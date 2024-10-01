@@ -33,6 +33,7 @@ from nemo.collections.tts.losses.audio_codec_loss import (
     TimeDomainLoss,
 )
 from nemo.collections.tts.modules.common import GaussianDropout
+from nemo.collections.tts.data.vocoder_dataset import create_vocoder_dataset
 from nemo.collections.tts.parts.utils.callbacks import LoggingCallback
 from nemo.collections.tts.parts.utils.helpers import get_batch_size, get_num_workers
 from nemo.core import ModelPT
@@ -505,60 +506,38 @@ class AudioCodecModel(ModelPT):
         }
         self.log_dict(metrics, on_epoch=True, sync_dist=True)
 
-    def get_dataset(self, cfg):
-        with open_dict(cfg):
-            is_sharded = cfg.dataset.pop('is_sharded', False)
-
-        if is_sharded:
-            with open_dict(cfg):
-                cfg.dataset.global_rank = self.global_rank
-                cfg.dataset.world_size = self.world_size
-                cfg.dataset._target_ = 'nemo.collections.tts.data.vocoder_dataset.TarredVocoderDataset'
-
-        dataset = instantiate(cfg.dataset)
-
-        sampler = dataset.get_sampler(cfg.dataloader_params.batch_size, world_size=self.trainer.world_size)
-        return dataset, sampler
-
-    def _setup_train_dataloader(self, cfg):
-        dataset, sampler = self.get_dataset(cfg)
+    def _setup_train_dataloader(self, dataset_config, dataloader_params):
+        dataset = create_vocoder_dataset(
+            dataset_type=dataset_config.dataset_type,
+            global_rank=self.trainer.global_rank,
+            world_size=self.trainer.world_size,
+            dataset_args=dataset_config.dataset_args,
+            is_train=True
+        )
+        sampler = dataset.get_sampler(batch_size=dataloader_params.batch_size, world_size=self.trainer.world_size)
         data_loader = torch.utils.data.DataLoader(
-            dataset, collate_fn=dataset.collate_fn, sampler=sampler, **cfg.dataloader_params
+            dataset, collate_fn=dataset.collate_fn, sampler=sampler, **dataloader_params
         )
         return data_loader
 
-    def _setup_test_dataloader(self, cfg):
-        dataset = instantiate(cfg.dataset)
-        data_loader = torch.utils.data.DataLoader(dataset, collate_fn=dataset.collate_fn, **cfg.dataloader_params)
+    def _setup_test_dataloader(self, dataset_config, dataloader_params):
+        dataset = create_vocoder_dataset(
+            dataset_type=dataset_config.dataset_type,
+            dataset_args=dataset_config.dataset_args,
+            is_train=False
+        )
+        data_loader = torch.utils.data.DataLoader(dataset, collate_fn=dataset.collate_fn, **dataloader_params)
         return data_loader
 
     def setup_training_data(self, cfg):
-        self._train_dl = self._setup_train_dataloader(cfg)
-        batch_size = cfg['dataloader_params']['batch_size']
-        # Need to set this because if using an IterableDataset, the length of the dataloader is the total number
-        # of samples rather than the number of batches, and this messes up the tqdm progress bar.
-        # So we set the number of steps manually (to the correct number) to fix this.
-        if (
-            self._train_dl is not None
-            and hasattr(self._train_dl, 'dataset')
-            and isinstance(self._train_dl.dataset, torch.utils.data.IterableDataset)
-        ):
-            # We also need to check if limit_train_batches is already set.
-            # If it's an int, we assume that the user has set it to something sane, i.e. <= # training batches,
-            # and don't change it. Otherwise, adjust batches accordingly if it's a float (including 1.0).
-            if self._trainer is not None and isinstance(self._trainer.limit_train_batches, float):
-                self._trainer.limit_train_batches = int(
-                    self._trainer.limit_train_batches
-                    * ceil((len(self._train_dl.dataset) / self.world_size) / batch_size)
-                )
-            elif self._trainer is None:
-                logging.warning(
-                    "Model Trainer was not set before constructing the dataset, incorrect number of "
-                    "training batches will be used. Please set the trainer and rebuild the dataset."
-                )
+        self._train_dl = self._setup_train_dataloader(
+            dataset_config=cfg.dataset, dataloader_params=cfg.dataloader_params
+        )
 
     def setup_validation_data(self, cfg):
-        self._validation_dl = self._setup_test_dataloader(cfg)
+        self._validation_dl = self._setup_test_dataloader(
+            dataset_config=cfg.dataset, dataloader_params=cfg.dataloader_params
+        )
 
     def setup_test_data(self, cfg):
         pass
@@ -573,6 +552,7 @@ class AudioCodecModel(ModelPT):
 
         if "steps_per_epoch" in self._cfg:
             return self._cfg.max_epochs * self._cfg.steps_per_epoch
+
         return compute_max_steps(
             max_epochs=self._cfg.max_epochs,
             accumulate_grad_batches=self.trainer.accumulate_grad_batches,
@@ -629,7 +609,9 @@ class AudioCodecModel(ModelPT):
         if not self.log_config:
             return []
 
-        data_loader = self._setup_test_dataloader(self.log_config)
+        data_loader = self._setup_test_dataloader(
+            dataset_config=self.log_config.dataset, dataloader_params=self.log_config.dataloader_params
+        )
         generators = instantiate(self.log_config.generators)
         log_dir = Path(self.log_config.log_dir) if self.log_config.log_dir else None
         log_callback = LoggingCallback(
