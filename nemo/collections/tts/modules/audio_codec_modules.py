@@ -1574,7 +1574,6 @@ class HiFiGANDecoder(NeuralModule):
         super().__init__()
 
         self.up_sample_rates = up_sample_rates
-        self.is_causal = is_causal
 
         self.pre_conv = Conv1dNorm(in_channels=input_dim, out_channels=base_channels, kernel_size=in_kernel_size)
 
