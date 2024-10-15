@@ -500,12 +500,11 @@ class AudioCodecModel(ModelPT):
             metrics["g_loss_commit"] = commit_loss
             generator_losses.append(self.commit_loss_scale * commit_loss)
 
-        if audio_token_loss is not None:
+        if audio_token_loss:
             metrics["g_loss_distil"] = audio_token_loss * self.distil_loss_scale
             generator_losses.append(metrics["g_loss_distil"])
 
         loss_gen_all = sum(generator_losses)
-        print("gen loss vs g_loss_distil", loss_gen_all, metrics["g_loss_distil"])
 
         optim_gen.zero_grad()
         self.manual_backward(loss_gen_all)
@@ -539,7 +538,7 @@ class AudioCodecModel(ModelPT):
             "val_loss_si_sdr": loss_si_sdr,
         }
 
-        if audio_token_loss is not None:
+        if audio_token_loss:
             metrics["val_loss_distil"] = audio_token_loss * self.distil_loss_scale
 
         self.log_dict(metrics, on_epoch=True, sync_dist=True)
