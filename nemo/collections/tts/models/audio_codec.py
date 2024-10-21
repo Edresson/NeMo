@@ -98,6 +98,12 @@ class AudioCodecModel(ModelPT):
             logging.warning('Vector quantizer will not be used.')
             self.vector_quantizer = None
 
+        # Freeze audio encoder and vector quantizer if needed
+        if cfg.get("freeze_audio_encoder_and_vector_quantizer", False):
+            logging.warning('Freezing Audio Encoder and Vector quantizer.')
+            self.audio_encoder.freeze()
+            self.vector_quantizer.freeze()
+
         # Decoder setup
         self.audio_decoder = instantiate(cfg.audio_decoder)
 
