@@ -1764,6 +1764,99 @@ class CausalAudioTokenPredictor(NeuralModule):
         return audio_tokens, audio_logits, audio_len
 
 
+class LayerNorm(nn.Module):
+    def __init__(self, channels, eps=1e-5):
+        super().__init__()
+        self.channels = channels
+        self.eps = eps
+
+        self.gamma = nn.Parameter(torch.ones(channels))
+        self.beta = nn.Parameter(torch.zeros(channels))
+
+    def forward(self, x):
+        x = x.transpose(1, -1)
+        x = F.layer_norm(x, (self.channels,), self.gamma, self.beta, self.eps)
+        return x.transpose(1, -1)
+
+class AudioTokenPredictor(NeuralModule):
+    """
+    AudioTokenPredictor using 2 1D Conv layers.
+
+    Args:
+        input_dim: Input dimension.
+        base_channels: Number of filters in the each convolution.
+        kernel_size: Kernel size of the convolution layers.
+        num_codebooks: Number of codebooks.
+        codebook_size: Size of each codebook.
+        norm_temp: norm_temp for Softmax.
+        p_dropout: Dropout rate applied after each layer.
+
+    """
+
+    def __init__(
+        self,
+        input_dim: int,
+        base_channels: int = 512,
+        kernel_size: int = 3,
+        num_codebooks: int = 8,
+        codebook_size: int = 1000,
+        norm_temp: float = 0.02,
+        p_dropout: float = 0.05,
+        use_mse_loss: bool = True,
+        audio_codes_channels: int = 128,
+    ):
+        super().__init__()
+        self.use_mse_loss = use_mse_loss
+        self.norm_temp = norm_temp
+        self.num_codebooks = num_codebooks
+        self.codebook_size = codebook_size
+
+        self.drop = nn.Dropout(p_dropout)
+        self.conv_1 = nn.Conv1d(input_dim, base_channels, kernel_size, padding=kernel_size // 2)
+        self.norm_1 = LayerNorm(base_channels)
+        self.conv_2 = nn.Conv1d(base_channels, base_channels, kernel_size, padding=kernel_size // 2)
+        self.norm_2 = LayerNorm(base_channels)
+
+        if self.use_mse_loss:
+            self.audio_token_layer = torch.nn.Linear(base_channels, audio_codes_channels)
+        else:
+            self.audio_token_layer = torch.nn.Linear(base_channels, self.num_codebooks * self.codebook_size)
+
+
+    def forward(self, inputs, input_len):
+        # [B, C, T]
+        x = mask_sequence_tensor(inputs, input_len)
+        x = self.conv_1(x)
+        x = torch.nn.functional.leaky_relu(x)
+        x = self.norm_1(x)
+        x = self.drop(x)
+        x = mask_sequence_tensor(x, input_len)
+        x = self.conv_2(x)
+        x = torch.nn.functional.leaky_relu(x)
+        x = self.norm_2(x)
+        x = self.drop(x)
+        x = mask_sequence_tensor(x, input_len)
+
+        # [batch_size, input_len, num_codebook * codebook_size]
+        audio_logits = self.audio_token_layer(x.transpose(1, 2))
+        
+        if self.use_mse_loss:
+            return audio_logits, input_len
+        else:
+            # [batch_size, input_len, num_codebook, codebook_size]
+            logit_shape = (audio_logits.shape[0], audio_logits.shape[1], self.num_codebooks, self.codebook_size)
+            audio_logits = torch.reshape(audio_logits, logit_shape)
+            audio_norm = torch.norm(audio_logits, p=2, dim=3, keepdim=True) + 1e-6
+            audio_logits = audio_logits / audio_norm / self.norm_temp
+
+            # [batch_size, input_len, num_codebook]
+            audio_tokens = audio_logits.max(dim=3).indices
+            audio_logits = rearrange(audio_logits, 'B T C W -> B C W T')
+            audio_tokens = rearrange(audio_tokens, 'B T C -> B C T')
+            return audio_logits, input_len
+
+
+
 class HiFiGANDecoder(NeuralModule):
     """
     Codec decoder using the HiFi-GAN generator architecture.

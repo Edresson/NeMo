@@ -31,7 +31,8 @@ from nemo.collections.tts.losses.audio_codec_loss import (
     RelativeFeatureMatchingLoss,
     SISDRLoss,
     TimeDomainLoss,
-    AudioTokenLoss
+    AudioTokenLoss,
+    MaskedMSELoss,
 )
 from nemo.collections.tts.modules.common import GaussianDropout
 from nemo.collections.tts.data.vocoder_dataset import create_vocoder_dataset
@@ -171,13 +172,18 @@ class AudioCodecModel(ModelPT):
                 # freeze model
                 self.distil_codec_model.freeze()
 
+                
                 # delete generator and discriminator to free memory
                 del self.distil_codec_model.discriminator
                 del self.distil_codec_model.audio_decoder
 
                 # get token_predictor and loss
                 self.token_predictor = instantiate(cfg.distillation.distil_predictor)
-                self.audio_token_loss_fn = AudioTokenLoss(num_codebooks=self.token_predictor.num_codebooks)
+                if cfg.distillation.distil_predictor.use_mse_loss:
+                    self.use_distil_mse_loss = True
+                    self.distil_loss = torch.nn.MSELoss(reduction='none')# MaskedMSELoss()
+                else:
+                    self.distil_loss = AudioTokenLoss(num_codebooks=self.token_predictor.num_codebooks)
 
         # Log setup
         self.log_config = cfg.get("log_config", None)
@@ -418,18 +424,28 @@ class AudioCodecModel(ModelPT):
             commit_loss = 0.0
 
         if self.use_distil_loss:
-            audio_tokens, audio_logits, audio_len = self.token_predictor(encoded, encoded_len)
-            token_maskin_loss = get_mask_from_lengths(audio_len)
-            audio_token_loss = self.audio_token_loss_fn(
-                logits=audio_logits, target_tokens=audio_tokens, mask=token_maskin_loss
-            )
+            with torch.no_grad():
+                encoded_distil, encoded_len_distil = self.distil_codec_model.encode_audio(audio=audio, audio_len=audio_len)
+                encoded_distil, indices_distil = self.distil_codec_model.vector_quantizer(inputs=encoded_distil, input_len=encoded_len_distil)
+
+            audio_logits, audio_len = self.token_predictor(encoded, encoded_len)
+            if self.use_distil_mse_loss:
+                distil_loss = self.distil_loss(input=encoded, target=encoded_distil)
+                distil_loss = torch.mean(distil_loss, dim=1)
+                distil_loss = torch.sum(distil_loss, dim=1) / torch.clamp(encoded_len_distil, min=1.0)
+                distil_loss = torch.mean(distil_loss)
+            else:
+                token_maskin_loss = get_mask_from_lengths(audio_len)
+                distil_loss = self.distil_loss(
+                    logits=audio_logits, target_tokens=indices_distil, mask=token_maskin_loss
+                )
         else:
-            audio_token_loss = 0.0
+            distil_loss = 0.0
 
         # [B, T]
         audio_gen, _ = self.audio_decoder(inputs=encoded, input_len=encoded_len)
 
-        return audio, audio_len, audio_gen, commit_loss, audio_token_loss
+        return audio, audio_len, audio_gen, commit_loss, distil_loss
 
     @property
     def disc_update_prob(self) -> float:
@@ -446,7 +462,7 @@ class AudioCodecModel(ModelPT):
     def training_step(self, batch, batch_idx):
         optim_gen, optim_disc = self.optimizers()
 
-        audio, audio_len, audio_gen, commit_loss, audio_token_loss = self._process_batch(batch)
+        audio, audio_len, audio_gen, commit_loss, distil_loss = self._process_batch(batch)
 
         metrics = {
             "global_step": self.global_step,
@@ -506,8 +522,8 @@ class AudioCodecModel(ModelPT):
             metrics["g_loss_commit"] = commit_loss
             generator_losses.append(self.commit_loss_scale * commit_loss)
 
-        if audio_token_loss:
-            metrics["g_loss_distil"] = audio_token_loss * self.distil_loss_scale
+        if distil_loss:
+            metrics["g_loss_distil"] = distil_loss * self.distil_loss_scale
             generator_losses.append(metrics["g_loss_distil"])
 
         loss_gen_all = sum(generator_losses)
@@ -525,7 +541,7 @@ class AudioCodecModel(ModelPT):
         self.update_lr("epoch")
 
     def validation_step(self, batch, batch_idx):
-        audio, audio_len, audio_gen, _, audio_token_loss = self._process_batch(batch)
+        audio, audio_len, audio_gen, _, distil_loss = self._process_batch(batch)
 
         loss_mel_l1, loss_mel_l2 = self.mel_loss_fn(audio_real=audio, audio_gen=audio_gen, audio_len=audio_len)
         loss_stft = self.stft_loss_fn(audio_real=audio, audio_gen=audio_gen, audio_len=audio_len)
@@ -544,8 +560,8 @@ class AudioCodecModel(ModelPT):
             "val_loss_si_sdr": loss_si_sdr,
         }
 
-        if audio_token_loss:
-            metrics["val_loss_distil"] = audio_token_loss * self.distil_loss_scale
+        if distil_loss:
+            metrics["val_loss_distil"] = distil_loss * self.distil_loss_scale
 
         self.log_dict(metrics, on_epoch=True, sync_dist=True)
 
