@@ -431,10 +431,10 @@ class AudioCodecModel(ModelPT):
             audio_logits, audio_len = self.token_predictor(encoded, encoded_len)
             if self.use_distil_mse_loss:
                 # mse loss
-                # distil_loss = self.distil_loss(input=encoded, target=encoded_distil)
-                # distil_loss = torch.mean(distil_loss, dim=1)
+                distil_loss = self.distil_loss(input=encoded, target=encoded_distil)
+                distil_loss = torch.mean(distil_loss, dim=1)
                 # cosine similarity loss
-                distil_loss = torch.nn.functional.cosine_similarity(encoded, encoded_distil, dim=1, eps=1e-8) * -1
+                # distil_loss = torch.nn.functional.cosine_similarity(encoded, encoded_distil, dim=1, eps=1e-8) * -1
                 distil_loss = torch.sum(distil_loss, dim=1) / torch.clamp(encoded_len_distil, min=1.0)
                 distil_loss = torch.mean(distil_loss)
 
@@ -634,7 +634,8 @@ class AudioCodecModel(ModelPT):
         OmegaConf.set_struct(optim_config, True)
 
         vq_params = self.vector_quantizer.parameters() if self.vector_quantizer else []
-        gen_params = itertools.chain(self.audio_encoder.parameters(), self.audio_decoder.parameters(), vq_params)
+        distil_params = self.token_predictor.parameters() if self.use_distil_loss else []
+        gen_params = itertools.chain(self.audio_encoder.parameters(), self.audio_decoder.parameters(), vq_params, distil_params)
         optim_g = instantiate(optim_config, params=gen_params)
 
         disc_params = self.discriminator.parameters()
