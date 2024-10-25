@@ -427,13 +427,17 @@ class AudioCodecModel(ModelPT):
             with torch.no_grad():
                 encoded_distil, encoded_len_distil = self.distil_codec_model.encode_audio(audio=audio, audio_len=audio_len)
                 encoded_distil, indices_distil = self.distil_codec_model.vector_quantizer(inputs=encoded_distil, input_len=encoded_len_distil)
-
+                print(encoded_distil.max(), encoded_distil.min())
             audio_logits, audio_len = self.token_predictor(encoded, encoded_len)
             if self.use_distil_mse_loss:
-                distil_loss = self.distil_loss(input=encoded, target=encoded_distil)
-                distil_loss = torch.mean(distil_loss, dim=1)
+                # mse loss
+                # distil_loss = self.distil_loss(input=encoded, target=encoded_distil)
+                # distil_loss = torch.mean(distil_loss, dim=1)
+                # cosine similarity loss
+                distil_loss = torch.nn.functional.cosine_similarity(encoded, encoded_distil, dim=1, eps=1e-8) * -1
                 distil_loss = torch.sum(distil_loss, dim=1) / torch.clamp(encoded_len_distil, min=1.0)
                 distil_loss = torch.mean(distil_loss)
+
             else:
                 token_maskin_loss = get_mask_from_lengths(audio_len)
                 distil_loss = self.distil_loss(
