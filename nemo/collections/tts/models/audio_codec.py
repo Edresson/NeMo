@@ -427,7 +427,7 @@ class AudioCodecModel(ModelPT):
             with torch.no_grad():
                 encoded_distil, encoded_len_distil = self.distil_codec_model.encode_audio(audio=audio, audio_len=audio_len)
                 encoded_distil, indices_distil = self.distil_codec_model.vector_quantizer(inputs=encoded_distil, input_len=encoded_len_distil)
-                print(encoded_distil.max(), encoded_distil.min())
+
             audio_logits, audio_len = self.token_predictor(encoded, encoded_len)
             if self.use_distil_mse_loss:
                 # mse loss
