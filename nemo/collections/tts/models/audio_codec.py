@@ -634,7 +634,7 @@ class AudioCodecModel(ModelPT):
         OmegaConf.set_struct(optim_config, True)
 
         vq_params = self.vector_quantizer.parameters() if self.vector_quantizer else []
-        distil_params = self.token_predictor.parameters() if self.use_distil_loss else []
+        distil_params = itertools.chain(self.token_predictor.parameters(), self.distil_codec_model.parameters()) if self.use_distil_loss else []
         gen_params = itertools.chain(self.audio_encoder.parameters(), self.audio_decoder.parameters(), vq_params, distil_params)
         optim_g = instantiate(optim_config, params=gen_params)
 
