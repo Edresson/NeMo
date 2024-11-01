@@ -18,6 +18,7 @@ import os
 import string
 from typing import Any, List
 from functools import partial
+from copy import deepcopy
 
 import editdistance
 import numpy as np
@@ -40,10 +41,12 @@ from nemo.collections.nlp.modules.common.megatron.utils import (
     average_losses_across_data_parallel_group,
     get_iterator_k_split,
     init_method_normal,
+    attn_mask_postprocess,
+    build_attention_mask_3d,
 )
 from nemo.collections.nlp.parts.nlp_overrides import NLPSaveRestoreConnector
 from nemo.collections.nlp.parts.utils_funcs import get_last_rank
-from nemo.collections.tts.data.speechllm.t5_speechllm_dataset import Lang, T5SpeechLMDataset
+from nemo.collections.tts.data.speechllm.t5_speechllm_dataset import Lang, T5SpeechLMDataset, pad_text_to_speech_dims
 from nemo.collections.tts.data.speechllm.t5_speechllm_tarred_dataset import T5SpeechLMTarredDataset
 from nemo.collections.tts.losses.aligner_loss import ForwardSumLoss
 from nemo.collections.tts.models import AudioCodecModel
@@ -2507,3 +2510,352 @@ class MegatronT5SpeechLMModel(MegatronBaseSpeechLM):
             acc = correct / len(gather_results_dedup) if all_labels[0] else None
             logging.info(f'Prediction results: {acc}')
             logging.info(f'Test finish')
+
+
+    def init_infer(self):
+        with torch.no_grad(): #, torch.autocast(device_type='cuda', dtype=torch.bfloat16):
+            self.temp_device = next(self.parameters()).device
+
+            virtual_tokens = torch.tensor([[39124, 39125, 39126]]).to(self.temp_device)  # need to concat to both context embeddings and input text embeddings for current model
+            self.taskname_ids = torch.tensor([[4322]]).to(self.temp_device)
+
+            self.max_inference_timesteps = self.cfg.get('max_inference_timesteps', 2048)
+            self.virtual_tokens_embeddings = self.get_embeddings(virtual_tokens, self.taskname_ids, inference=True)
+            self.enc_position_embedding = self.frozen_model.enc_dec_model.encoder_embedding.position_embeddings.weight
+            self.dec_positional_embeddings = self.frozen_model.enc_dec_model.decoder_embedding.position_embeddings.weight
+            self.mask_type = self.frozen_model.enc_dec_model.enc_dec_model.encoder.model_attn_mask_type
+
+            # speaker_context = "TEXT CONTEXT: | Language:en Dataset:Riva Speaker:Lindy_CMU_HAPPY |"
+            speaker_context = "TEXT CONTEXT: | Language:en Dataset:Riva Speaker:Lindy_WIZWIKI |"
+
+            if isinstance(speaker_context, str):
+                speaker_context = self.tokenizer.text_to_ids(speaker_context) + [self.tokenizer.eos_id]
+                speaker_context = torch.tensor(speaker_context).to(self.temp_device)
+                speaker_context = pad_text_to_speech_dims(
+                    speaker_context, self.tokenizer.pad_id, self.num_speech_codebooks - 1
+                )
+
+            speaker_context = speaker_context.unsqueeze(0)
+            speaker_context_embeddings = self.get_embeddings(speaker_context, self.taskname_ids, inference=True)
+            speaker_context_embeddings = torch.cat([self.virtual_tokens_embeddings, speaker_context_embeddings], dim=1)
+            speaker_context_embeddings += self.enc_position_embedding[:speaker_context_embeddings.shape[1],:].unsqueeze(0)
+            # Embed speaker
+            self.speaker_context_mask = torch.ones([1, speaker_context_embeddings.shape[1]]).to(self.temp_device)
+            speaker_context_embeddings = speaker_context_embeddings.transpose(0, 1)
+            speaker_context_mask_3d = attn_mask_postprocess(
+                build_attention_mask_3d(
+                    source_mask=self.speaker_context_mask, target_mask=self.speaker_context_mask, attn_mask_type=self.mask_type,
+                )
+            )
+            self.speaker_context_output = self.frozen_model.enc_dec_model.enc_dec_model.encoder.model[0](
+                speaker_context_embeddings,
+                speaker_context_mask_3d,
+                layer_past=None,
+                get_key_value=False,
+                self_attention_relative_position_bias=None,
+                cross_attention_relative_position_bias=None,
+                set_inference_key_value_memory=False,
+            )
+            self.instruction_tokens = self.tokenizer.text_to_ids("Phoneme TTS")
+            # self.alibi = ALiBiRelativePositionEmbedding(False, 12, LayerType.decoder, None, 2048)
+            self.reset_infer()
+
+    def reset_infer(self):
+        with torch.no_grad(), torch.autocast(device_type='cuda', dtype=torch.bfloat16):
+            self.input_text_buffer = ""
+            self.generated_codes_buffer = torch.empty([1,8,0], dtype=torch.int64).to(self.temp_device)
+            # Decoder input starts with bos and 0 token
+            bos_dec_input = torch.tensor([self.tokenizer.bos_id, 0]).to(self.temp_device)
+            bos_dec_input = pad_text_to_speech_dims(bos_dec_input, 0, 7)
+            self.bos_dec_input = bos_dec_input.unsqueeze(0)
+            self.curr_dec_input = self.bos_dec_input.clone()
+            self.decoder_t = 1
+            self.text_split_start = 0
+            self.reset = True
+            self.code_length_per_split = []
+            self.splits_tokenized = []
+            self.split_i = 0
+            self.current_enc_step = 0
+
+    def infer_chunk(self, text, phoneme_tokenizer, n_words_per_split=5, n_codes_to_regenerate=10, decoder_step_to_remove_splits=1000, final=False, extra_codes_for_final_phone=2):
+        print(f"Enterring infer_chunk with self.input_text_buffer |{self.input_text_buffer}| text |{text}| text |{text[len(self.input_text_buffer):]}|")
+        #with torch.no_grad(), torch.autocast(device_type='cuda', dtype=torch.bfloat16):
+        with torch.no_grad():
+            self.input_text_buffer += text[len(self.input_text_buffer):]
+            full_input_text = "".join(self.input_text_buffer)
+            n_words = full_input_text.split(" ")
+
+            splits = []
+            n_splits = -(len(n_words) // -n_words_per_split)
+            for i in range(n_splits):
+                if i == n_splits - 1:
+                    splits.append(" ".join(n_words[i*n_words_per_split:]))
+                else:
+                    splits.append(" ".join(n_words[i*n_words_per_split:(i+1)*n_words_per_split]))
+
+            for split_j in range(self.split_i, n_splits):
+                if not final and len(splits[split_j].split(" ")) < n_words_per_split:
+                    print(f"On split {split_j}. It has {len(splits[split_j].split(' '))} words, but we need {n_words_per_split}.")
+                    yield None, True
+
+                print(f"New split: {split_j}|Decoder_t {self.decoder_t}|Split'{splits[split_j]}'")
+                self.reset = True
+                self.decoder_t = 1
+                self.curr_dec_input = self.bos_dec_input.clone()
+                # if self.decoder_t > decoder_step_to_remove_splits:
+                #     print(f"Resetting decoder, currently at {self.decoder_t}. Last generated length: {self.code_length_per_split[split_j-1]}")
+                #     self.text_split_start = split_j-1
+                #     self.decoder_t = self.code_length_per_split[split_j-1]
+                #     self.curr_dec_input = torch.cat([self.bos_dec_input, self.generated_codes_buffer[:, :, -(self.code_length_per_split[split_j-1]):-(n_codes_to_regenerate+1)]], dim=-1)
+                #     # decoder_t += 2 # For bos and all zeros frame
+                #     self.decoder_t -= (n_codes_to_regenerate + 1)
+                #     self.decoder_t += 1 # For bos
+                #     # self.current_enc_step = 7 + len(self.splits_tokenized[self.text_split_start])
+                #     print(f"Reset decoder, now at {self.decoder_t} with input size {self.curr_dec_input.shape}.")
+                # elif self.decoder_t > 1:
+                #     self.decoder_t -= (n_codes_to_regenerate + 1)
+                #     # Need to reset attention memory
+                #     for layer in self.frozen_model.enc_dec_model.enc_dec_model.decoder.model.layers:
+                #         layer.self_attention.inference_current_sequence_len -= (n_codes_to_regenerate + 2)
+                #     self.curr_dec_input = self.generated_codes_buffer[:,:,-(n_codes_to_regenerate+1)].clone()
+                #     self.curr_dec_input = self.curr_dec_input.unsqueeze(-1)
+                #     # self.current_enc_step = 7  # 3 virutal, 4 instruction
+                #     # for j in range(self.text_split_start, split_j):
+                #     #     self.current_enc_step += len(self.splits_tokenized[j][1:])
+                #     # if self.splits_tokenized[j][-1] != 30000:
+                #     #     self.current_enc_step += 1
+                #     print(f"Went back to decoder_t {self.decoder_t} with input size {self.curr_dec_input.shape}.")
+
+                output_token_list = []
+                field_tokens = phoneme_tokenizer.encode(splits[split_j])
+                field_tokens_adjusted = [_id + self.lm_vocab_size for _id in field_tokens]
+                self.splits_tokenized.append(field_tokens_adjusted)
+                assert len(self.splits_tokenized) == split_j+1
+                text_tokens = deepcopy(self.instruction_tokens)
+                # print(f"text_tokens:{text_tokens}")
+                # import ipdb; ipdb.set_trace()
+                # Manually add space tokens
+                # self.current_enc_step -= 1
+                self.current_enc_step = 7 # 3 virtual, 4 instruction
+                should_end_at = 7 # 3 virtual, 4 instruction, 1 space
+                text_tokens += self.splits_tokenized[split_j]
+                should_end_at += len(self.splits_tokenized[split_j])
+                # text_tokens += [30000]
+                # for j in range(self.text_split_start, split_j+1):
+                #     should_end_at += len(self.splits_tokenized[j][1:])
+                #     if j != split_j:
+                #         self.current_enc_step += len(self.splits_tokenized[j][1:])
+                # if text_tokens[-1] != 30000:
+                #     text_tokens += [30000]
+                #     should_end_at += 1
+                should_end_at -= 1
+                extra_codes = extra_codes_for_final_phone
+
+                output_text = []
+                for token in text_tokens:
+                    if token > self.lm_vocab_size:
+                        output_text.append(token - self.lm_vocab_size)
+                print(phoneme_tokenizer.decode(output_text))
+
+                # Need to first add T5Sentinel.FIRST.value aka '<extra_id_0>' aka 28996
+                text_tokens += [28996, self.tokenizer.eos_id]
+                text_tokens = torch.tensor(text_tokens).clone().to(self.temp_device)
+                # print(f"text_tokens:{text_tokens}")
+                # ipdb.set_trace()
+                import time
+                start_time = time.time()
+                text_tokens = pad_text_to_speech_dims(
+                    text_tokens, self.tokenizer.pad_id, self.num_speech_codebooks - 1
+                )
+                text_tokens = text_tokens.unsqueeze(0)
+                text_embeddings = self.get_embeddings(text_tokens, self.taskname_ids, inference=True)
+                text_embeddings = torch.cat([self.virtual_tokens_embeddings, text_embeddings], dim=1)
+                text_embeddings += self.enc_position_embedding[:text_embeddings.shape[1],:].unsqueeze(0)
+
+                # Embed text
+                text_mask = torch.ones([1, text_embeddings.shape[1]]).to(self.temp_device)
+                text_embeddings = text_embeddings.transpose(0, 1)
+                text_mask_3d = attn_mask_postprocess(
+                    build_attention_mask_3d(
+                        source_mask=text_mask, target_mask=text_mask, attn_mask_type=self.mask_type,
+                    )
+                )
+                print('time to prep before model forword stuff', time.time() - start_time)
+                ## 0 is for speaker context
+                ## 1 is for text
+                start_time = time.time()
+                text_enc_output = self.frozen_model.enc_dec_model.enc_dec_model.encoder.model[1](
+                    text_embeddings,
+                    text_mask_3d,
+                    layer_past=None,
+                    get_key_value=False,
+                    self_attention_relative_position_bias=None,
+                    cross_attention_relative_position_bias=None,
+                    set_inference_key_value_memory=False,
+                )
+                print('encoder time', time.time() - start_time)
+
+                # full_alibi = self.alibi(0,text_enc_output.shape[0])
+                for t in range(self.decoder_t, self.max_inference_timesteps):
+                    if t % 100 == 0:
+                        print(f"Timestep|{t}|text_enc_output|{text_enc_output.shape[0]}|current_enc_step|{self.current_enc_step}|should_end_at|{should_end_at}|")
+
+                    # torch.cuda.nvtx.range_push("get word embeddings")
+                    dec_input = self.frozen_model.enc_dec_model.decoder_embedding.word_embeddings(self.curr_dec_input[:,0,:t+1])
+                    dec_input += self.dec_positional_embeddings[t+1-dec_input.shape[1]:t+1, :].unsqueeze(0)  # Add positional embedding
+                    # torch.cuda.nvtx.range_pop()
+                    dec_input = dec_input.transpose(0,1)
+                    for i in range(1, self.curr_dec_input.size()[1]):
+                        current = self.frozen_model.enc_dec_model.speech_tokens_embeddings[i - 1](self.curr_dec_input[:, i, :t+1]).permute(1, 0, 2)
+                        dec_input = dec_input + current
+
+                    all_bias = torch.zeros([1, 12, 1, text_enc_output.shape[0]])
+                    # alibi bias
+                    # if self.current_enc_step > 0:
+                    #     possible_bias_left = full_alibi[:, :, :, -self.current_enc_step:]
+                    #     tokens_left = text_enc_output.shape[0] - self.current_enc_step - 1
+                    #     possible_bias_right = full_alibi[:, :, :, -tokens_left:]
+                    #     all_bias[:, :, :, :self.current_enc_step] = possible_bias_left
+                    #     all_bias[:, :, :, -tokens_left:] = torch.flip(possible_bias_right, dims=[-1])
+                    # hard window
+                    # if self.current_enc_step > 7 and self.current_enc_step < should_end_at:  # 3 vritual and 4 instructions
+                    #     left_window_size = 0
+                    #     right_window_size = 3
+                    #     all_bias -= 999999
+                    #     all_bias[:, :, :, self.current_enc_step+left_window_size:self.current_enc_step+right_window_size] = 0
+                    all_bias = all_bias.to(self.temp_device)
+
+                    #pr = nvtx.Profile()
+                    #pr.enable()
+                    dec_output = self.frozen_model.enc_dec_model.enc_dec_model.decode(
+                        dec_input=dec_input,
+                        dec_attn_mask=torch.ones([1, t+1]).to(self.temp_device),
+                        enc_output=[self.speaker_context_output, text_enc_output],
+                        enc_attn_mask=[self.speaker_context_mask, text_mask],
+                        dec_layer_past=None,
+                        dec_get_key_value=False,
+                        dec_self_attention_relative_position_bias=None,
+                        dec_cross_attention_relative_position_bias=[None, all_bias],
+                        return_all_crossattention_probs=True,
+                        set_inference_key_value_memory=True if self.reset else False,
+                        # set_xa_inference_key_value_memory=True if self.decoder_t == t else False,
+                        decoder_max_sequence_len=self.max_inference_timesteps,
+                        encoder_max_sequence_len=[self.speaker_context_output.shape[0], text_enc_output.shape[0]],
+                        enc_output_to_layers=self.enc_output_to_layers,
+                        # current_enc_step=[None, self.current_enc_step]
+                    )
+                    # pr.disable()
+
+                    dec_output, attention = dec_output
+                    text_attention = []
+                    for i in range(len(attention)):
+                        if i < 5:
+                            text_attention.append(attention[i][0, :, -1, :]) #( [1, 12, 2, 45])
+                    assert len(text_attention) == 5
+                    # [12, 45]
+                    text_attention = torch.stack(text_attention)
+                    text_attention = torch.mean(text_attention, (0, 1))  # Size text tokens
+                    text_attention = torch.argmax(text_attention)
+                    if self.current_enc_step < text_attention:
+                        self.current_enc_step = text_attention
+
+                    if self.current_enc_step >= should_end_at:
+                        extra_codes -= 1
+                        if extra_codes == 0:
+                            break
+
+                    self.reset = False
+                    first_layer_vocabsize = (
+                        self.speech_offset + self.speech_codebook_size
+                    )  # variables set in __init__ of speechlm model
+                    token_logits = self.frozen_model.enc_dec_model.tokens_head(dec_output, self.frozen_model.enc_dec_model.word_embeddings_weight())  # s, b, vocab
+                    if self.frozen_model.enc_dec_model.seq_pattern in ["parallel", "delay_parallel"]:
+                        # For flat seq_pattern we need all the logits
+                        token_logits = token_logits[:, :, :first_layer_vocabsize]
+                    speech_layers = self.num_speech_codebooks - 1
+                    last_layer_logits = token_logits
+
+                    # speech_logits_list will be used in loss calculation (parallel output)
+                    speech_logits_list = []
+                    if self.frozen_model.enc_dec_model.seq_pattern in ["parallel", "delay_parallel"]:
+                        for i in range(speech_layers):
+                            last_layer_logits = self.frozen_model.enc_dec_model.speech_tokens_heads[i](dec_output)[0]  # T, B, 1024
+                            speech_logits_list.append(last_layer_logits)  # T, B, 1024
+
+                    token_logits = token_logits.transpose(0, 1).contiguous()  # (B, T, 31124) both text and speech
+                    speech_logits = torch.stack(speech_logits_list, dim=-1)  # T, B, 1024, 7
+                    speech_logits = speech_logits.transpose(0, 1).contiguous()  # (B, T, 1024, 7)
+                    print("speech_logits", speech_logits.shape)
+                    print("token_logits", token_logits.shape)
+
+                    _si = self.speech_offset
+                    _ei = _si + self.speech_codebook_size
+                    first_layer_speech_logits = token_logits[:, :, _si:_ei].unsqueeze(-1)  # (b, s, 1023, 1)
+
+                    all_speech_logits = torch.cat(
+                        [first_layer_speech_logits, speech_logits], dim=-1
+                    )  # (b, s, 1024, 8)
+
+                    stop_token_pred = token_logits[:, -1, :].argmax(dim=1)
+                    if t > self.decoder_t+n_codes_to_regenerate+10 and stop_token_pred[0] == self.tokenizer.eos_id:
+                        break
+
+                    all_speech_logits_currtimestep = all_speech_logits[:, -1, :, :].permute(0, 2, 1).contiguous().view(-1, self.speech_codebook_size)
+
+                    top_k = 80
+                    output_logits_currtimestep_topk = torch.topk(all_speech_logits_currtimestep, top_k, dim=1)[0]
+
+                    # find indices which are not top k
+                    indices_to_remove = all_speech_logits_currtimestep < output_logits_currtimestep_topk[:, -1].unsqueeze(1)
+                    # (B*8, 1024) or (B, 1024)
+
+                    output_logits_currtimestep_rescored = all_speech_logits_currtimestep.clone()
+                    output_logits_currtimestep_rescored[indices_to_remove] = -float('Inf')
+
+                    temperature = 0.85  # Set temp 0.01 for greedy decoding
+                    output_logits_currtimestep_rescored = output_logits_currtimestep_rescored / temperature
+                    output_logits_currtimestep_rescored = torch.nn.functional.softmax(
+                        output_logits_currtimestep_rescored, dim=1
+                    )
+
+                    output_tokens_curr_timestep = torch.multinomial(
+                        output_logits_currtimestep_rescored, num_samples=1
+                    )  # (B*8, 1)
+
+                    output_tokens_curr_timestep = output_tokens_curr_timestep.view(
+                        token_logits.shape[0], self.num_speech_codebooks
+                    )
+                    output_token_list.append(output_tokens_curr_timestep)
+                    dec_input_next_timestep = output_tokens_curr_timestep * 1  # (B,8)
+                    dec_input_next_timestep[:, 0] = (
+                        dec_input_next_timestep[:, 0] + self.speech_offset
+                    )  # add offset to first codebook
+                    self.curr_dec_input = dec_input_next_timestep.unsqueeze(-1)
+                    # print(curr_dec_input.shape)
+
+                    # import ipdb; ipdb.set_trace()
+                is_ok = True
+                if t >= self.max_inference_timesteps - 10:
+                    print("ERROR: Reached max inference timesteps")
+                    is_ok = False
+                num_frames_generated = t - self.decoder_t
+                self.decoder_t = t
+                assert num_frames_generated > n_codes_to_regenerate
+                self.code_length_per_split.append(num_frames_generated)
+                assert len(self.code_length_per_split) == split_j + 1
+                output_tokens_combined = torch.stack(output_token_list)  # (T, B, 8) if speech else (T, B)
+                output_tokens_combined = output_tokens_combined.permute(1, 2, 0)  # (B, 8, T)
+                # print(f"1 {output_tokens_combined.dtype}")
+                self.generated_codes_buffer = torch.cat([self.generated_codes_buffer, output_tokens_combined], dim=-1)
+                # print(f"2 {self.generated_codes_buffer.dtype}")
+                # print(f"End split: {split_j}|output_tokens_combined {output_tokens_combined.shape}|num_frames_generated {num_frames_generated}|t {t}| decoder_t {self.decoder_t}|self.current_enc_step {self.current_enc_step}")
+                self.split_i += 1
+                #print('yielding output_tokens_combined', output_tokens_combined)
+                #print('yielding is_ok', is_ok)
+                yield output_tokens_combined, is_ok
+
+    def opt_decoder(self):
+        import torch._dynamo
+        torch._dynamo.reset()
+        self.opt_decoder = torch.compile(self.frozen_model.enc_dec_model.enc_dec_model.decoder, mode="reduce-overhead")
+
