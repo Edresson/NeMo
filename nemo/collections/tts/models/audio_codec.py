@@ -594,8 +594,8 @@ class AudioCodecModel(ModelPT):
             metrics["val_loss_distil"] = distil_loss * self.distil_loss_scale
 
         if flow_loss:
-            metrics["g_loss_flow"] = flow_loss * self.flow_loss_scale
-            metrics["val_loss"] += metrics["g_loss_flow"]
+            metrics["val_loss_flow"] = flow_loss * self.flow_loss_scale
+            metrics["val_loss"] += metrics["val_loss_flow"]
 
         self.log_dict(metrics, on_epoch=True, sync_dist=True)
 

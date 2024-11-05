@@ -438,6 +438,7 @@ class ResidualCouplingBlock(NeuralModule):
                     logs_0 = logs.clone()
                 elif i == len(self.flows)-1:
                     logs_1 = logs.clone()
+
             logs = torch.cat([logs_0, logs_1], 1)
             return x, logdet, logs
         else:
