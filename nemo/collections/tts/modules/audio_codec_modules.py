@@ -25,6 +25,7 @@ from transformers import AutoModel
 
 from nemo.collections.asr.modules import AudioToMelSpectrogramPreprocessor
 from nemo.collections.common.parts.utils import ClampActivation, HalfSnake, Snake, mask_sequence_tensor
+from nemo.collections.tts.parts.utils.helpers import get_mask_from_lengths
 from nemo.core.classes.common import typecheck
 from nemo.core.classes.module import NeuralModule
 from nemo.core.neural_types.elements import (
@@ -39,6 +40,7 @@ from nemo.core.neural_types.neural_type import NeuralType
 from nemo.utils import logging
 import math
 
+from nemo.collections.tts.modules.vits_modules import WN, Flip
 
 def get_padding(kernel_size: int, dilation: int = 1) -> int:
     return (kernel_size * dilation - dilation) // 2
@@ -154,8 +156,331 @@ class SLMDiscriminator(NeuralModule):
 
         return [y_d_r.unsqueeze(1)], [y_d_g.unsqueeze(1)], [fmap_r], [fmap_g]
 
+class GlowDist(NeuralModule):
+    """
+    Base distribution of the Glow model, i.e. Diagonal Gaussian with one mean and
+    log scale for each channel
+    """
 
-class CodecActivation(nn.Module):
+    def __init__(self, shape, num_classes=None, logscale_factor=3.0):
+        """Constructor
+
+        Args:
+          shape: Shape of the variables
+          num_classes: Number of classes if the base is class conditional, None otherwise
+          logscale_factor: Scaling factor for mean and log variance
+        """
+        super().__init__()
+        # Save shape and related statistics
+        if isinstance(shape, int):
+            shape = (shape,)
+        if isinstance(shape, list):
+            shape = tuple(shape)
+        self.shape = shape
+        self.n_dim = len(shape)
+        self.num_pix = np.prod(shape[1:])
+        self.d = np.prod(shape)
+        self.sum_dim = list(range(1, self.n_dim + 1))
+        self.num_classes = num_classes
+        self.class_cond = num_classes is not None
+        self.logscale_factor = logscale_factor
+        # Set up parameters
+        self.loc = nn.Parameter(
+            torch.zeros(1, self.shape[0], *((self.n_dim - 1) * [1]))
+        )
+        self.loc_logs = nn.Parameter(
+            torch.zeros(1, self.shape[0], *((self.n_dim - 1) * [1]))
+        )
+        self.log_scale = nn.Parameter(
+            torch.zeros(1, self.shape[0], *((self.n_dim - 1) * [1]))
+        )
+        self.log_scale_logs = nn.Parameter(
+            torch.zeros(1, self.shape[0], *((self.n_dim - 1) * [1]))
+        )
+        # Class conditional parameter if needed
+        if self.class_cond:
+            self.loc_cc = nn.Parameter(torch.zeros(self.num_classes, self.shape[0]))
+            self.log_scale_cc = nn.Parameter(
+                torch.zeros(self.num_classes, self.shape[0])
+            )
+        # Temperature parameter for annealed sampling
+        self.temperature = None
+
+    def forward(self, num_samples=1, y=None):
+        # Prepare parameter
+        loc = self.loc * torch.exp(self.loc_logs * self.logscale_factor)
+        log_scale = self.log_scale * torch.exp(
+            self.log_scale_logs * self.logscale_factor
+        )
+        if self.class_cond:
+            if y is not None:
+                num_samples = len(y)
+            else:
+                y = torch.randint(
+                    self.num_classes, (num_samples,), device=self.loc.device
+                )
+            if y.dim() == 1:
+                y_onehot = torch.zeros(
+                    (len(y), self.num_classes),
+                    dtype=self.loc.dtype,
+                    device=self.loc.device,
+                )
+                y_onehot.scatter_(1, y[:, None], 1)
+                y = y_onehot
+            loc = loc + (y @ self.loc_cc).view(
+                y.size(0), self.shape[0], *((self.n_dim - 1) * [1])
+            )
+            log_scale = log_scale + (y @ self.log_scale_cc).view(
+                y.size(0), self.shape[0], *((self.n_dim - 1) * [1])
+            )
+        if self.temperature is not None:
+            log_scale = log_scale + np.log(self.temperature)
+        # Sample
+        eps = torch.randn(
+            (num_samples,) + self.shape, dtype=self.loc.dtype, device=self.loc.device
+        )
+        z = loc + torch.exp(log_scale) * eps
+        # Get log prob
+        log_p = (
+            -0.5 * self.d * np.log(2 * np.pi)
+            - self.num_pix * torch.sum(log_scale, dim=self.sum_dim)
+            - 0.5 * torch.sum(torch.pow(eps, 2), dim=self.sum_dim)
+        )
+        return z, log_p
+
+    def log_prob(self, z, y=None):
+        # Perpare parameter
+        loc = self.loc * torch.exp(self.loc_logs * self.logscale_factor)
+        log_scale = self.log_scale * torch.exp(
+            self.log_scale_logs * self.logscale_factor
+        )
+        if self.class_cond:
+            if y.dim() == 1:
+                y_onehot = torch.zeros(
+                    (len(y), self.num_classes),
+                    dtype=self.loc.dtype,
+                    device=self.loc.device,
+                )
+                y_onehot.scatter_(1, y[:, None], 1)
+                y = y_onehot
+            loc = loc + (y @ self.loc_cc).view(
+                y.size(0), self.shape[0], *((self.n_dim - 1) * [1])
+            )
+            log_scale = log_scale + (y @ self.log_scale_cc).view(
+                y.size(0), self.shape[0], *((self.n_dim - 1) * [1])
+            )
+        if self.temperature is not None:
+            log_scale = log_scale + np.log(self.temperature)
+        # Get log prob
+        log_p = (
+            -0.5 * self.d * np.log(2 * np.pi)
+            - self.num_pix * torch.sum(log_scale, dim=self.sum_dim)
+            - 0.5
+            * torch.sum(
+                torch.pow((z - loc) / torch.exp(log_scale), 2), dim=self.sum_dim
+            )
+        )
+        return log_p
+
+class DiagGaussian(NeuralModule):
+    """
+    Multivariate Gaussian distribution with diagonal covariance matrix
+    """
+
+    def __init__(self, shape, trainable=False):
+        """Constructor
+
+        Args:
+          shape: Tuple with shape of data, if int shape has one dimension
+          trainable: Flag whether to use trainable or fixed parameters
+        """
+        super().__init__()
+        if isinstance(shape, int):
+            shape = (shape,)
+        if isinstance(shape, list):
+            shape = tuple(shape)
+        self.shape = shape
+        self.n_dim = len(shape)
+        self.d = np.prod(shape)
+        if trainable:
+            self.loc = nn.Parameter(torch.zeros(1, *self.shape))
+            self.log_scale = nn.Parameter(torch.zeros(1, *self.shape))
+        else:
+            self.register_buffer("loc", torch.zeros(1, *self.shape))
+            self.register_buffer("log_scale", torch.zeros(1, *self.shape))
+        self.temperature = None  # Temperature parameter for annealed sampling
+
+    def forward(self, num_samples=1, context=None):
+        eps = torch.randn(
+            (num_samples,) + self.shape, dtype=self.loc.dtype, device=self.loc.device
+        )
+        if self.temperature is None:
+            log_scale = self.log_scale
+        else:
+            log_scale = self.log_scale + np.log(self.temperature)
+        z = self.loc + torch.exp(log_scale) * eps
+        log_p = -0.5 * self.d * np.log(2 * np.pi) - torch.sum(
+            log_scale + 0.5 * torch.pow(eps, 2), list(range(1, self.n_dim + 1))
+        )
+        return z, log_p
+
+    def log_prob(self, z, context=None):
+        if self.temperature is None:
+            log_scale = self.log_scale
+        else:
+            log_scale = self.log_scale + np.log(self.temperature)
+        log_p = -0.5 * self.d * np.log(2 * np.pi) - torch.sum(
+            log_scale + 0.5 * torch.pow((z - self.loc) / torch.exp(log_scale), 2),
+            list(range(1, self.n_dim + 1)),
+        )
+        return log_p
+
+
+class ResidualCouplingLayer(NeuralModule):
+    def __init__(
+        self,
+        channels,
+        hidden_channels,
+        kernel_size,
+        dilation_rate,
+        n_layers,
+        p_dropout=0,
+        gin_channels=0,
+        mean_only=False,
+    ):
+        assert channels % 2 == 0, "channels should be divisible by 2"
+        super().__init__()
+        self.channels = channels
+        self.hidden_channels = hidden_channels
+        self.kernel_size = kernel_size
+        self.dilation_rate = dilation_rate
+        self.n_layers = n_layers
+        self.half_channels = channels // 2
+        self.mean_only = mean_only
+
+        self.pre = nn.Conv1d(self.half_channels, hidden_channels, 1)
+        self.enc = WN(
+            hidden_channels, kernel_size, dilation_rate, n_layers, p_dropout=p_dropout, gin_channels=gin_channels
+        )
+        self.post = nn.Conv1d(hidden_channels, self.half_channels * (2 - mean_only), 1)
+        self.post.weight.data.zero_()
+        self.post.bias.data.zero_()
+
+    def forward(self, x, x_mask, g=None, reverse=False):
+        x0, x1 = torch.split(x, [self.half_channels] * 2, 1)
+        h = self.pre(x0) * x_mask
+        h = self.enc(h, x_mask, g=g)
+        stats = self.post(h) * x_mask
+        if not self.mean_only:
+            m, logs = torch.split(stats, [self.half_channels] * 2, 1)
+        else:
+            m = stats
+            logs = torch.zeros_like(m)
+
+        if not reverse:
+            x1 = m + x1 * torch.exp(logs) * x_mask
+            x = torch.cat([x0, x1], 1)
+            logdet = torch.sum(logs, [1, 2])
+            return x, logdet, logs
+        else:
+            x1 = (x1 - m) * torch.exp(-logs) * x_mask
+            x = torch.cat([x0, x1], 1)
+            return x
+
+
+class Flip(NeuralModule):
+    def forward(self, x, *args, reverse=False, **kwargs):
+        
+        if not reverse:
+            logdet = torch.zeros(x.size(0)).to(dtype=x.dtype, device=x.device)
+            return x, logdet
+        else:
+            return x
+
+class ResidualCouplingBlock(NeuralModule):
+    def __init__(self, channels, hidden_channels, kernel_size, dilation_rate, n_layers, n_flows=4, gin_channels=0):
+        super().__init__()
+        self.channels = channels
+        self.hidden_channels = hidden_channels
+        self.kernel_size = kernel_size
+        self.dilation_rate = dilation_rate
+        self.n_layers = n_layers
+        self.n_flows = n_flows
+        self.gin_channels = gin_channels
+
+        self.num_samples = self.channels
+        # self.q0 = GlowDist(self.num_samples)
+        self.q0 = DiagGaussian(self.num_samples)
+
+        self.flows = nn.ModuleList()
+        for i in range(n_flows):
+            self.flows.append(
+                ResidualCouplingLayer(
+                    channels,
+                    hidden_channels,
+                    kernel_size,
+                    dilation_rate,
+                    n_layers,
+                    gin_channels=gin_channels,
+                    mean_only=False,
+                )
+            )
+            # self.flows.append(Flip())
+
+    def forward(self, x, x_len, g=None, reverse=False):
+        x_mask = get_mask_from_lengths(x_len).unsqueeze(1)
+
+        if not reverse:
+            for i, flow in enumerate(self.flows):
+                x, logdet, logs = flow(x, x_mask, g=g, reverse=reverse)
+                x = torch.flip(x, [1])
+                if i == len(self.flows)-2:
+                    logs_0 = logs.clone()
+                elif i == len(self.flows)-1:
+                    logs_1 = logs.clone()
+            logs = torch.cat([logs_0, logs_1], 1)
+            return x, logdet, logs
+        else:
+            for flow in reversed(self.flows):
+                x = torch.flip(x, [1])
+                x = flow(x, x_mask, g=g, reverse=reverse)
+            return x
+
+    def forward_kld(self, x, x_len, g=None):
+        """Estimates forward KL divergence, see [arXiv 1912.02762](https://arxiv.org/abs/1912.02762)
+
+        Args:
+          x: Batch sampled from target distribution
+
+        Returns:
+          Estimate of forward KL divergence averaged over batch
+        """
+        x_mask = get_mask_from_lengths(x_len).unsqueeze(1)
+
+        log_q = torch.zeros(len(x), device=x.device)
+
+        for flow in self.flows:
+            x, log_det, _ = flow(x, x_mask, g=g, reverse=False)
+            log_q += log_det
+
+        # last x is z
+        z = x
+        log_q += self.q0.log_prob(z.transpose(1, 2)).mean(1)
+        kld = -torch.mean(log_q)
+        return kld
+
+    def sample(self, z, logs, temperature=0.667):
+        z_ = z + torch.randn_like(z) * torch.exp(logs) * temperature
+        return z_
+
+    def infer(self, x, x_len, g=None, temperature=0.667):
+        z, logdet, logs = self.forward(x, x_len, g=g, reverse=False)
+        z_ = self.sample(z, logs, temperature=temperature)
+        x = self.forward(z_, x_len, g=g, reverse=True)
+        return x
+
+
+class CodecActivation(NeuralModule):
     """
     Choose between activation based on the input parameter.
 
@@ -182,7 +507,7 @@ class CodecActivation(nn.Module):
         return self.activation(x)
 
 
-class CausalConvTranspose1dNorm(nn.Module):
+class CausalConvTranspose1dNorm(NeuralModule):
     """ConvTranspose1d causal padding and normalization."""
 
     def __init__(
@@ -237,7 +562,7 @@ class CausalConvTranspose1dNorm(nn.Module):
         return hidden_states
 
 
-class CausalConv1dNorm(nn.Module):
+class CausalConv1dNorm(NeuralModule):
     """Conv1d with causal padding and normalization."""
         
     def __init__(
@@ -1764,7 +2089,7 @@ class CausalAudioTokenPredictor(NeuralModule):
         return audio_tokens, audio_logits, audio_len
 
 
-class LayerNorm(nn.Module):
+class LayerNorm(NeuralModule):
     def __init__(self, channels, eps=1e-5):
         super().__init__()
         self.channels = channels

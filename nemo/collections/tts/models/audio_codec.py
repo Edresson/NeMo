@@ -46,6 +46,7 @@ from nemo.core.optim.lr_scheduler import compute_max_steps, prepare_lr_scheduler
 from nemo.utils import logging, model_utils
 from nemo.utils.decorators import experimental
 
+from nemo.collections.tts.modules.audio_codec_modules import ResidualCouplingBlock
 
 @experimental
 class AudioCodecModel(ModelPT):
@@ -99,14 +100,20 @@ class AudioCodecModel(ModelPT):
             logging.warning('Vector quantizer will not be used.')
             self.vector_quantizer = None
 
+        # Decoder setup
+        self.audio_decoder = instantiate(cfg.audio_decoder)
+
         # Freeze audio encoder and vector quantizer if needed
         if cfg.get("freeze_audio_encoder_and_vector_quantizer", False):
             logging.warning('Freezing Audio Encoder and Vector quantizer.')
             self.audio_encoder.freeze()
             self.vector_quantizer.freeze()
 
-        # Decoder setup
-        self.audio_decoder = instantiate(cfg.audio_decoder)
+        if cfg.get("freeze_codec_generator", False):
+            logging.warning('Freezing the whole codec generator.')
+            self.audio_encoder.freeze()
+            self.vector_quantizer.freeze()
+            self.audio_decoder.freeze()
 
         # Discriminator setup
         self.discriminator = instantiate(cfg.discriminator)
@@ -166,13 +173,13 @@ class AudioCodecModel(ModelPT):
         if "distillation" in cfg:
             distil_model_path = cfg.distillation.get("distil_model_path", None)
             self.distil_loss_scale = cfg.distillation.get("distil_loss_scale", 1.0)
+
             if distil_model_path is not None:
                 self.use_distil_loss = True
                 self.distil_codec_model = AudioCodecModel.restore_from(restore_path=distil_model_path)
                 # freeze model
                 self.distil_codec_model.freeze()
 
-                
                 # delete generator and discriminator to free memory
                 del self.distil_codec_model.discriminator
                 del self.distil_codec_model.audio_decoder
@@ -184,6 +191,13 @@ class AudioCodecModel(ModelPT):
                     self.distil_loss = torch.nn.MSELoss(reduction='none')# MaskedMSELoss()
                 else:
                     self.distil_loss = AudioTokenLoss(num_codebooks=self.token_predictor.num_codebooks)
+        
+        self.use_sampling_flow = cfg.get("use_sampling_flow", False)
+        self.inference_sampling_temperature = cfg.get("inference_sampling_temperature", 0.667)
+        self.flow_loss_scale = cfg.get("flow_loss_scale", 1.0)
+
+        if self.use_sampling_flow:
+            self.flow = ResidualCouplingBlock(cfg.audio_encoder.encoded_dim, cfg.audio_encoder.encoded_dim, 5, 1, 8, gin_channels=0)
 
         # Log setup
         self.log_config = cfg.get("log_config", None)
@@ -238,6 +252,9 @@ class AudioCodecModel(ModelPT):
             Decoded output `audio` in the time domain and its length in number of samples `audio_len`.
             Note that `audio_len` will be a multiple of `self.samples_per_frame`.
         """
+        if self.use_sampling_flow:
+            inputs = self.flow.infer(inputs, input_len, temperature=0.667)
+
         audio, audio_len = self.audio_decoder(inputs=inputs, input_len=input_len)
         return audio, audio_len
 
@@ -345,6 +362,7 @@ class AudioCodecModel(ModelPT):
         """
         # Convert a discrete representation to a dequantized vector for each frame
         dequantized = self.dequantize(tokens=tokens, tokens_len=tokens_len)
+
         # Apply decoder to obtain time-domain audio for each frame
         audio, audio_len = self.decode_audio(inputs=dequantized, input_len=tokens_len)
 
@@ -446,10 +464,14 @@ class AudioCodecModel(ModelPT):
         else:
             distil_loss = 0.0
 
+        flow_loss = 0.0
+        if self.use_sampling_flow:
+            flow_loss = self.flow.forward_kld(encoded, encoded_len)
+
         # [B, T]
         audio_gen, _ = self.audio_decoder(inputs=encoded, input_len=encoded_len)
 
-        return audio, audio_len, audio_gen, commit_loss, distil_loss
+        return audio, audio_len, audio_gen, commit_loss, distil_loss, flow_loss
 
     @property
     def disc_update_prob(self) -> float:
@@ -466,7 +488,7 @@ class AudioCodecModel(ModelPT):
     def training_step(self, batch, batch_idx):
         optim_gen, optim_disc = self.optimizers()
 
-        audio, audio_len, audio_gen, commit_loss, distil_loss = self._process_batch(batch)
+        audio, audio_len, audio_gen, commit_loss, distil_loss, flow_loss = self._process_batch(batch)
 
         metrics = {
             "global_step": self.global_step,
@@ -530,6 +552,10 @@ class AudioCodecModel(ModelPT):
             metrics["g_loss_distil"] = distil_loss * self.distil_loss_scale
             generator_losses.append(metrics["g_loss_distil"])
 
+        if flow_loss:
+            metrics["g_loss_flow"] = flow_loss * self.flow_loss_scale
+            generator_losses.append(metrics["g_loss_flow"])
+            
         loss_gen_all = sum(generator_losses)
 
         optim_gen.zero_grad()
@@ -545,7 +571,7 @@ class AudioCodecModel(ModelPT):
         self.update_lr("epoch")
 
     def validation_step(self, batch, batch_idx):
-        audio, audio_len, audio_gen, _, distil_loss = self._process_batch(batch)
+        audio, audio_len, audio_gen, _, distil_loss, flow_loss = self._process_batch(batch)
 
         loss_mel_l1, loss_mel_l2 = self.mel_loss_fn(audio_real=audio, audio_gen=audio_gen, audio_len=audio_len)
         loss_stft = self.stft_loss_fn(audio_real=audio, audio_gen=audio_gen, audio_len=audio_len)
@@ -566,6 +592,10 @@ class AudioCodecModel(ModelPT):
 
         if distil_loss:
             metrics["val_loss_distil"] = distil_loss * self.distil_loss_scale
+
+        if flow_loss:
+            metrics["g_loss_flow"] = flow_loss * self.flow_loss_scale
+            metrics["val_loss"] += metrics["g_loss_flow"]
 
         self.log_dict(metrics, on_epoch=True, sync_dist=True)
 
@@ -633,9 +663,10 @@ class AudioCodecModel(ModelPT):
         sched_config = optim_config.pop("sched", None)
         OmegaConf.set_struct(optim_config, True)
 
+        flow_params = self.flow.parameters() if self.use_sampling_flow else []
         vq_params = self.vector_quantizer.parameters() if self.vector_quantizer else []
         distil_params = itertools.chain(self.token_predictor.parameters(), self.distil_codec_model.parameters()) if self.use_distil_loss else []
-        gen_params = itertools.chain(self.audio_encoder.parameters(), self.audio_decoder.parameters(), vq_params, distil_params)
+        gen_params = itertools.chain(self.audio_encoder.parameters(), self.audio_decoder.parameters(), vq_params, distil_params, flow_params)
         optim_g = instantiate(optim_config, params=gen_params)
 
         disc_params = self.discriminator.parameters()
