@@ -156,6 +156,47 @@ class SLMDiscriminator(NeuralModule):
 
         return [y_d_r.unsqueeze(1)], [y_d_g.unsqueeze(1)], [fmap_r], [fmap_g]
 
+
+class GaussianVAE(NeuralModule):        
+    def __init__(self, dim, latent_dim, bias=True, use_weight_norm=True):
+        super().__init__()
+        
+        self.proj_in = nn.Linear(dim, latent_dim * 2, bias=bias)
+        self.proj_out = nn.Linear(latent_dim, dim, bias=bias)
+
+        if use_weight_norm:
+            self.proj_in = torch.nn.utils.parametrizations.weight_norm(self.proj_in)
+            self.proj_out = torch.nn.utils.parametrizations.weight_norm(self.proj_out)
+
+    def reparam(self, mu, logvar):
+        std = torch.exp(logvar / 2)
+        eps = torch.randn_like(std)
+        return mu + eps * std
+
+    def kl_divergence(self, mu, logvar):
+        return torch.mean(-0.5 * torch.sum(
+                1 + logvar - mu.pow(2) - logvar.exp(),
+                dim=(1, 2))
+            )
+        
+    def repr_from_latent(self, latent):
+        if isinstance(latent, torch.Tensor):
+            z = latent
+        else:
+            z = self.reparam(latent['mu'], latent['logvar'])
+        l = self.proj_out(z)
+        return l
+
+    def forward(self, x):
+        x = x.transpose(1, 2)
+        mu, logvar = self.proj_in(x).chunk(2, dim=-1)
+        kl_div = self.kl_divergence(mu, logvar)
+        z = self.reparam(mu, logvar)
+        xhat = self.proj_out(z).transpose(1, 2)
+        latent_dict = {'mu': mu, 'logvar': logvar, 'z': z, 'kl_divergence': kl_div}
+        return xhat, latent_dict
+
+
 class GlowDist(NeuralModule):
     """
     Base distribution of the Glow model, i.e. Diagonal Gaussian with one mean and
@@ -469,6 +510,7 @@ class ResidualCouplingBlock(NeuralModule):
         log_q += self.q0.log_prob(z.transpose(1, 2)).mean(1)
         kld = -torch.mean(log_q)
         return kld
+
 
     def sample(self, z, logs, temperature=0.667):
         z_ = z + torch.randn_like(z) * torch.exp(logs) * temperature

@@ -46,7 +46,7 @@ from nemo.core.optim.lr_scheduler import compute_max_steps, prepare_lr_scheduler
 from nemo.utils import logging, model_utils
 from nemo.utils.decorators import experimental
 
-from nemo.collections.tts.modules.audio_codec_modules import ResidualCouplingBlock
+from nemo.collections.tts.modules.audio_codec_modules import ResidualCouplingBlock, GaussianVAE
 
 @experimental
 class AudioCodecModel(ModelPT):
@@ -199,6 +199,11 @@ class AudioCodecModel(ModelPT):
         if self.use_sampling_flow:
             self.flow = ResidualCouplingBlock(cfg.audio_encoder.encoded_dim, cfg.audio_encoder.encoded_dim, 5, 1, 8, gin_channels=0)
 
+        self.use_gaussian_vae = cfg.get("use_gaussian_vae", False)
+        self.vae_loss_scale = cfg.get("vae_loss_scale", 1.0)
+        if self.use_gaussian_vae:
+            self.vae = GaussianVAE(cfg.audio_encoder.encoded_dim, cfg.audio_encoder.encoded_dim)
+        
         # Log setup
         self.log_config = cfg.get("log_config", None)
 
@@ -252,8 +257,13 @@ class AudioCodecModel(ModelPT):
             Decoded output `audio` in the time domain and its length in number of samples `audio_len`.
             Note that `audio_len` will be a multiple of `self.samples_per_frame`.
         """
+
         if self.use_sampling_flow:
             inputs = self.flow.infer(inputs, input_len, temperature=0.667)
+
+        if self.use_gaussian_vae:
+            inputs, _ = self.vae(inputs)
+            print("VAE infer done !!")
 
         audio, audio_len = self.audio_decoder(inputs=inputs, input_len=input_len)
         return audio, audio_len
@@ -468,10 +478,15 @@ class AudioCodecModel(ModelPT):
         if self.use_sampling_flow:
             flow_loss = self.flow.forward_kld(encoded, encoded_len)
 
+        vae_loss = 0.0
+        if self.use_gaussian_vae:
+            encoded, latents = self.vae(encoded)
+            vae_loss = latents["kl_divergence"]
+
         # [B, T]
         audio_gen, _ = self.audio_decoder(inputs=encoded, input_len=encoded_len)
 
-        return audio, audio_len, audio_gen, commit_loss, distil_loss, flow_loss
+        return audio, audio_len, audio_gen, commit_loss, distil_loss, flow_loss, vae_loss
 
     @property
     def disc_update_prob(self) -> float:
@@ -488,7 +503,7 @@ class AudioCodecModel(ModelPT):
     def training_step(self, batch, batch_idx):
         optim_gen, optim_disc = self.optimizers()
 
-        audio, audio_len, audio_gen, commit_loss, distil_loss, flow_loss = self._process_batch(batch)
+        audio, audio_len, audio_gen, commit_loss, distil_loss, flow_loss, vae_loss = self._process_batch(batch)
 
         metrics = {
             "global_step": self.global_step,
@@ -555,7 +570,12 @@ class AudioCodecModel(ModelPT):
         if flow_loss:
             metrics["g_loss_flow"] = flow_loss * self.flow_loss_scale
             generator_losses.append(metrics["g_loss_flow"])
-            
+        
+        if vae_loss:
+            metrics["g_loss_vae"] = vae_loss * self.vae_loss_scale
+            print("VAE loss:", metrics["g_loss_vae"])
+            generator_losses.append(metrics["g_loss_vae"])
+
         loss_gen_all = sum(generator_losses)
 
         optim_gen.zero_grad()
@@ -571,7 +591,7 @@ class AudioCodecModel(ModelPT):
         self.update_lr("epoch")
 
     def validation_step(self, batch, batch_idx):
-        audio, audio_len, audio_gen, _, distil_loss, flow_loss = self._process_batch(batch)
+        audio, audio_len, audio_gen, _, distil_loss, flow_loss, vae_loss = self._process_batch(batch)
 
         loss_mel_l1, loss_mel_l2 = self.mel_loss_fn(audio_real=audio, audio_gen=audio_gen, audio_len=audio_len)
         loss_stft = self.stft_loss_fn(audio_real=audio, audio_gen=audio_gen, audio_len=audio_len)
@@ -596,6 +616,10 @@ class AudioCodecModel(ModelPT):
         if flow_loss:
             metrics["val_loss_flow"] = flow_loss * self.flow_loss_scale
             metrics["val_loss"] += metrics["val_loss_flow"]
+
+        if vae_loss:
+            metrics["val_loss_vae"] = vae_loss * self.vae_loss_scale
+            metrics["val_loss"] += metrics["val_loss_vae"]
 
         self.log_dict(metrics, on_epoch=True, sync_dist=True)
 
@@ -664,9 +688,10 @@ class AudioCodecModel(ModelPT):
         OmegaConf.set_struct(optim_config, True)
 
         flow_params = self.flow.parameters() if self.use_sampling_flow else []
+        vae_params = self.vae.parameters() if self.use_gaussian_vae else []
         vq_params = self.vector_quantizer.parameters() if self.vector_quantizer else []
         distil_params = itertools.chain(self.token_predictor.parameters(), self.distil_codec_model.parameters()) if self.use_distil_loss else []
-        gen_params = itertools.chain(self.audio_encoder.parameters(), self.audio_decoder.parameters(), vq_params, distil_params, flow_params)
+        gen_params = itertools.chain(self.audio_encoder.parameters(), self.audio_decoder.parameters(), vq_params, distil_params, flow_params, vae_params)
         optim_g = instantiate(optim_config, params=gen_params)
 
         disc_params = self.discriminator.parameters()
