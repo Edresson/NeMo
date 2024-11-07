@@ -203,7 +203,7 @@ class AudioCodecModel(ModelPT):
         self.vae_loss_scale = cfg.get("vae_loss_scale", 1.0)
         if self.use_gaussian_vae:
             self.vae = GaussianVAE(cfg.audio_encoder.encoded_dim, cfg.audio_encoder.encoded_dim)
-        
+
         # Log setup
         self.log_config = cfg.get("log_config", None)
 
