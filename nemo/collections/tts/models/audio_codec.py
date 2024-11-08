@@ -103,6 +103,13 @@ class AudioCodecModel(ModelPT):
         # Decoder setup
         self.audio_decoder = instantiate(cfg.audio_decoder)
 
+        # Add gaussian VAE
+        self.use_gaussian_vae = cfg.get("use_gaussian_vae", False)
+        self.vae_loss_scale = cfg.get("vae_loss_scale", 1.0)
+
+        if self.use_gaussian_vae:
+            self.audio_decoder.vae = GaussianVAE(cfg.audio_encoder.encoded_dim, cfg.audio_encoder.encoded_dim)
+
         # Freeze audio encoder and vector quantizer if needed
         if cfg.get("freeze_audio_encoder_and_vector_quantizer", False):
             logging.warning('Freezing Audio Encoder and Vector quantizer.')
@@ -199,10 +206,6 @@ class AudioCodecModel(ModelPT):
         if self.use_sampling_flow:
             self.flow = ResidualCouplingBlock(cfg.audio_encoder.encoded_dim, cfg.audio_encoder.encoded_dim, 5, 1, 8, gin_channels=0)
 
-        self.use_gaussian_vae = cfg.get("use_gaussian_vae", False)
-        self.vae_loss_scale = cfg.get("vae_loss_scale", 1.0)
-        if self.use_gaussian_vae:
-            self.vae = GaussianVAE(cfg.audio_encoder.encoded_dim, cfg.audio_encoder.encoded_dim)
 
         # Log setup
         self.log_config = cfg.get("log_config", None)
@@ -262,8 +265,7 @@ class AudioCodecModel(ModelPT):
             inputs = self.flow.infer(inputs, input_len, temperature=0.667)
 
         if self.use_gaussian_vae:
-            inputs, _ = self.vae(inputs)
-            print("VAE infer done !!")
+            inputs, _ = self.audio_decoder.vae(inputs)
 
         audio, audio_len = self.audio_decoder(inputs=inputs, input_len=input_len)
         return audio, audio_len
@@ -480,7 +482,7 @@ class AudioCodecModel(ModelPT):
 
         vae_loss = 0.0
         if self.use_gaussian_vae:
-            encoded, latents = self.vae(encoded)
+            encoded, latents = self.audio_decoder.vae(encoded)
             vae_loss = latents["kl_divergence"]
 
         # [B, T]
@@ -572,9 +574,8 @@ class AudioCodecModel(ModelPT):
             generator_losses.append(metrics["g_loss_flow"])
         
         if vae_loss:
-            metrics["g_loss_vae"] = vae_loss * self.vae_loss_scale
-            print("VAE loss:", metrics["g_loss_vae"])
-            generator_losses.append(metrics["g_loss_vae"])
+            metrics["g_loss_vae"] = vae_loss
+            generator_losses.append(vae_loss * self.vae_loss_scale)
 
         loss_gen_all = sum(generator_losses)
 
@@ -688,10 +689,9 @@ class AudioCodecModel(ModelPT):
         OmegaConf.set_struct(optim_config, True)
 
         flow_params = self.flow.parameters() if self.use_sampling_flow else []
-        vae_params = self.vae.parameters() if self.use_gaussian_vae else []
         vq_params = self.vector_quantizer.parameters() if self.vector_quantizer else []
         distil_params = itertools.chain(self.token_predictor.parameters(), self.distil_codec_model.parameters()) if self.use_distil_loss else []
-        gen_params = itertools.chain(self.audio_encoder.parameters(), self.audio_decoder.parameters(), vq_params, distil_params, flow_params, vae_params)
+        gen_params = itertools.chain(self.audio_encoder.parameters(), self.audio_decoder.parameters(), vq_params, distil_params, flow_params)
         optim_g = instantiate(optim_config, params=gen_params)
 
         disc_params = self.discriminator.parameters()
