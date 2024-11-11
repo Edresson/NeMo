@@ -158,9 +158,43 @@ class SLMDiscriminator(NeuralModule):
 
 
 class GaussianVAE(NeuralModule):        
-    def __init__(self, dim, latent_dim, bias=True, use_weight_norm=True):
+    def __init__(self, dim, latent_dim, bias=True, use_weight_norm=True, use_large_encoder_decoder=False, vae_out_clamp=True):
         super().__init__()
-        
+        self.vae_out_clamp = vae_out_clamp
+        self.use_large_encoder_decoder = use_large_encoder_decoder
+        if self.use_large_encoder_decoder:
+            num_layers = 10
+            self.res_encoder = nn.ModuleList(
+                [
+                    ResidualBlock(
+                        channels=dim,
+                        filters=768,
+                        kernel_size=3,
+                        dropout_rate=0.05,
+                        activation="lrelu",
+                        is_causal=True,
+                    )
+                    for _ in range(num_layers)
+                ]
+            )
+            self.res_decoder = nn.ModuleList(
+                [
+                    ResidualBlock(
+                        channels=dim,
+                        filters=768,
+                        kernel_size=3,
+                        dropout_rate=0.05,
+                        activation="lrelu",
+                        is_causal=True,
+                    )
+                    for _ in range(num_layers)
+                ]
+            )
+
+        if self.vae_out_clamp:
+            # kepp only values between 1 and -1
+            self.out_activation = ClampActivation()
+
         self.proj_in = nn.Linear(dim, latent_dim * 2, bias=bias)
         self.proj_out = nn.Linear(latent_dim, dim, bias=bias)
 
@@ -178,21 +212,34 @@ class GaussianVAE(NeuralModule):
                 1 + logvar - mu.pow(2) - logvar.exp(),
                 dim=(1, 2))
             )
-        
-    def repr_from_latent(self, latent):
-        if isinstance(latent, torch.Tensor):
-            z = latent
-        else:
-            z = self.reparam(latent['mu'], latent['logvar'])
-        l = self.proj_out(z)
-        return l
 
     def forward(self, x):
+        if self.use_large_encoder_decoder:
+            target_x = x.clone()
+            x_len = torch.Tensor([x.size(-1)]).repeat(x.size(0)).to(x.device)
+            for res_block in self.res_encoder:
+                x = res_block(inputs=x, input_len=x_len)
+
         x = x.transpose(1, 2)
+
         mu, logvar = self.proj_in(x).chunk(2, dim=-1)
         kl_div = self.kl_divergence(mu, logvar)
         z = self.reparam(mu, logvar)
+
+        if self.use_large_encoder_decoder:
+            for res_block in self.res_decoder:
+                z = res_block(inputs=z.transpose(1, 2), input_len=x_len).transpose(1, 2)
+
         xhat = self.proj_out(z).transpose(1, 2)
+
+        if self.vae_out_clamp:
+            xhat = self.out_activation(xhat)
+
+        # compute MSE
+        if self.use_large_encoder_decoder:
+            mse_loss = torch.nn.functional.mse_loss(xhat, target_x)
+            kl_div += mse_loss
+
         latent_dict = {'mu': mu, 'logvar': logvar, 'z': z, 'kl_divergence': kl_div}
         return xhat, latent_dict
 
