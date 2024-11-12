@@ -18,6 +18,7 @@ from pathlib import Path
 from typing import List, Tuple
 
 import torch
+import torchaudio
 import torch.nn.functional as F
 from einops import rearrange
 from hydra.utils import instantiate
@@ -46,7 +47,7 @@ from nemo.core.optim.lr_scheduler import compute_max_steps, prepare_lr_scheduler
 from nemo.utils import logging, model_utils
 from nemo.utils.decorators import experimental
 
-from nemo.collections.tts.modules.audio_codec_modules import ResidualCouplingBlock, GaussianVAE
+from nemo.collections.tts.modules.audio_codec_modules import ResidualCouplingBlock, GaussianVAE, ResNetSpeakerEncoder
 
 @experimental
 class AudioCodecModel(ModelPT):
@@ -210,6 +211,15 @@ class AudioCodecModel(ModelPT):
         if self.use_sampling_flow:
             self.flow = ResidualCouplingBlock(cfg.audio_encoder.encoded_dim, cfg.audio_encoder.encoded_dim, 5, 1, 8, gin_channels=0)
 
+        self.use_scl_loss = cfg.get("use_scl_loss", False)
+        self.scl_loss_scale = cfg.get("scl_loss_scale", False)
+        if self.use_scl_loss:
+            self.speaker_encoder = ResNetSpeakerEncoder()
+            # load pretrained model
+            self.speaker_encoder.load_checkpoint("https://github.com/coqui-ai/TTS/releases/download/speaker_encoder_model/model_se.pth.tar")
+            # freeze the pretrained speaker encoder
+            self.speaker_encoder.freeze()
+            print("Speaker encoder loaded and frozen !!")
 
         # Log setup
         self.log_config = cfg.get("log_config", None)
@@ -217,6 +227,19 @@ class AudioCodecModel(ModelPT):
         # Optimizer setup
         self.lr_schedule_interval = None
         self.automatic_optimization = False
+
+
+    def get_speaker_embedding(self, audio, requires_grad=False):
+        if not requires_grad:
+            with torch.no_grad():
+                audio_resampled = torchaudio.functional.resample(audio, self.sample_rate, self.speaker_encoder.audio_config["sample_rate"])
+                g = self.speaker_encoder(audio_resampled, l2_norm=True).unsqueeze(-1)
+        else:
+            audio_resampled = torchaudio.functional.resample(audio, self.sample_rate, self.speaker_encoder.audio_config["sample_rate"])
+            g = self.speaker_encoder(audio_resampled, l2_norm=True).unsqueeze(-1)
+
+        return g
+
 
     @typecheck(
         input_types={
@@ -592,6 +615,25 @@ class AudioCodecModel(ModelPT):
             else:
                 generator_losses.append(vae_loss * self.vae_loss_scale)
 
+
+        # compute embeddings for speaker consistency loss
+        if self.use_scl_loss:
+            # concate generated and GT waveforms
+            audios_batch = torch.cat((audio.squeeze(1), audio_gen.squeeze(1)), dim=0)
+
+            # get speaker embeddings with grads
+            pred_embs = self.get_speaker_embedding(audios_batch, requires_grad=True)
+
+            # split generated and GT speaker embeddings
+            gt_spk_emb, syn_spk_emb = torch.chunk(pred_embs, 2, dim=0)
+
+            # speaker consistency loss like YourTTS paper
+            loss_scl = -1 * torch.nn.functional.cosine_similarity(gt_spk_emb, syn_spk_emb).mean() * self.scl_loss_scale
+
+            metrics["g_loss_scl"] = loss_scl
+            generator_losses.append(metrics["g_loss_scl"])
+
+
         loss_gen_all = sum(generator_losses)
 
         optim_gen.zero_grad()
@@ -636,6 +678,24 @@ class AudioCodecModel(ModelPT):
         if vae_loss:
             metrics["val_loss_vae"] = vae_loss * self.vae_loss_scale
             metrics["val_loss"] += metrics["val_loss_vae"]
+
+        # compute embeddings for speaker consistency loss
+        if self.use_scl_loss:
+            # concate generated and GT waveforms
+            audios_batch = torch.cat((audio.squeeze(1), audio_gen.squeeze(1)), dim=0)
+
+            # get speaker embeddings with grads
+            pred_embs = self.get_speaker_embedding(audios_batch, requires_grad=True)
+
+            # split generated and GT speaker embeddings
+            gt_spk_emb, syn_spk_emb = torch.chunk(pred_embs, 2, dim=0)
+
+            # speaker consistency loss like YourTTS paper
+            loss_scl = -1 * torch.nn.functional.cosine_similarity(gt_spk_emb, syn_spk_emb).mean() * self.scl_loss_scale
+
+            metrics["val_loss_scl"] = loss_scl
+            metrics["val_loss"] += metrics["val_loss_scl"]
+
 
         self.log_dict(metrics, on_epoch=True, sync_dist=True)
 
@@ -703,11 +763,12 @@ class AudioCodecModel(ModelPT):
         sched_config = optim_config.pop("sched", None)
         OmegaConf.set_struct(optim_config, True)
 
+        se_params = self.speaker_encoder.parameters() if self.use_scl_loss else []
         vae_params = self.vae.parameters() if self.use_gaussian_vae else []
         flow_params = self.flow.parameters() if self.use_sampling_flow else []
         vq_params = self.vector_quantizer.parameters() if self.vector_quantizer else []
         distil_params = itertools.chain(self.token_predictor.parameters(), self.distil_codec_model.parameters()) if self.use_distil_loss else []
-        gen_params = itertools.chain(self.audio_encoder.parameters(), self.audio_decoder.parameters(), vq_params, distil_params, flow_params, vae_params)
+        gen_params = itertools.chain(self.audio_encoder.parameters(), self.audio_decoder.parameters(), vq_params, distil_params, flow_params, vae_params, se_params)
         optim_g = instantiate(optim_config, params=gen_params)
 
         disc_params = self.discriminator.parameters()
