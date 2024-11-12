@@ -109,9 +109,10 @@ class AudioCodecModel(ModelPT):
         self.vae_out_clamp = cfg.get("vae_out_clamp", False)
         self.vae_use_large_enc_dec = cfg.get("vae_use_large_enc_dec", False)
         self.vae_loss_scale = cfg.get("vae_loss_scale", 1.0)
+        self.vae_use_mse_loss = cfg.get("vae_use_mse_loss", False)
 
         if self.use_gaussian_vae:
-            self.vae = GaussianVAE(cfg.audio_encoder.encoded_dim, cfg.audio_encoder.encoded_dim, use_large_encoder_decoder=self.vae_use_large_enc_dec, vae_out_clamp=self.vae_out_clamp)
+            self.vae = GaussianVAE(cfg.audio_encoder.encoded_dim, cfg.audio_encoder.encoded_dim, use_large_encoder_decoder=self.vae_use_large_enc_dec, vae_out_clamp=self.vae_out_clamp, use_mse_loss=self.vae_use_mse_loss)
 
         # Freeze audio encoder and vector quantizer if needed
         if cfg.get("freeze_audio_encoder_and_vector_quantizer", False):

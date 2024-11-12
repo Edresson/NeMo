@@ -158,8 +158,9 @@ class SLMDiscriminator(NeuralModule):
 
 
 class GaussianVAE(NeuralModule):        
-    def __init__(self, dim, latent_dim, bias=True, use_weight_norm=True, use_large_encoder_decoder=False, vae_out_clamp=True):
+    def __init__(self, dim, latent_dim, bias=True, use_weight_norm=True, use_large_encoder_decoder=False, vae_out_clamp=False, use_mse_loss=False):
         super().__init__()
+        self.use_mse_loss = use_mse_loss
         self.vae_out_clamp = vae_out_clamp
         self.use_large_encoder_decoder = use_large_encoder_decoder
         if self.use_large_encoder_decoder:
@@ -215,7 +216,8 @@ class GaussianVAE(NeuralModule):
 
     def forward(self, x):
         if self.use_large_encoder_decoder:
-            target_x = x.clone()
+            if self.use_mse_loss:
+                target_x = x.clone()
             x_len = torch.Tensor([x.size(-1)]).repeat(x.size(0)).to(x.device)
             for res_block in self.res_encoder:
                 x = res_block(inputs=x, input_len=x_len)
@@ -227,8 +229,10 @@ class GaussianVAE(NeuralModule):
         z = self.reparam(mu, logvar)
 
         if self.use_large_encoder_decoder:
+            z = z.transpose(1, 2)
             for res_block in self.res_decoder:
-                z = res_block(inputs=z.transpose(1, 2), input_len=x_len).transpose(1, 2)
+                z = res_block(inputs=z, input_len=x_len)
+            z = z.transpose(1, 2)
 
         xhat = self.proj_out(z).transpose(1, 2)
 
@@ -236,7 +240,7 @@ class GaussianVAE(NeuralModule):
             xhat = self.out_activation(xhat)
 
         # compute MSE
-        if self.use_large_encoder_decoder:
+        if self.use_mse_loss:
             mse_loss = torch.nn.functional.mse_loss(xhat, target_x)
             kl_div += mse_loss
 
