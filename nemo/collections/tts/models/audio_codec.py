@@ -49,6 +49,25 @@ from nemo.utils.decorators import experimental
 
 from nemo.collections.tts.modules.audio_codec_modules import ResidualCouplingBlock, GaussianVAE, ResNetSpeakerEncoder
 
+import numpy as np
+def frange_cycle_zero_linear(n_iter, start=0.0, stop=1.0,  n_cycle=4, ratio_increase=0.5, ratio_zero=0.3):
+    #  Cyclical Annealing Schedule: A Simple Approach to Mitigating KL Vanishing
+    ##  We followed the approach done here: https://github.com/ChunyuanLI/Optimus
+    L = np.ones(n_iter) * stop
+    period = n_iter/n_cycle
+    step = (stop-start)/(period*ratio_increase) # linear schedule
+    for c in range(n_cycle):
+        v, i = start, 0
+        while v <= stop and (int(i+c*period) < n_iter):
+            if i < period*ratio_zero:
+                L[int(i+c*period)] = start
+            else: 
+                L[int(i+c*period)] = v
+                v += step
+            i += 1
+    return L
+
+
 @experimental
 class AudioCodecModel(ModelPT):
     def __init__(self, cfg: DictConfig, trainer: Trainer = None):
@@ -113,6 +132,10 @@ class AudioCodecModel(ModelPT):
         self.vae_use_mse_loss = cfg.get("vae_use_mse_loss", False)
 
         if self.use_gaussian_vae:
+            # define 1 cycle for each 10 epochs. So first 1 to 6 epochs steps KLD scale will be 0 then it will increase slowly for the next epochs and then it will be 1.0 in the epoch 10.
+            n_cycle = int((self.max_steps) / (float(cfg.steps_per_epoch) * 10))
+            logging.warning(f'Using cyclical schedule to anneal KLD loss scale for the total {self.max_steps} steps with {n_cycle} cycles!')
+            self.vae_cyclical_schedule = frange_cycle_zero_linear(self.max_steps, start=0.0, stop=self.vae_loss_scale,  n_cycle=n_cycle, ratio_increase=0.25, ratio_zero=0.5)
             self.vae = GaussianVAE(cfg.audio_encoder.encoded_dim, cfg.audio_encoder.encoded_dim, use_large_encoder_decoder=self.vae_use_large_enc_dec, vae_out_clamp=self.vae_out_clamp, use_mse_loss=self.vae_use_mse_loss)
 
         # Freeze audio encoder and vector quantizer if needed
@@ -607,14 +630,15 @@ class AudioCodecModel(ModelPT):
         if flow_loss:
             metrics["g_loss_flow"] = flow_loss * self.flow_loss_scale
             generator_losses.append(metrics["g_loss_flow"])
-        
-        if vae_loss:
-            metrics["g_loss_vae"] = vae_loss
-            if self.use_only_vae_loss:
-                generator_losses = [vae_loss * self.vae_loss_scale]
-            else:
-                generator_losses.append(vae_loss * self.vae_loss_scale)
 
+        if vae_loss:
+            # Note that self.global_step is the sum of optimization calls, so for GANs it might be 2x larger than the right global_step, but it also depends how many times the disc is called. self.trainer.fit_loop.epoch_loop._batches_that_stepped returns the exact number of bach processed
+            vae_loss_scale = self.vae_cyclical_schedule[self.trainer.fit_loop.epoch_loop._batches_that_stepped]
+            metrics["g_loss_vae"] = vae_loss * vae_loss_scale
+            if self.use_only_vae_loss:
+                generator_losses = [metrics["g_loss_vae"]]
+            else:
+                generator_losses.append(metrics["g_loss_vae"])
 
         # compute embeddings for speaker consistency loss
         if self.use_scl_loss:
@@ -632,7 +656,6 @@ class AudioCodecModel(ModelPT):
 
             metrics["g_loss_scl"] = loss_scl
             generator_losses.append(metrics["g_loss_scl"])
-
 
         loss_gen_all = sum(generator_losses)
 
