@@ -68,6 +68,20 @@ def frange_cycle_zero_linear(n_iter, start=0.0, stop=1.0,  n_cycle=4, ratio_incr
     return L
 
 
+def frange_cycle_linear(n_iter, start=0.0, stop=1.0,  n_cycle=4, ratio=0.5):
+    L = np.ones(n_iter) * stop
+    period = n_iter/n_cycle
+    step = (stop-start)/(period*ratio) # linear schedule
+
+    for c in range(n_cycle):
+        v, i = start, 0
+        while v <= stop and (int(i+c*period) < n_iter):
+            L[int(i+c*period)] = v
+            v += step
+            i += 1
+    return L
+
+
 @experimental
 class AudioCodecModel(ModelPT):
     def __init__(self, cfg: DictConfig, trainer: Trainer = None):
@@ -130,12 +144,17 @@ class AudioCodecModel(ModelPT):
         self.vae_use_large_enc_dec = cfg.get("vae_use_large_enc_dec", False)
         self.vae_loss_scale = cfg.get("vae_loss_scale", 1.0)
         self.vae_use_mse_loss = cfg.get("vae_use_mse_loss", False)
+        self.vae_use_cycle_zero = cfg.get("vae_use_cycle_zero", True)
 
         if self.use_gaussian_vae:
             # define 1 cycle for each 10 epochs. So first 1 to 6 epochs steps KLD scale will be 0 then it will increase slowly for the next epochs and then it will be 1.0 in the epoch 10.
             n_cycle = int((self.max_steps) / (float(cfg.steps_per_epoch) * 10))
             logging.warning(f'Using cyclical schedule to anneal KLD loss scale for the total {self.max_steps} steps with {n_cycle} cycles!')
-            self.vae_cyclical_schedule = frange_cycle_zero_linear(self.max_steps, start=0.0, stop=self.vae_loss_scale,  n_cycle=n_cycle, ratio_increase=0.25, ratio_zero=0.5)
+            if self.vae_use_cycle_zero:
+                self.vae_cyclical_schedule = frange_cycle_zero_linear(self.max_steps, start=0.0, stop=self.vae_loss_scale,  n_cycle=n_cycle, ratio_increase=0.25, ratio_zero=0.5)
+            else:
+                self.vae_cyclical_schedule = frange_cycle_linear(self.max_steps, start=0.0, stop=self.vae_loss_scale,  n_cycle=n_cycle, ratio=0.5)
+
             self.vae = GaussianVAE(cfg.audio_encoder.encoded_dim, cfg.audio_encoder.encoded_dim, use_large_encoder_decoder=self.vae_use_large_enc_dec, vae_out_clamp=self.vae_out_clamp, use_mse_loss=self.vae_use_mse_loss)
 
         # Freeze audio encoder and vector quantizer if needed
@@ -635,6 +654,7 @@ class AudioCodecModel(ModelPT):
             # Note that self.global_step is the sum of optimization calls, so for GANs it might be 2x larger than the right global_step, but it also depends how many times the disc is called. self.trainer.fit_loop.epoch_loop._batches_that_stepped returns the exact number of bach processed
             vae_loss_scale = self.vae_cyclical_schedule[self.trainer.fit_loop.epoch_loop._batches_that_stepped]
             metrics["g_loss_vae"] = vae_loss * vae_loss_scale
+            metrics["vae_loss_scale"] = vae_loss_scale
             if self.use_only_vae_loss:
                 generator_losses = [metrics["g_loss_vae"]]
             else:
