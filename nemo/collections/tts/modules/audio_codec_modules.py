@@ -42,6 +42,9 @@ from nemo.utils import logging
 import math
 
 from nemo.collections.tts.modules.vits_modules import WN, Flip
+from transformers import Wav2Vec2Processor, Wav2Vec2ForCTC
+
+
 
 def get_padding(kernel_size: int, dilation: int = 1) -> int:
     return (kernel_size * dilation - dilation) // 2
@@ -156,6 +159,36 @@ class SLMDiscriminator(NeuralModule):
         y_d_g, fmap_g = self._forward(audio_gen)
 
         return [y_d_r.unsqueeze(1)], [y_d_g.unsqueeze(1)], [fmap_r], [fmap_g]
+
+
+# Torch version of transformers.models.wav2vec2.feature_extraction_wav2vec2.Wav2Vec2FeatureExtractor.zero_mean_unit_var_norm
+def zero_mean_unit_var_norm(input_values):
+    """
+    Normalized to have zero mean and unit variance
+    """
+    normed_input_values = (input_values - input_values.mean(dim=1).unsqueeze(-1)) / torch.sqrt(input_values.var(dim=1).unsqueeze(-1) + 1e-7)
+    return normed_input_values
+
+
+class PhonemeASR(NeuralModule):
+    def __init__(self, input_sr=22050, model_sr=16000):
+        super().__init__()
+        # self.processor = Wav2Vec2Processor.from_pretrained("facebook/wav2vec2-lv-60-espeak-cv-ft") # processor are not grad friendly
+        self.model = Wav2Vec2ForCTC.from_pretrained("facebook/wav2vec2-lv-60-espeak-cv-ft")
+        self.resample = torchaudio.transforms.Resample(input_sr, model_sr)
+
+    def forward(self, audio):
+        audio = self.resample(audio)
+        # input_values = self.processor(audio, return_tensors="pt").input_values
+        input_values = zero_mean_unit_var_norm(audio)
+        logits = self.model(input_values).logits
+        predicted_ids = torch.argmax(logits, dim=-1)
+
+        # transcription = self.processor.batch_decode(predicted_ids)
+        # print("GT Phonemes:", transcription[0])
+        # print("GEN Phonemes:", transcription[len(transcription)//2])
+        return logits, predicted_ids
+
 
 ##############
 # Speaker encoder #

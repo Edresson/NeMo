@@ -47,7 +47,9 @@ from nemo.core.optim.lr_scheduler import compute_max_steps, prepare_lr_scheduler
 from nemo.utils import logging, model_utils
 from nemo.utils.decorators import experimental
 
-from nemo.collections.tts.modules.audio_codec_modules import ResidualCouplingBlock, GaussianVAE, ResNetSpeakerEncoder
+from nemo.collections.tts.modules.audio_codec_modules import ResidualCouplingBlock, GaussianVAE, ResNetSpeakerEncoder, PhonemeASR
+
+from torch.nn import CrossEntropyLoss
 
 import numpy as np
 def frange_cycle_zero_linear(n_iter, start=0.0, stop=1.0,  n_cycle=4, ratio_increase=0.5, ratio_zero=0.3):
@@ -262,6 +264,15 @@ class AudioCodecModel(ModelPT):
             # freeze the pretrained speaker encoder
             self.speaker_encoder.freeze()
             print("Speaker encoder loaded and frozen !!")
+
+        self.use_asr_consitency_loss = cfg.get("use_asr_consitency_loss", False)
+        self.acl_loss_scale = cfg.get("acl_loss_scale", False)
+        if self.use_asr_consitency_loss:
+            self.phoneme_asr_model = PhonemeASR(input_sr=self.sample_rate)
+            self.phoneme_asr_model.freeze()
+            # self.acl_loss = CrossEntropyLoss()
+            print("Phoneme ASR model loaded and frozen !!")
+
 
         # Log setup
         self.log_config = cfg.get("log_config", None)
@@ -653,6 +664,7 @@ class AudioCodecModel(ModelPT):
         if vae_loss:
             # Note that self.global_step is the sum of optimization calls, so for GANs it might be 2x larger than the right global_step, but it also depends how many times the disc is called. self.trainer.fit_loop.epoch_loop._batches_that_stepped returns the exact number of bach processed
             vae_loss_scale = self.vae_cyclical_schedule[self.trainer.fit_loop.epoch_loop._batches_that_stepped]
+
             metrics["g_loss_vae"] = vae_loss * vae_loss_scale
             metrics["vae_loss_scale"] = vae_loss_scale
             if self.use_only_vae_loss:
@@ -676,6 +688,30 @@ class AudioCodecModel(ModelPT):
 
             metrics["g_loss_scl"] = loss_scl
             generator_losses.append(metrics["g_loss_scl"])
+
+        if self.use_asr_consitency_loss:
+            # concate generated and GT waveforms
+            audios_batch = torch.cat((audio.squeeze(1), audio_gen.squeeze(1)), dim=0)
+
+            logits, labels = self.phoneme_asr_model(audios_batch)
+            
+            logits_gt, logits_pred = torch.chunk(logits, 2, dim=0)
+            labels_gt, labels_pred = torch.chunk(labels, 2, dim=0)
+
+
+            loss_acl = torch.nn.functional.mse_loss(logits_pred, logits_gt) * self.acl_loss_scale
+
+            """
+            params_list = list(self.phoneme_asr_model.parameters())
+            avg = 0
+            for params in params_list:
+                avg += params.mean()
+
+            print("avg phoneme_asr_model params", avg)
+            """
+
+            metrics["g_loss_acl"] = loss_acl
+            generator_losses.append(metrics["g_loss_acl"])
 
         loss_gen_all = sum(generator_losses)
 
@@ -738,6 +774,19 @@ class AudioCodecModel(ModelPT):
 
             metrics["val_loss_scl"] = loss_scl
             metrics["val_loss"] += metrics["val_loss_scl"]
+
+        if self.use_asr_consitency_loss:
+            # concate generated and GT waveforms
+            audios_batch = torch.cat((audio.squeeze(1), audio_gen.squeeze(1)), dim=0)
+
+            logits, labels = self.phoneme_asr_model(audios_batch)
+            
+            logits_gt, logits_pred = torch.chunk(logits, 2, dim=0)
+
+            loss_acl = torch.nn.functional.mse_loss(logits_pred, logits_gt) * self.acl_loss_scale
+            metrics["val_loss_acl"] = loss_acl
+            metrics["val_loss"] += metrics["val_loss_acl"]
+
 
 
         self.log_dict(metrics, on_epoch=True, sync_dist=True)
@@ -806,12 +855,13 @@ class AudioCodecModel(ModelPT):
         sched_config = optim_config.pop("sched", None)
         OmegaConf.set_struct(optim_config, True)
 
+        asr_ph_params = self.phoneme_asr_model.parameters() if self.use_asr_consitency_loss else []
         se_params = self.speaker_encoder.parameters() if self.use_scl_loss else []
         vae_params = self.vae.parameters() if self.use_gaussian_vae else []
         flow_params = self.flow.parameters() if self.use_sampling_flow else []
         vq_params = self.vector_quantizer.parameters() if self.vector_quantizer else []
         distil_params = itertools.chain(self.token_predictor.parameters(), self.distil_codec_model.parameters()) if self.use_distil_loss else []
-        gen_params = itertools.chain(self.audio_encoder.parameters(), self.audio_decoder.parameters(), vq_params, distil_params, flow_params, vae_params, se_params)
+        gen_params = itertools.chain(self.audio_encoder.parameters(), self.audio_decoder.parameters(), vq_params, distil_params, flow_params, vae_params, se_params, asr_ph_params)
         optim_g = instantiate(optim_config, params=gen_params)
 
         disc_params = self.discriminator.parameters()
