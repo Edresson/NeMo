@@ -29,6 +29,7 @@ from nemo.collections.common.parts.utils import ClampActivation, HalfSnake, Snak
 from nemo.collections.tts.parts.utils.helpers import get_mask_from_lengths
 from nemo.core.classes.common import typecheck
 from nemo.core.classes.module import NeuralModule
+
 from nemo.core.neural_types.elements import (
     AudioSignal,
     EncodedRepresentation,
@@ -1094,6 +1095,7 @@ class Conv1dNorm(NeuralModule):
             stride=stride,
             padding=padding,
             dilation=dilation,
+            # padding_mode="replicate",
             padding_mode="reflect",
         )
         self.conv = nn.utils.weight_norm(conv)
