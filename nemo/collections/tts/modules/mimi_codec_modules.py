@@ -2448,14 +2448,17 @@ class MimiCausalEncoder(NeuralModule):
         sample_rate,
         total_hop_length,
         output_dim,
+        use_out_projection=True,
     ):
         super().__init__()
         self.encoder = SEANetEncoder(**seanet_kwargs)
         self.encoder_transformer = ProjectedTransformer(**transformer_kwargs)
         self.encoder_hop_length = self.encoder.hop_length
         self.total_hop_length = total_hop_length
+        self.use_out_projection = use_out_projection
         self.sample_rate = sample_rate
-        dimension = self.encoder.dimension
+        # dimension = self.encoder.dimension
+        dimension = transformer_kwargs.output_dimensions[0]
         if self.encoder_hop_length != self.total_hop_length:
             downsample_stride = self.total_hop_length / self.encoder_hop_length 
             learnt = "conv"
@@ -2467,17 +2470,17 @@ class MimiCausalEncoder(NeuralModule):
             )
         else:
             self.downsample = None
-
-        self.proj = StreamingConv1d(
-            dimension,
-            output_dim,
-            kernel_size=1,
-            stride=1,
-            causal=True,
-            groups=1,
-            bias=False,
-            pad_mode="replicate",
-        )
+        if self.use_out_projection:
+            self.proj = StreamingConv1d(
+                dimension,
+                output_dim,
+                kernel_size=1,
+                stride=1,
+                causal=True,
+                groups=1,
+                bias=False,
+                pad_mode="replicate",
+            )
 
 
     def forward(self, audio, audio_len):
@@ -2488,8 +2491,10 @@ class MimiCausalEncoder(NeuralModule):
             emb = self.downsample(emb)
 
         emb_len = audio_len / self.total_hop_length
-        emb = self.proj(emb)
-        emb = mask_sequence_tensor(emb, emb_len)
+        if self.use_out_projection:
+            emb = self.proj(emb)
+            emb = mask_sequence_tensor(emb, emb_len)
+
         return emb, emb_len.int()
 
 
