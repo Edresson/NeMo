@@ -986,7 +986,7 @@ class CausalConvTranspose1dNorm(NeuralModule):
 
 class CausalConv1dNorm(NeuralModule):
     """Conv1d with causal padding and normalization."""
-        
+
     def __init__(
         self,
         in_channels: int,
@@ -995,11 +995,12 @@ class CausalConv1dNorm(NeuralModule):
         stride: int = 1,
         dilation: int = 1,
         groups: int = 1,
-        pad_mode: str = "constant",
+        pad_mode: str = "zeros",
+        extra_pad_mode: str = "constant",
         bias: bool = True
     ):
         super().__init__()
-        self.pad_mode = pad_mode
+        self.extra_pad_mode = extra_pad_mode
 
         # warn user on unusual setup between dilation and stride
         if stride > 1 and dilation > 1:
@@ -1009,7 +1010,7 @@ class CausalConv1dNorm(NeuralModule):
             )
 
         self.conv = nn.Conv1d(
-            in_channels, out_channels, kernel_size, stride, dilation=dilation, groups=groups, bias=bias
+            in_channels, out_channels, kernel_size, stride, dilation=dilation, groups=groups, bias=bias, padding_mode=pad_mode,
         )
 
         kernel_size = self.conv.kernel_size[0]
@@ -1066,7 +1067,7 @@ class CausalConv1dNorm(NeuralModule):
         extra_padding = self._get_extra_padding_for_conv1d(inputs)
 
         # Left padding for causal
-        hidden_states = self._pad1d(inputs, (self.padding_total, extra_padding), mode=self.pad_mode)
+        hidden_states = self._pad1d(inputs, (self.padding_total, extra_padding), mode=self.extra_pad_mode)
         hidden_states = self.conv(hidden_states)
 
         # mask output
@@ -1084,6 +1085,7 @@ class Conv1dNorm(NeuralModule):
         stride: int = 1,
         dilation: int = 1,
         padding: Optional[int] = None,
+        pad_mode: str = "reflect",
     ):
         super().__init__()
         if not padding:
@@ -1095,8 +1097,7 @@ class Conv1dNorm(NeuralModule):
             stride=stride,
             padding=padding,
             dilation=dilation,
-            # padding_mode="replicate",
-            padding_mode="reflect",
+            padding_mode=pad_mode,
         )
         self.conv = nn.utils.weight_norm(conv)
 
@@ -1124,7 +1125,7 @@ class Conv1dNorm(NeuralModule):
 
 
 class ConvTranspose1dNorm(NeuralModule):
-    def __init__(self, in_channels: int, out_channels: int, kernel_size: int, stride: int = 1):
+    def __init__(self, in_channels: int, out_channels: int, kernel_size: int, stride: int = 1, groups: int = 1):
         super().__init__()
         padding, output_padding = get_up_sample_padding(kernel_size, stride)
         conv = nn.ConvTranspose1d(
@@ -1135,6 +1136,7 @@ class ConvTranspose1dNorm(NeuralModule):
             padding=padding,
             output_padding=output_padding,
             padding_mode="zeros",
+            groups=groups
         )
         self.conv = nn.utils.weight_norm(conv)
 
@@ -1913,6 +1915,7 @@ class ResidualBlock(NeuralModule):
         dropout_rate: float = 0.0,
         activation: str = "lrelu",
         is_causal: bool = False,
+        pad_mode: str = "reflect",
     ):
         super(ResidualBlock, self).__init__()
 
@@ -1921,14 +1924,14 @@ class ResidualBlock(NeuralModule):
         self.dropout = torch.nn.Dropout(dropout_rate)
         if not is_causal:
             self.input_conv = Conv1dNorm(
-                in_channels=channels, out_channels=filters, kernel_size=kernel_size, dilation=dilation
+                in_channels=channels, out_channels=filters, kernel_size=kernel_size, dilation=dilation, pad_mode=pad_mode
             )
-            self.skip_conv = Conv1dNorm(in_channels=filters, out_channels=channels, kernel_size=kernel_size)
+            self.skip_conv = Conv1dNorm(in_channels=filters, out_channels=channels, kernel_size=kernel_size, pad_mode=pad_mode)
         else:
             self.input_conv = CausalConv1dNorm(
-                in_channels=channels, out_channels=filters, kernel_size=kernel_size, dilation=dilation
+                in_channels=channels, out_channels=filters, kernel_size=kernel_size, dilation=dilation, pad_mode=pad_mode
             )
-            self.skip_conv = CausalConv1dNorm(in_channels=filters, out_channels=channels, kernel_size=kernel_size)
+            self.skip_conv = CausalConv1dNorm(in_channels=filters, out_channels=channels, kernel_size=kernel_size, pad_mode=pad_mode)
 
     def remove_weight_norm(self):
         self.input_conv.remove_weight_norm()
@@ -1964,7 +1967,7 @@ class HiFiGANResBlock(NeuralModule):
         activation: Activation for the residual blocks.
     """
 
-    def __init__(self, channels: int, kernel_size: int, dilations: Iterable[int], activation: str, is_causal: bool = False):
+    def __init__(self, channels: int, kernel_size: int, dilations: Iterable[int], activation: str, is_causal: bool = False, pad_mode: str = "reflect"):
         super().__init__()
 
         self.res_blocks = nn.ModuleList(
@@ -1976,6 +1979,7 @@ class HiFiGANResBlock(NeuralModule):
                     dilation=dilation,
                     activation=activation,
                     is_causal=is_causal,
+                    pad_mode=pad_mode,
                 )
                 for dilation in dilations
             ]
@@ -2017,12 +2021,12 @@ class HiFiGANResLayer(NeuralModule):
 
     """
 
-    def __init__(self, channels: int, kernel_sizes: Iterable[int], dilations: Iterable[int], activation: str, is_causal: bool = False):
+    def __init__(self, channels: int, kernel_sizes: Iterable[int], dilations: Iterable[int], activation: str, is_causal: bool = False, pad_mode: str = "reflect"):
         super().__init__()
 
         self.res_blocks = nn.ModuleList(
             [
-                HiFiGANResBlock(channels=channels, kernel_size=kernel_size, dilations=dilations, activation=activation, is_causal=is_causal)
+                HiFiGANResBlock(channels=channels, kernel_size=kernel_size, dilations=dilations, activation=activation, is_causal=is_causal, pad_mode=pad_mode)
                 for kernel_size in kernel_sizes
             ]
         )
@@ -2076,6 +2080,7 @@ class CausalHiFiGANEncoder(NeuralModule):
         resblock_kernel_sizes: Iterable[int] = (3, 7, 11),
         resblock_dilation_sizes: Iterable[int] = (1, 3, 5),
         activation: str = "lrelu",
+        pad_mode: str = "zeros",
     ):
         assert in_kernel_size > 0
         assert out_kernel_size > 0
@@ -2083,7 +2088,7 @@ class CausalHiFiGANEncoder(NeuralModule):
         super().__init__()
 
         self.down_sample_rates = down_sample_rates
-        self.pre_conv = CausalConv1dNorm(in_channels=1, out_channels=base_channels, kernel_size=in_kernel_size)
+        self.pre_conv = CausalConv1dNorm(in_channels=1, out_channels=base_channels, kernel_size=in_kernel_size, pad_mode=pad_mode)
 
         in_channels = base_channels
         self.activations = nn.ModuleList([])
@@ -2096,6 +2101,7 @@ class CausalHiFiGANEncoder(NeuralModule):
                 dilations=resblock_dilation_sizes,
                 activation=activation,
                 is_causal=True,
+                pad_mode=pad_mode,
             )
             self.res_layers.append(res_layer)
 
@@ -2111,13 +2117,13 @@ class CausalHiFiGANEncoder(NeuralModule):
                 out_channels=out_channels,
                 kernel_size=kernel_size,
                 stride=down_sample_rate,
-                # padding=padding,
+                pad_mode=pad_mode,
             )
             in_channels = out_channels
             self.down_sample_conv_layers.append(down_sample_conv)
 
         self.post_activation = CodecActivation(activation, channels=in_channels)
-        self.post_conv = CausalConv1dNorm(in_channels=in_channels, out_channels=encoded_dim, kernel_size=out_kernel_size)
+        self.post_conv = CausalConv1dNorm(in_channels=in_channels, out_channels=encoded_dim, kernel_size=out_kernel_size, pad_mode=pad_mode)
 
     @property
     def input_types(self):
@@ -2191,6 +2197,7 @@ class HiFiGANEncoder(NeuralModule):
         resblock_kernel_sizes: Iterable[int] = (3, 7, 11),
         resblock_dilation_sizes: Iterable[int] = (1, 3, 5),
         activation: str = "lrelu",
+        pad_mode: str = "reflect",
     ):
         assert in_kernel_size > 0
         assert out_kernel_size > 0
@@ -2198,7 +2205,7 @@ class HiFiGANEncoder(NeuralModule):
         super().__init__()
 
         self.down_sample_rates = down_sample_rates
-        self.pre_conv = Conv1dNorm(in_channels=1, out_channels=base_channels, kernel_size=in_kernel_size)
+        self.pre_conv = Conv1dNorm(in_channels=1, out_channels=base_channels, kernel_size=in_kernel_size, pad_mode=pad_mode)
 
         in_channels = base_channels
         self.activations = nn.ModuleList([])
@@ -2210,6 +2217,7 @@ class HiFiGANEncoder(NeuralModule):
                 kernel_sizes=resblock_kernel_sizes,
                 dilations=resblock_dilation_sizes,
                 activation=activation,
+                pad_mode=pad_mode,
             )
             self.res_layers.append(res_layer)
 
@@ -2226,12 +2234,13 @@ class HiFiGANEncoder(NeuralModule):
                 kernel_size=kernel_size,
                 stride=down_sample_rate,
                 padding=padding,
+                pad_mode=pad_mode
             )
             in_channels = out_channels
             self.down_sample_conv_layers.append(down_sample_conv)
 
         self.post_activation = CodecActivation(activation, channels=in_channels)
-        self.post_conv = Conv1dNorm(in_channels=in_channels, out_channels=encoded_dim, kernel_size=out_kernel_size)
+        self.post_conv = Conv1dNorm(in_channels=in_channels, out_channels=encoded_dim, kernel_size=out_kernel_size, pad_mode=pad_mode)
 
     @property
     def input_types(self):
@@ -2308,7 +2317,9 @@ class CausalHiFiGANDecoder(NeuralModule):
         resblock_kernel_sizes: Iterable[int] = (3, 7, 11),
         resblock_dilation_sizes: Iterable[int] = (1, 3, 5),
         activation: str = "lrelu",
-        output_activation: str = "tanh"
+        output_activation: str = "tanh",
+        pad_mode: str = "zeros",
+        n_groups_equal_to_out_channels: bool = True,
     ):
         assert in_kernel_size > 0
         assert out_kernel_size > 0
@@ -2317,7 +2328,7 @@ class CausalHiFiGANDecoder(NeuralModule):
 
         self.up_sample_rates = up_sample_rates
 
-        self.pre_conv = CausalConv1dNorm(in_channels=input_dim, out_channels=base_channels, kernel_size=in_kernel_size)
+        self.pre_conv = CausalConv1dNorm(in_channels=input_dim, out_channels=base_channels, kernel_size=in_kernel_size, pad_mode=pad_mode)
 
         in_channels = base_channels
         self.activations = nn.ModuleList([])
@@ -2331,7 +2342,7 @@ class CausalHiFiGANDecoder(NeuralModule):
             self.activations.append(act)
 
             up_sample_conv = CausalConvTranspose1dNorm(
-                in_channels=in_channels, out_channels=out_channels, kernel_size=kernel_size, stride=up_sample_rate
+                in_channels=in_channels, out_channels=out_channels, kernel_size=kernel_size, stride=up_sample_rate, groups=out_channels if n_groups_equal_to_out_channels else 1
             )
             in_channels = out_channels
             self.up_sample_conv_layers.append(up_sample_conv)
@@ -2342,11 +2353,12 @@ class CausalHiFiGANDecoder(NeuralModule):
                 dilations=resblock_dilation_sizes,
                 activation=activation,
                 is_causal=True,
+                pad_mode=pad_mode,
             )
             self.res_layers.append(res_layer)
 
         self.post_activation = CodecActivation(activation, channels=in_channels)
-        self.post_conv = CausalConv1dNorm(in_channels=in_channels, out_channels=1, kernel_size=out_kernel_size)
+        self.post_conv = CausalConv1dNorm(in_channels=in_channels, out_channels=1, kernel_size=out_kernel_size, pad_mode=pad_mode)
         if output_activation == "tanh":
             self.out_activation = nn.Tanh()
         elif output_activation == "clamp":
@@ -2637,7 +2649,9 @@ class HiFiGANDecoder(NeuralModule):
         resblock_kernel_sizes: Iterable[int] = (3, 7, 11),
         resblock_dilation_sizes: Iterable[int] = (1, 3, 5),
         activation: str = "lrelu",
-        output_activation: str = "tanh"
+        output_activation: str = "tanh",
+        pad_mode: str = "reflect",
+        n_groups_equal_to_out_channels: bool = False,
     ):
         assert in_kernel_size > 0
         assert out_kernel_size > 0
@@ -2646,7 +2660,7 @@ class HiFiGANDecoder(NeuralModule):
 
         self.up_sample_rates = up_sample_rates
 
-        self.pre_conv = Conv1dNorm(in_channels=input_dim, out_channels=base_channels, kernel_size=in_kernel_size)
+        self.pre_conv = Conv1dNorm(in_channels=input_dim, out_channels=base_channels, kernel_size=in_kernel_size, pad_mode=pad_mode)
 
         in_channels = base_channels
         self.activations = nn.ModuleList([])
@@ -2660,7 +2674,7 @@ class HiFiGANDecoder(NeuralModule):
             self.activations.append(act)
 
             up_sample_conv = ConvTranspose1dNorm(
-                in_channels=in_channels, out_channels=out_channels, kernel_size=kernel_size, stride=up_sample_rate
+                in_channels=in_channels, out_channels=out_channels, kernel_size=kernel_size, stride=up_sample_rate, groups=out_channels if n_groups_equal_to_out_channels else 1,
             )
             in_channels = out_channels
             self.up_sample_conv_layers.append(up_sample_conv)
@@ -2670,11 +2684,12 @@ class HiFiGANDecoder(NeuralModule):
                 kernel_sizes=resblock_kernel_sizes,
                 dilations=resblock_dilation_sizes,
                 activation=activation,
+                pad_mode=pad_mode,
             )
             self.res_layers.append(res_layer)
 
         self.post_activation = CodecActivation(activation, channels=in_channels)
-        self.post_conv = Conv1dNorm(in_channels=in_channels, out_channels=1, kernel_size=out_kernel_size)
+        self.post_conv = Conv1dNorm(in_channels=in_channels, out_channels=1, kernel_size=out_kernel_size, pad_mode=pad_mode)
         if output_activation == "tanh":
             self.out_activation = nn.Tanh()
         elif output_activation == "clamp":
@@ -2801,10 +2816,11 @@ class ResNetEncoder(NeuralModule):
         kernel_size: int = 3,
         dropout_rate: float = 0.1,
         activation: str = "lrelu",
+        pad_mode: str = "reflect",
     ):
         super(ResNetEncoder, self).__init__()
 
-        self.pre_conv = Conv1dNorm(in_channels=in_channels, out_channels=hidden_channels, kernel_size=kernel_size)
+        self.pre_conv = Conv1dNorm(in_channels=in_channels, out_channels=hidden_channels, kernel_size=kernel_size, pad_mode=pad_mode)
         self.res_layers = nn.ModuleList(
             [
                 ResidualBlock(
@@ -2813,12 +2829,13 @@ class ResNetEncoder(NeuralModule):
                     kernel_size=kernel_size,
                     dropout_rate=dropout_rate,
                     activation=activation,
+                    pad_mode=pad_mode,
                 )
                 for _ in range(num_layers)
             ]
         )
         self.post_activation = CodecActivation(activation, channels=hidden_channels)
-        self.post_conv = Conv1dNorm(in_channels=hidden_channels, out_channels=out_channels, kernel_size=kernel_size)
+        self.post_conv = Conv1dNorm(in_channels=hidden_channels, out_channels=out_channels, kernel_size=kernel_size, pad_mode=pad_mode)
 
     def remove_weight_norm(self):
         self.pre_conv.remove_weight_norm()
