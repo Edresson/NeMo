@@ -41,6 +41,7 @@ from nemo.collections.nlp.parts.nlp_overrides import NLPSaveRestoreConnector
 from nemo.utils import AppState, logging
 from nemo.utils.distributed import initialize_distributed
 from nemo.utils.model_utils import inject_model_parallel_rank
+from nemo.collections.multimodal.speech_llm.models.modular_models import ModularAudioGPTModel
 
 try:
     from megatron.core import parallel_state
@@ -163,6 +164,11 @@ def convert(local_rank, rank, world_size, args):
         model = MegatronImagen.load_from_checkpoint(checkpoint_path, hparams_file=args.hparams_file, trainer=trainer)
     elif args.model_type == 'controlnet':
         model = MegatronControlNet.load_from_checkpoint(
+            checkpoint_path, hparams_file=args.hparams_file, trainer=trainer
+        )
+    elif args.model_type == 'audiogpt':
+        print(args.hparams_file)
+        model = ModularAudioGPTModel.load_from_checkpoint(
             checkpoint_path, hparams_file=args.hparams_file, trainer=trainer
         )
     else:

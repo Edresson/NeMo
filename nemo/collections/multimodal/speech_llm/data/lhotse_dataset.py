@@ -348,16 +348,21 @@ class LhotseAudioQuestionAnswerDataset(torch.utils.data.Dataset):
             answer_audio_lens = []
             answer_audios = []
             features_lens = []
-            for i, cut in enumerate(cuts):
-                answer_audio = torch.tensor(cut.target_audio.resample(self.codec_sample_rate).load_audio()).float()
-                answer_audio_len = torch.tensor(answer_audio.shape[1]).long()
-                answer_audios.append(answer_audio)
-                answer_audio_lens.append(answer_audio_len)
-                features_lens.append(math.ceil(answer_audio_len / self.codec_model_downsampling_factor))
-            answer_audios = collate_vectors(
-                [a.squeeze(0) for a in answer_audios], max_length=max(answer_audio_lens), padding_value=0.0
-            ).float()
-            answer_audio_lens = torch.tensor(answer_audio_lens).long()
+            if hasattr(cuts[0], "target_audio"):
+                for i, cut in enumerate(cuts):
+                    answer_audio = torch.tensor(cut.target_audio.resample(self.codec_sample_rate).load_audio()).float()
+                    answer_audio_len = torch.tensor(answer_audio.shape[1]).long()
+                    answer_audios.append(answer_audio)
+                    answer_audio_lens.append(answer_audio_len)
+                    features_lens.append(math.ceil(answer_audio_len / self.codec_model_downsampling_factor))
+                answer_audios = collate_vectors(
+                    [a.squeeze(0) for a in answer_audios], max_length=max(answer_audio_lens), padding_value=0.0
+                ).float()
+                answer_audio_lens = torch.tensor(answer_audio_lens).long()
+            else:
+                # Test set when target audios are not available, set features_lens to random number 10
+                features_lens = [10] * len(cuts)
+
             # Prepare dummy target_codec with speech_pad_id and eos_tensor, the dummy values will be filled in training_step or validation_step
             # once the audio codecs are extracted from the audio.
             features_lens = torch.tensor(features_lens, dtype=torch.int)

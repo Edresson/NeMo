@@ -378,17 +378,18 @@ class ModularAudioGPTModel(SpeechLLMAdapterMixin, MegatronGPTSFTModel):
         context_lengths = audio_batch['context_lengths']
 
         if self.extract_codec_on_the_fly:
-            answer_signal = audio_batch['answer_audio']
-            answer_signal_length = audio_batch['answer_audio_lens']
-            target_text_lengths = audio_batch['target_text_lengths']
+            if "answer_audio" in audio_batch and audio_batch['answer_audio'] is not None:
+                answer_signal = audio_batch['answer_audio']
+                answer_signal_length = audio_batch['answer_audio_lens']
+                target_text_lengths = audio_batch['target_text_lengths']
 
-            answer_codecs, answer_codecs_lens = self._get_codec_embeddings(
-                answer_signal, answer_signal_length
-            )  # list, list
-            for i, answer_codec in enumerate(answer_codecs):
-                base_length = target_text_lengths[i] + context_lengths[i]
-                input_ids[i, base_length + 1 : base_length + 1 + answer_codecs_lens[i], 1:] = answer_codec
-                labels[i, base_length : base_length + answer_codecs_lens[i], 1:] = answer_codec
+                answer_codecs, answer_codecs_lens = self._get_codec_embeddings(
+                    answer_signal, answer_signal_length
+                )  # list, list
+                for i, answer_codec in enumerate(answer_codecs):
+                    base_length = target_text_lengths[i] + context_lengths[i]
+                    input_ids[i, base_length + 1 : base_length + 1 + answer_codecs_lens[i], 1:] = answer_codec
+                    labels[i, base_length : base_length + answer_codecs_lens[i], 1:] = answer_codec
 
         num_audios = audio_batch.get("num_audios", None)
         context_start_idx = audio_batch.get("context_start_idx", None)

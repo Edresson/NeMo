@@ -85,7 +85,7 @@ def main(cfg) -> None:
         if "peft" in model_cfg and model_cfg.peft.get("peft_scheme", None):
             # need this due to the way that MegatronGPTSFTModel doesn't load adapters in model initialization
             model.load_adapters(model_file, map_location="cpu")
-    else:
+    elif ".nemo" in cfg.model.restore_from_path:
         # Load model from a local file
         model_cfg = ModularAudioGPTModel.merge_inference_cfg(cfg, trainer)
         model = ModularAudioGPTModel.restore_from(
@@ -97,6 +97,17 @@ def main(cfg) -> None:
         )
         model = ModularAudioGPTModel.load_adapters_for_inference(cfg, model_cfg, model)
         model = ModularAudioGPTModel.load_audio_encoder_for_inference(cfg, model_cfg, model)
+    else:
+        # if ckpt file
+        model_cfg = OmegaConf.to_container(OmegaConf.load(cfg.model.restore_from_hparams_path).cfg)
+        model_cfg = OmegaConf.create(model_cfg)
+        # trainer = MegatronTrainerBuilder(model_cfg).create_trainer()
+        model = ModularAudioGPTModel(model_cfg, trainer)
+        torch_state_dict = torch.load(cfg.model.restore_from_path)['state_dict']
+        model.load_state_dict(torch_state_dict, strict=True)
+        print("Model loaded")
+        # model = ModularAudioGPTModel.load_adapters_for_inference(cfg, model_cfg, model)
+        # model = ModularAudioGPTModel.load_audio_encoder_for_inference(cfg, model_cfg, model)
 
     model.freeze()
     if cfg.get("save_as_nemo", None):
