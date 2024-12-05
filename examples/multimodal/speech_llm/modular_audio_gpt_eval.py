@@ -12,118 +12,81 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-
-from pathlib import Path
-
+import torch
+from nemo.core.connectors.save_restore_connector import SaveRestoreConnector
+import tempfile
+import os
 import torch.multiprocessing as mp
-from omegaconf.omegaconf import OmegaConf
+from omegaconf.omegaconf import OmegaConf, open_dict
 
 from nemo.collections.multimodal.speech_llm.models.modular_models import ModularAudioGPTModel
-from nemo.collections.nlp.parts.megatron_trainer_builder import MegatronTrainerBuilder
+from nemo.collections.nlp.parts.megatron_trainer_builder import MegatronLMPPTrainerBuilder
 from nemo.core.config import hydra_runner
-from nemo.utils import logging
+from nemo.utils import logging, model_utils
+from nemo.utils.exp_manager import exp_manager
 
 mp.set_start_method("spawn", force=True)
 
 """
-This is the script to run inference with a ModularAudioGPTModel.
-
-If you want to evaluate an ModularAudioGPTModel:
-
 MEGATRON_CKPT=/path/to/megatron-llm.nemo
-ALM_DIR=/path/to/nemo_experiments/job_name
-ALM_YAML=$ALM_DIR/version_0/hparams.yaml
-ALM_CKPT="$ALM_DIR/checkpoints/AudioGPT--validation_wer\=0.5-step\=103-epoch\=0-last.ckpt"
+ASR_MODEL=/path/to/asr-model.nemo
 
-VAL_MANIFESTS="[/data/libri-test-other.json,/data/MCV_7.1_test.json,/data/wsj-test.json]"
-VAL_NAMES="[ls-test-other,mcv7.1-test,wsj-test]"
+TRAIN_MANIFESTS="[/data/train_1.json,/data/train_2.json]"
+VAL_MANIFESTS="[/data/dev_1.json,/data/dev_2.json]"
+VAL_NAMES="[dev-1,dev-2]"
 
-HYDRA_FULL_ERROR=1 \
-CUDA_VISIBLE_DEVICES=0 python modular_audio_gpt_eval.py \
-    model.restore_from_path=$MEGATRON_CKPT \
-    model.peft.restore_from_path=$ALM_CKPT \
-    model.peft.restore_from_hparams_path=$ALM_YAML \
-    model.data.test_ds.manifest_filepath=$VAL_MANIFESTS \
-    model.data.test_ds.names=$VAL_NAMES \
-    model.data.test_ds.global_batch_size=8 \
-	model.data.test_ds.micro_batch_size=8 \
-	model.data.test_ds.tokens_to_generate=256 \
-    ++inference.greedy=False \
-    ++inference.top_k=50 \
-    ++inference.top_p=0.95 \
-    ++inference.temperature=0.4 \
-    ++inference.repetition_penalty=1.2 \
-    ++model.data.test_ds.output_dir=${ALM_DIR}
+CUDA_VISIBLE_DEVICES="0,1" python modular_audio_gpt_train.py --config-path="./conf" --config-name "modular_audio_gpt_config_peft" \
+    trainer.devices=-1 \
+    model.freeze_audio_encoder=True \
+    model.freeze_llm=True \
+    model.global_batch_size=4 \
+    model.micro_batch_size=2 \
+    model.pretrained_audio_model=$ASR_MODEL \
+    model.restore_from_path=$MEGATRON_MODEL \
+    model.data.train_ds.manifest_filepath=$TRAIN_MANIFESTS \
+    model.data.validation_ds.manifest_filepath=$VAL_MANIFESTS \
+    ++model.data.validation_ds.names=$VAL_NAMES \
 """
 
 
-@hydra_runner(config_path="conf", config_name="modular_audio_gpt_config_eval")
+@hydra_runner(config_path="conf", config_name="modular_audio_gpt_config_peft")
 def main(cfg) -> None:
+    # Set up logging with the specified log level
+    logging_level = getattr(logging, cfg.log_level.upper(), logging.INFO)
+    logging.setLevel(logging_level)
+
     logging.info("\n\n************** Experiment configuration ***********")
-    logging.info(f"\n{OmegaConf.to_yaml(cfg)}")
-    logging.info("**************************************************\n\n")
+    logging.info(f'\n{OmegaConf.to_yaml(cfg)}')
+    # hydra interpolation does not work here as the interpolation key is lost when PTL saves hparams
+    with open_dict(cfg):
+        cfg.model.precision = cfg.trainer.precision
 
-    trainer = MegatronTrainerBuilder(cfg).create_trainer()
+    precision = cfg.trainer.precision
+    trainer = MegatronLMPPTrainerBuilder(cfg).create_trainer()
+    cfg.trainer.precision = precision
 
-    if cfg.model.from_pretrained:
-        # Load model from NGC or HuggingFace
-        logging.info(f"Loading model from cloud: {cfg.model.from_pretrained}")
-        model_cfg = ModularAudioGPTModel.from_pretrained(
-            cfg.model.from_pretrained, trainer=trainer, return_config=True
-        )
-        model_cfg = ModularAudioGPTModel.merge_inference_cfg(cfg, trainer, model_cfg)
-        model_file = ModularAudioGPTModel.from_pretrained(
-            cfg.model.from_pretrained, trainer=trainer, return_model_file=True
-        )
-        model = ModularAudioGPTModel.restore_from(
-            restore_path=model_file,
-            trainer=trainer,
-            override_config_path=model_cfg,
-            strict=False,
-            map_location="cpu",
-        )
-        if "peft" in model_cfg and model_cfg.peft.get("peft_scheme", None):
-            # need this due to the way that MegatronGPTSFTModel doesn't load adapters in model initialization
-            model.load_adapters(model_file, map_location="cpu")
-    elif ".nemo" in cfg.model.restore_from_path:
-        # Load model from a local file
-        model_cfg = ModularAudioGPTModel.merge_inference_cfg(cfg, trainer)
-        model = ModularAudioGPTModel.restore_from(
-            restore_path=cfg.model.restore_from_path,
-            trainer=trainer,
-            override_config_path=model_cfg,
-            strict=False,
-            map_location="cpu",
-        )
-        model = ModularAudioGPTModel.load_adapters_for_inference(cfg, model_cfg, model)
-        model = ModularAudioGPTModel.load_audio_encoder_for_inference(cfg, model_cfg, model)
+    # exp_manager(trainer, cfg.exp_manager)
+    # update resume from checkpoint found by exp_manager
+    logging.info(f'Resuming training from checkpoint: {trainer.ckpt_path}')
+    print("Config:", cfg)
+
+    if hasattr(cfg, 'model_target'):
+        imported_cls = model_utils.import_class_by_path(cfg.model_target)
     else:
-        # if ckpt file
-        model_cfg = OmegaConf.to_container(OmegaConf.load(cfg.model.restore_from_hparams_path).cfg)
-        model_cfg = OmegaConf.create(model_cfg)
-        # trainer = MegatronTrainerBuilder(model_cfg).create_trainer()
-        model = ModularAudioGPTModel(model_cfg, trainer)
-        torch_state_dict = torch.load(cfg.model.restore_from_path)['state_dict']
-        model.load_state_dict(torch_state_dict, strict=True)
-        print("Model loaded")
-        # model = ModularAudioGPTModel.load_adapters_for_inference(cfg, model_cfg, model)
-        # model = ModularAudioGPTModel.load_audio_encoder_for_inference(cfg, model_cfg, model)
+        imported_cls = ModularAudioGPTModel
+    model = imported_cls.restore_from_pretrained_models(cfg, trainer=trainer)
 
-    model.freeze()
-    if cfg.get("save_as_nemo", None):
-        model.setup("predict")  # need to call setup() to load adapters and prepare for saving
-        model.save_to(cfg.save_as_nemo)
-        logging.info(f"Model saved to {Path(cfg.save_as_nemo).absolute()}, exiting...")
-        exit(0)
+    if ".nemo" in cfg.model.eval_checkpoint:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            SaveRestoreConnector._unpack_nemo_file(path2file=cfg.model.eval_checkpoint, out_folder=tmpdir)
+            cfg.model.eval_checkpoint = os.path.join(tmpdir, "model_weights.ckpt")
+            model.load_state_dict(torch.load(cfg.model.eval_checkpoint))
+    else:
+        model.load_state_dict(torch.load(cfg.model.eval_checkpoint))
 
-    if not cfg.model.get('use_flash_attention', False):
-        cfg.inference.compute_attention_mask = True
-    config = OmegaConf.to_container(cfg.inference, resolve=True)
-    model.set_inference_config(config)
-
-    # run inference
+    
     trainer.test(model)
 
 
-if __name__ == "__main__":
+if __name__ == '__main__':
     main()
