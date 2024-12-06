@@ -240,12 +240,52 @@ model:
     end_string: ""
     train_ds:
       input_cfg:
+      # - type: lhotse_shar
+      #   shar_path: /lustre/fs7/portfolios/llmservice/projects/llmservice_nemo_speechlm/data/s2s_synthetic_data/s2s_shars_21fps/squadv2/
+      #   weight: 0.1
+      #   tags:
+      #     lang: en
+      #     s2s: True
+      # - type: lhotse_shar
+      #   shar_path: /lustre/fs7/portfolios/llmservice/projects/llmservice_nemo_speechlm/data/s2s_synthetic_data/s2s_shars_21fps/alpaca/ # speech SQA
+      #   weight: 0.1
+      #   tags:
+      #     lang: en
+      #     s2s: True
+      # - type: lhotse_shar
+      #   shar_path: /lustre/fsw/portfolios/llmservice/projects/llmservice_nemo_speechlm/data/tmp/msmarco_train_normalized.b/
+      #   weight: 0.5
+      #   tags:
+      #     lang: en
+      #     has_alignment: True
+      #     s2s_align: True
       - type: lhotse_shar
         shar_path: /lustre/fsw/portfolios/llmservice/users/kevinhu/s2s/data_otf/msmarco/timestamp
         weight: 0.5
         tags:
           lang: en
-          has_alignment: False
+          has_alignment: True
+          s2s_align: True
+      - type: lhotse_shar
+        shar_path: /lustre/fsw/portfolios/llmservice/users/kevinhu/s2s/data_otf/alpaca/timestamp
+        weight: 0.5
+        tags:
+          lang: en
+          has_alignment: True
+          s2s_align: True
+      - type: lhotse_shar
+        shar_path: /lustre/fsw/portfolios/llmservice/users/kevinhu/s2s/data_otf/msmarco_train_normalized/timestamp
+        weight: 0.5
+        tags:
+          lang: en
+          has_alignment: True
+          s2s_align: True    
+      - type: lhotse_shar
+        shar_path: /lustre/fsw/portfolios/llmservice/users/kevinhu/s2s/data_otf/squadv2/timestamp
+        weight: 0.5
+        tags:
+          lang: en
+          has_alignment: True
           s2s_align: True
 
       load_answer_audio: ${model.extract_codec_on_the_fly}
@@ -304,78 +344,6 @@ model:
       shuffle_buffer_size : 10000
       duration_bins: null
 
-    test_ds:
-      names: s2st
-      input_cfg:
-        - type: group
-          weight: 1.0
-          tags:
-            lang: en
-          input_cfg:
-            - type: lhotse_shar
-              shar_path: /lustre/fsw/portfolios/llmservice/projects/llmservice_nemo_speechlm/data/s2s_synthetic_data/s2s_lhotse_with_wavs/squadv2_test/
-              weight: 0.1
-              tags:
-                lang: en
-                has_alignment: False
-                s2s_align: True
-            - type: lhotse_shar
-              shar_path: /lustre/fsw/portfolios/llmservice/projects/llmservice_nemo_speechlm/data/s2s_synthetic_data/s2s_lhotse_with_wavs/airbench/
-              weight: 0.1
-              tags:
-                lang: en
-                has_alignment: False
-                s2s_align: True
-
-      load_answer_audio: ${model.extract_codec_on_the_fly}
-      codec_model_downsampling_factor: ${model.codec_model_downsampling_factor}
-      global_batch_size: ${model.global_batch_size}
-      micro_batch_size: ${model.micro_batch_size}
-      shuffle: False
-      num_workers: 0
-      pin_memory: True
-      max_seq_length: 512
-      min_seq_length: 1
-      drop_last: False
-      context_key: 'context'
-      ali_score_key: 'ali_score'
-      answer_key: 'answer'
-      add_eos: True
-      end_string: ${model.data.end_string}
-      add_sep: False
-      add_bos: False
-      separate_prompt_and_response_with_newline: False
-      write_predictions_to_file: True
-      output_file_path_prefix: null # Prefix of the file to write predictions to.
-      truncation_field: "context" # Options: ['context', 'answer']
-      index_mapping_dir: null # Path to a directory to write index mapping files.
-      prompt_template: "[INST]\n<<SYS>>\nPlease answer the following based on the previous speech feature.\n<</SYS>>\n\n{context}[/INST] {answer}" # fstring to use for assistant prompt. Example: "Q: {input}\nA: {output}"
-      tokens_to_generate: 256
-      speech_pad_id: ${model.speech_pad_id}
-      speech_unk_id: ${model.speech_unk_id}
-      speech_bos_id: ${model.speech_bos_id}
-      speech_eos_id: ${model.speech_eos_id}
-      filter_by_source_target_text_ratio: False # If the length of the source and target texts differ too much, the instance will be discarded
-      source_target_text_ratio_limit: 4.0
-      # ASR configs
-      sample_rate: 16000 #${model.audio_encoder.preprocessor.sample_rate}
-      target_audio_sample_rate: 22050 # codec sampling rate
-
-      log_every_n_steps: 10
-      metrics:
-        - name: "loss" # Name of the evaluation metric to use. Options: ['exact_string_match', 'loss']
-          average: null # Average the metric over the dataset. Options: ['macro', 'micro']. Works only for 'F1', 'accuracy' etc. Refer to torchmetrics for metrics where this is supported.
-          num_classes: null
-        - name: "bleu"
-          average: null
-          num_classes: null
-        - name: "asr-bleu"
-          average: null
-          num_classes: null
-        - name: "asr-wer"
-          average: null
-          num_classes: null
-
     validation_ds:
       names: s2st
       input_cfg:
@@ -389,14 +357,12 @@ model:
               weight: 0.1
               tags:
                 lang: en
-                has_alignment: False
                 s2s_align: True
             - type: lhotse_shar
               shar_path: /rivamlops_data/ALM/SpeechQA/Mixtral8x22b_MMLPC_en/onfly_timestamp_s2s_shars/manifest_497_answer
               weight: 0.5
               tags:
                 lang: en
-                has_alignment: False
                 s2s_align: True
 
       load_answer_audio: ${model.extract_codec_on_the_fly}
