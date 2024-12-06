@@ -313,14 +313,14 @@ model:
             lang: en
           input_cfg:
             - type: lhotse_shar
-              shar_path: /lustre/fsw/portfolios/llmservice/projects/llmservice_nemo_speechlm/data/s2s_synthetic_data/s2s_lhotse_with_wavs/airbench/
+              shar_path: /lustre/fsw/portfolios/llmservice/projects/llmservice_nemo_speechlm/data/s2s_synthetic_data/s2s_lhotse_with_wavs/squadv2_test/
               weight: 0.1
               tags:
                 lang: en
                 has_alignment: False
                 s2s_align: True
             - type: lhotse_shar
-              shar_path: /lustre/fsw/portfolios/llmservice/projects/llmservice_nemo_speechlm/data/s2s_synthetic_data/s2s_lhotse_with_wavs/squadv2_test/
+              shar_path: /lustre/fsw/portfolios/llmservice/projects/llmservice_nemo_speechlm/data/s2s_synthetic_data/s2s_lhotse_with_wavs/airbench/
               weight: 0.1
               tags:
                 lang: en
@@ -389,14 +389,14 @@ model:
               weight: 0.1
               tags:
                 lang: en
-                has_alignment: False
+                has_alignment: True
                 s2s_align: True
             - type: lhotse_shar
               shar_path: /rivamlops_data/ALM/SpeechQA/Mixtral8x22b_MMLPC_en/onfly_timestamp_s2s_shars/manifest_497_answer
               weight: 0.5
               tags:
                 lang: en
-                has_alignment: False
+                has_alignment: True
                 s2s_align: True
 
       load_answer_audio: ${model.extract_codec_on_the_fly}

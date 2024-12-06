@@ -358,12 +358,14 @@ model:
               tags:
                 lang: en
                 s2s_align: True
+                has_alignment: True
             - type: lhotse_shar
               shar_path: /rivamlops_data/ALM/SpeechQA/Mixtral8x22b_MMLPC_en/onfly_timestamp_s2s_shars/manifest_497_answer
               weight: 0.5
               tags:
                 lang: en
                 s2s_align: True
+                has_alignment: True
 
       load_answer_audio: ${model.extract_codec_on_the_fly}
       codec_model_downsampling_factor: ${model.codec_model_downsampling_factor}

@@ -82,7 +82,8 @@ def main(cfg) -> None:
             cfg.model.eval_checkpoint = os.path.join(tmpdir, "model_weights.ckpt")
             model.load_state_dict(torch.load(cfg.model.eval_checkpoint))
     else:
-        model.load_state_dict(torch.load(cfg.model.eval_checkpoint))
+
+        model.load_state_dict(torch.load(cfg.model.eval_checkpoint)["state_dict"])
 
     
     trainer.test(model)

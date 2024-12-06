@@ -1,0 +1,98 @@
++ CLUSTER=oci
++ GPUS_PER_NODE=8
+++ expr 8 '*' 4
++ TOTAL_NUM_GPUS=32
++ SLURM_ACCOUNT=portfolios/convai
++ USERID=users/ecasanova
++ LUSTRE_ACCOUNT_PREFIX=/lustre/fsw/portfolios/convai
++ WANDB=edfa402d01b985ab9ce1f53e7f63a1f7cbb1a3d5
++ TRAIN_MAX_DURATION=100
++ MAX_OPEN_FDS=null
++ TRAIN_MAX_CUTS=null
++ VAL_MAX_CUTS=16
++ TRAIN_NUM_WORKERS=0
++ LHOTSE_NUM_BUCKETS=31
++ LHOTSE_DURATION_BINS='[3.155,3.76,4.27,4.74,5.1935,5.64,6.096,6.588,7.14,7.81,8.28,8.664,9.072,9.57,10.14,10.7335,11.3735,12.09,12.78,13.41,14.01,14.62,15.253375,15.96875,16.71,17.45,18.1335,18.7735,19.4,20.0]'
++ MAX_SEQ_LENGTH=1000
++ CONTAINER=/lustre/fsw/portfolios/llmservice/users/kevinhu/containers/nemo_s2s_24.08_with_seaborn.sqsh
++ PROJECT_NAME=salm_s2s_huk
++ MODEL_NAME=S2S
++ MODEL_PREFIX=align-otf-s2s_s2t-pt_salm_1ab
++ LLM_NAME=llama_tiny
++ '[' llama_tiny = 220m ']'
++ '[' llama_tiny = t5_x_en ']'
++ '[' llama_tiny = t5_en_x ']'
++ '[' llama_tiny = t5_x_x ']'
++ '[' llama_tiny = mt5_base ']'
++ '[' llama_tiny = flant5_l ']'
++ '[' llama_tiny = 843m ']'
++ '[' llama_tiny = 2b ']'
++ '[' llama_tiny = 2b_sft ']'
++ '[' llama_tiny = llama_tiny ']'
++ LLM_CHECKPOINT=/lustre/fsw/portfolios/llmservice/users/zhehuaic/pretrained/tiny_llama.nemo
++ PRECISION=bf16
++ MAX_EPOCHS=200
++ LOG_EVERY_N_STEPS=100
++ VAL_CHECK_INTERVAL=1500
++ MAX_STEPS=2000000
++ LIMIT_VAL_BATCHES=2
++ GRAD_CLIP_VAL=1.0
++ SAVE_TOP_K=1
++ ALWAYS_SAVE_NEMO=True
++ MIN_DELTA=0.0001
++ PATIENCE=20
++ PRETRAINED_AUDIO_MODEL=/lustre/fsw/portfolios/llmservice/users/zhehuaic/pretrained/canary-1b.nemo
++ PRETRAINED_S2TT_MODEL=null
++ CODEC_DIR=/lustre/fsw/portfolios/convai/users/ecasanova/S2S/Checkpoints/Codec/
++ CODEC_MODEL=/lustre/fsw/portfolios/convai/users/ecasanova/S2S/Checkpoints/Codec/Low_Frame-rate_Speech_Codec_12.5Hz-8-codebooks-4k-codes-dec-causal-fixed-scl_without_speaker_encoder.nemo
++ FREEZE_LLM=False
++ FREEZE_ENCODER=False
++ FREEZE_DECODER=False
++ FREEZE_AUDIO_ENCODER=False
++ FREEZE_CONNECTOR=False
++ MICRO_BATCH_SIZE=16
++ NUM_WORKERS=0
+++ expr 32 '*' 16
++ GLOBAL_BATCH_SIZE=512
++ batch_duration=30
++ RESTORE_FROM_PATH=/lustre/fsw/portfolios/llmservice/users/zhehuaic/pretrained/tiny_llama.nemo
++ RESUME_FROM_CHECKPOINT=null
++ SAVE_NEMO_ON_VALIDATION_END=True
++ MEGATRON_AMP_O2=False
++ DECODER_REDUCTION_FACTOR=1
+++ expr 512 / 1
++ TOKENS_TO_GENERATE=512
++ GPT_DP=0.1
++ FREQ_MASKS=2
++ TIMES_MASKS=10
++ FREQ_WIDTH=27
++ TIME_WIDTH=0.05
++ CONN_HIDDEN_DIM=256
++ CONN_POOLING=cat
++ CONN_POOLING_FACTOR=4
++ LR=1e-4
++ WEIGHT_DECAY=0
++ LR_SCHEDULER=InverseSquareRootAnnealing
++ WARMUP_STEPS=2500
++ MIN_LR=1e-6
++ EXP_NAME=align-otf-s2s_s2t-pt_salm_1ab_oci_S2S_llama_tiny__lr1e-4wd0_InverseSquareRootAnnealing_warmup2500_minlr1e-6_gbs512_mbs16_ep200.v2.1_12.5_FPS_causal_dec_sr_fixed_10k_no_salm
++ PIN_MEMORY=true
++ CODE_DIR=/lustre/fsw/portfolios/convai/users/ecasanova/S2S/NeMo_s2s_otf_edresson/
++ SCRIPT_PATH=/code/examples/multimodal/speech_llm/modular_audio_gpt_train.py
++ CONFIG_PATH=/code/examples/multimodal/speech_llm/conf/s2s/
++ CONFIG_NAME=modular_audio_gpt_config_llama_lhotse
++ CONFIG_NAME=pt_salm_1a_21fps_debug_local_10k
++ RESULTS_DIR=/lustre/fsw/portfolios/convai/users/ecasanova/S2S/results/salm_s2s_huk/align-otf-s2s_s2t-pt_salm_1ab_oci_S2S_llama_tiny__lr1e-4wd0_InverseSquareRootAnnealing_warmup2500_minlr1e-6_gbs512_mbs16_ep200.v2.1_12.5_FPS_causal_dec_sr_fixed_10k_no_salm
++ DATA_DIR=/lustre/fsw/portfolios/llmservice/users/chchien/Data
++ MODEL_DIR=/lustre/fsw/portfolios/llmservice/users/zhehuaic/pretrained/
++ mkdir -p /lustre/fsw/portfolios/convai/users/ecasanova/S2S/results/salm_s2s_huk/align-otf-s2s_s2t-pt_salm_1ab_oci_S2S_llama_tiny__lr1e-4wd0_InverseSquareRootAnnealing_warmup2500_minlr1e-6_gbs512_mbs16_ep200.v2.1_12.5_FPS_causal_dec_sr_fixed_10k_no_salm
++ OUTFILE=/lustre/fsw/portfolios/convai/users/ecasanova/S2S/results/salm_s2s_huk/align-otf-s2s_s2t-pt_salm_1ab_oci_S2S_llama_tiny__lr1e-4wd0_InverseSquareRootAnnealing_warmup2500_minlr1e-6_gbs512_mbs16_ep200.v2.1_12.5_FPS_causal_dec_sr_fixed_10k_no_salm/slurm-%j-%n.out
++ ERRFILE=/lustre/fsw/portfolios/convai/users/ecasanova/S2S/results/salm_s2s_huk/align-otf-s2s_s2t-pt_salm_1ab_oci_S2S_llama_tiny__lr1e-4wd0_InverseSquareRootAnnealing_warmup2500_minlr1e-6_gbs512_mbs16_ep200.v2.1_12.5_FPS_causal_dec_sr_fixed_10k_no_salm/error-%j-%n.out
++ MOUNTS=--container-mounts=/lustre/fsw/portfolios/convai/users/ecasanova/S2S/NeMo_s2s_otf_edresson/:/code,/lustre/fsw/portfolios/convai/users/ecasanova/S2S/results/salm_s2s_huk/align-otf-s2s_s2t-pt_salm_1ab_oci_S2S_llama_tiny__lr1e-4wd0_InverseSquareRootAnnealing_warmup2500_minlr1e-6_gbs512_mbs16_ep200.v2.1_12.5_FPS_causal_dec_sr_fixed_10k_no_salm:/results,/lustre/fsw/portfolios/llmservice/users/chchien/Data:/workspace/data,/lustre/fsw/portfolios/llmservice/users/zhehuaic/pretrained/:/workspace/model,/lustre/fsw:/lustre/fsw,/lustre/fsw/portfolios/llmservice/projects/llmservice_nemo_speechlm/data:/lustre/fsw/portfolios/llmservice/projects/llmservice_nemo_speechlm/data,/lustre/fsw/portfolios/llmservice/users/kevinhu/pretrained:/lustre/fsw/portfolios/llmservice/users/kevinhu/pretrained,/lustre/fsw/portfolios/llmservice/users/zhehuaic/pretrained:/lustre/fsw/portfolios/llmservice/users/zhehuaic/pretrained,/lustre/fsw/portfolios/llmservice/users/kevinhu/s2s/data_otf:/lustre/fsw/portfolios/llmservice/users/kevinhu/s2s/data_otf,/lustre/fsw/portfolios/convai/users/ecasanova/S2S/Checkpoints/Codec/:/lustre/fsw/portfolios/convai/users/ecasanova/S2S/Checkpoints/Codec/,/lustre/fsw/portfolios/convai/users/subhankarg/s2s_required_checkpoints:/lustre/fsw/portfolios/convai/users/subhankarg/s2s_required_checkpoints,/lustre/fsw/portfolios/llmservice/users/zhehuaic/results/HFCACHE/:/hfcache/,/lustre/fsw/portfolios/edgeai/projects/edgeai_riva_rivamlops/data/:/rivamlops_data/
++ export HYDRA_FULL_ERROR=1
++ HYDRA_FULL_ERROR=1
++ unset LOCAL_RANK
++ unset SLURM_NTASKS
++ unset CUDA_VISIBLE_DEVICES
++ read -r -d '' cmd
++ srun -o /lustre/fsw/portfolios/convai/users/ecasanova/S2S/results/salm_s2s_huk/align-otf-s2s_s2t-pt_salm_1ab_oci_S2S_llama_tiny__lr1e-4wd0_InverseSquareRootAnnealing_warmup2500_minlr1e-6_gbs512_mbs16_ep200.v2.1_12.5_FPS_causal_dec_sr_fixed_10k_no_salm/slurm-%j-%n.out -e /lustre/fsw/portfolios/convai/users/ecasanova/S2S/results/salm_s2s_huk/align-otf-s2s_s2t-pt_salm_1ab_oci_S2S_llama_tiny__lr1e-4wd0_InverseSquareRootAnnealing_warmup2500_minlr1e-6_gbs512_mbs16_ep200.v2.1_12.5_FPS_causal_dec_sr_fixed_10k_no_salm/error-%j-%n.out --container-image=/lustre/fsw/portfolios/llmservice/users/kevinhu/containers/nemo_s2s_24.08_with_seaborn.sqsh --container-mounts=/lustre/fsw/portfolios/convai/users/ecasanova/S2S/NeMo_s2s_otf_edresson/:/code,/lustre/fsw/portfolios/convai/users/ecasanova/S2S/results/salm_s2s_huk/align-otf-s2s_s2t-pt_salm_1ab_oci_S2S_llama_tiny__lr1e-4wd0_InverseSquareRootAnnealing_warmup2500_minlr1e-6_gbs512_mbs16_ep200.v2.1_12.5_FPS_causal_dec_sr_fixed_10k_no_salm:/results,/lustre/fsw/portfolios/llmservice/users/chchien/Data:/workspace/data,/lustre/fsw/portfolios/llmservice/users/zhehuaic/pretrained/:/workspace/model,/lustre/fsw:/lustre/fsw,/lustre/fsw/portfolios/llmservice/projects/llmservice_nemo_speechlm/data:/lustre/fsw/portfolios/llmservice/projects/llmservice_nemo_speechlm/data,/lustre/fsw/portfolios/llmservice/users/kevinhu/pretrained:/lustre/fsw/portfolios/llmservice/users/kevinhu/pretrained,/lustre/fsw/portfolios/llmservice/users/zhehuaic/pretrained:/lustre/fsw/portfolios/llmservice/users/zhehuaic/pretrained,/lustre/fsw/portfolios/llmservice/users/kevinhu/s2s/data_otf:/lustre/fsw/portfolios/llmservice/users/kevinhu/s2s/data_otf,/lustre/fsw/portfolios/convai/users/ecasanova/S2S/Checkpoints/Codec/:/lustre/fsw/portfolios/convai/users/ecasanova/S2S/Checkpoints/Codec/,/lustre/fsw/portfolios/convai/users/subhankarg/s2s_required_checkpoints:/lustre/fsw/portfolios/convai/users/subhankarg/s2s_required_checkpoints,/lustre/fsw/portfolios/llmservice/users/zhehuaic/results/HFCACHE/:/hfcache/,/lustre/fsw/portfolios/edgeai/projects/edgeai_riva_rivamlops/data/:/rivamlops_data/ bash -c 'echo "*******STARTING********" && echo "---------------" && ls /code/examples/multimodal/speech_llm/conf/ && nvidia-smi && ulimit -c 0 && export WANDB_API_KEY=edfa402d01b985ab9ce1f53e7f63a1f7cbb1a3d5 && python -c '\''import torch; print(torch.__version__)'\'' && cd /code && git rev-parse HEAD && pip show torch && export PYTHONPATH="/code/.:${PYTHONPATH}" && export LHOTSE_DILL_ENABLED=1 && export NVTE_MASKED_SOFTMAX_FUSION=0 && export NVTE_FLASH_ATTN=0 && export NVTE_FUSED_ATTN=0 && export HF_HOME="/hfcache/" && export TORCH_HOME="/hfcache/torch" && export NEMO_CACHE_DIR="/hfcache/torch/nemo" && export HF_DATASETS_CACHE="/hfcache/datasets" && export TRANSFORMERS_CACHE="/hfcache/models" && export TOKENIZERS_PARALLELISM=false && export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True && export LHOTSE_AUDIO_DURATION_MISMATCH_TOLERANCE=0.3 && python -c '\''import pytorch_lightning as ptl; print(ptl.__version__)'\'' && echo "Starting training" && HYDRA_FULL_ERROR=1 TORCH_CUDNN_V8_API_ENABLED=1 CUDA_LAUNCH_BLOCKING=1 python /code/examples/multimodal/speech_llm/modular_audio_gpt_train.py     --config-path=/code/examples/multimodal/speech_llm/conf/s2s/     --config-name=pt_salm_1a_21fps_debug_local_10k     name=megatron_audio_gpt_peft_tuning     ++trainer.benchmark=false     ++trainer.use_distributed_sampler=false     ++exp_manager.exp_dir=/results/     ++exp_manager.max_time_per_run="00:03:55:00"     ++exp_manager.create_wandb_logger=true     ++exp_manager.name=align-otf-s2s_s2t-pt_salm_1ab_oci_S2S_llama_tiny__lr1e-4wd0_InverseSquareRootAnnealing_warmup2500_minlr1e-6_gbs512_mbs16_ep200.v2.1_12.5_FPS_causal_dec_sr_fixed_10k_no_salm     ++exp_manager.wandb_logger_kwargs.name=align-otf-s2s_s2t-pt_salm_1ab_oci_S2S_llama_tiny__lr1e-4wd0_InverseSquareRootAnnealing_warmup2500_minlr1e-6_gbs512_mbs16_ep200.v2.1_12.5_FPS_causal_dec_sr_fixed_10k_no_salm     ++exp_manager.wandb_logger_kwargs.project=salm_s2s_huk     ++exp_manager.wandb_logger_kwargs.entity=aiapps     ++exp_manager.wandb_logger_kwargs.resume=true     ++exp_manager.resume_if_exists=true     ++exp_manager.resume_ignore_no_checkpoint=true     ++exp_manager.checkpoint_callback_params.save_top_k=1     ++exp_manager.checkpoint_callback_params.always_save_nemo=True     ++exp_manager.checkpoint_callback_params.monitor="validation_loss"     exp_manager.checkpoint_callback_params.mode='\''max'\''     exp_manager.early_stopping_callback_params.mode='\''max'\''     ++exp_manager.early_stopping_callback_params.monitor="validation_loss"     ++exp_manager.early_stopping_callback_params.min_delta=0.0001     ++exp_manager.early_stopping_callback_params.patience=20     trainer.devices=-1     trainer.max_steps=2000000     trainer.max_epochs=-1     trainer.num_nodes=4      trainer.max_epochs=200     trainer.log_every_n_steps=100     trainer.val_check_interval=1500     trainer.limit_train_batches=1500     ++trainer.limit_val_batches=2     trainer.precision=bf16     trainer.gradient_clip_val=1.0     model.proj_head_loss_weights=[0.1,1,1,1,1,1,1,1,1]     model.restore_from_path=/lustre/fsw/portfolios/llmservice/users/zhehuaic/pretrained/tiny_llama.nemo     model.resume_from_checkpoint=null     model.pretrained_audio_model=/lustre/fsw/portfolios/llmservice/users/zhehuaic/pretrained/canary-1b.nemo     model.salm_model_path=null     ++model.codec_model_path=/lustre/fsw/portfolios/convai/users/ecasanova/S2S/Checkpoints/Codec/Low_Frame-rate_Speech_Codec_12.5Hz-8-codebooks-4k-codes-dec-causal-fixed-scl_without_speaker_encoder.nemo     ++model.freeze_llm=False     ++model.freeze_encoder=False     ++model.freeze_decoder=False     model.freeze_audio_encoder=False     model.freeze_modality_adapter=False     model.global_batch_size=512     model.micro_batch_size=16     model.megatron_amp_O2=False     model.save_nemo_on_validation_end=True     ++model.hidden_dropout=0.1     ++model.attention_dropout=0.1     ++model.ffn_dropout=0.1     ++model.extract_codec_on_the_fly=True     ++model.codec_model_downsampling_factor=1764     ++model.proj_head_dims=[32000,4037,4037,4037,4037,4037,4037,4037,4037]     ++model.speech_pad_id=4033     ++model.speech_unk_id=4034      ++model.speech_bos_id=4035     ++model.speech_eos_id=4036     ++model.s2s_vocab_size=64296     model.perception.modality_adapter.n_layers=2     model.perception.modality_adapter.subsampling_factor=4     model.perception.modality_adapter.subsampling_conv_channels=256     ++model.perception.use_multi_layer_feat=false     ++model.perception.add_sep=true     ++model.perception.is_canary=True     model.perception.spec_augment.freq_masks=2     model.perception.spec_augment.time_masks=10     model.perception.spec_augment.freq_width=27     model.perception.spec_augment.time_width=0.05     ++model.perception.modality_adapter.reduction=striding     ++model.data.train_ds.use_lhotse=true     ++model.data.train_ds.batch_duration=30     ++model.data.train_ds.quadratic_duration=20     ++model.data.train_ds.batch_size=null     ++model.data.train_ds.num_buckets=31     ++model.data.train_ds.duration_bins=[3.155,3.76,4.27,4.74,5.1935,5.64,6.096,6.588,7.14,7.81,8.28,8.664,9.072,9.57,10.14,10.7335,11.3735,12.09,12.78,13.41,14.01,14.62,15.253375,15.96875,16.71,17.45,18.1335,18.7735,19.4,20.0]     ++model.data.train_ds.use_bucketing=true     ++model.data.train_ds.seed='\''trng'\''     ++model.data.train_ds.text_field="text"     ++model.data.train_ds.lang_field="target_lang"     ++model.data.train_ds.buffer_size=10000     ++model.data.train_ds.shuffle_buffer_size=10000     model.data.train_ds.num_workers=0     ++model.data.train_ds.add_bos=True     model.data.train_ds.pin_memory=true     model.data.train_ds.max_duration=100     ++model.data.validation_ds.use_lhotse=true     ++model.data.validation_ds.use_bucketing=false     ++model.data.validation_ds.batch_size=16     ++model.data.validation_ds.text_field="text"     ++model.data.validation_ds.lang_field="target_lang"     ++model.data.validation_ds.pin_memory=true     ++model.data.validation_ds.num_workers=0     ++model.data.validation_ds.output_dir=/results/     ++model.data.validation_ds.log_every_n_steps=100     ++model.data.validation_ds.max_seq_length=1000     ++model.data.train_ds.max_seq_length=1000     model.optim.lr=1e-4     model.optim.betas=[0.9,0.98]     model.optim.weight_decay=0     model.optim.sched.name=InverseSquareRootAnnealing     ~model.optim.sched.constant_steps     model.optim.sched.warmup_steps=2500     ++model.data.validation_ds.write_predictions_to_file=True     ++model.data.validation_ds.output_file_path_prefix=/results/align-otf-s2s_s2t-pt_salm_1ab_oci_S2S_llama_tiny__lr1e-4wd0_InverseSquareRootAnnealing_warmup2500_minlr1e-6_gbs512_mbs16_ep200.v2.1_12.5_FPS_causal_dec_sr_fixed_10k_no_salm/     ++model.data.validation_ds.canary_tokens_augment_ratio=0.0     ++model.data.validation_ds.convert_canary_prompt_to_text=true     ++model.data.train_ds.max_open_streams=null     ++model.data.validation_ds.max_open_streams=null 	model.optim.name=distributed_fused_adam     ++model.optim.bucket_cap_mb=200     ++model.optim.overlap_grad_sync=False     ++model.optim.contiguous_grad_buffer=True     ++model.use_flash_attention=True     model.optim.sched.min_lr=1e-6     ~model.peft     model.decoder_reduction_factor=1     ++inference.greedy=False    ++inference.top_k=80     ++inference.top_p=0.95     ++inference.temperature=0.85     ++inference.repetition_penalty=1.2     ++log_level=DEBUG     model.data.validation_ds.tokens_to_generate=512'
