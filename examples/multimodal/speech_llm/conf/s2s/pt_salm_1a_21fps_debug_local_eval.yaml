@@ -313,17 +313,11 @@ model:
             lang: en
           input_cfg:
             - type: lhotse_shar
-              shar_path: /lustre/fsw/portfolios/llmservice/projects/llmservice_nemo_speechlm/data/s2s_synthetic_data/s2s_lhotse_with_wavs/squadv2_test/
-              weight: 0.1
-              tags:
-                lang: en
-                has_alignment: False
-                s2s_align: True
-            - type: lhotse_shar
               shar_path: /lustre/fsw/portfolios/llmservice/projects/llmservice_nemo_speechlm/data/s2s_synthetic_data/s2s_lhotse_with_wavs/airbench/
               weight: 0.1
               tags:
                 lang: en
+                s2s: True
                 has_alignment: False
                 s2s_align: True
 
