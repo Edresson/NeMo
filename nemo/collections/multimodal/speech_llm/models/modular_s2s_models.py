@@ -576,6 +576,8 @@ class S2sModularAudioGPTModel(ModularAudioGPTModel):
                                 self.cfg.data.train_ds.speech_eos_id,
                             )
                             text_pred_text = self.tokenizer.ids_to_text(text_pred)
+                            # remove invalid char
+                            text_pred_text = " ".join(text_pred_text.replace("??", "").replace("\u2047", "").split())
                             deduplicated_outputs['preds'].append(text_pred_text.strip())
                             deduplicated_outputs['labels'].append(labels_text.strip())
                             text_answer_text = self.tokenizer.ids_to_text(text_answer)
