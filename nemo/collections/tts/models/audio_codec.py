@@ -260,7 +260,8 @@ class AudioCodecModel(ModelPT):
         if self.use_scl_loss:
             self.speaker_encoder = ResNetSpeakerEncoder()
             # load pretrained model
-            self.speaker_encoder.load_checkpoint("https://github.com/coqui-ai/TTS/releases/download/speaker_encoder_model/model_se.pth.tar")
+            # self.speaker_encoder.load_checkpoint("https://github.com/coqui-ai/TTS/releases/download/speaker_encoder_model/model_se.pth.tar")
+            self.speaker_encoder.load_checkpoint("https://huggingface.co/Edresson/Speaker_Encoder_H_ASP/resolve/main/pytorch_model.bin")
             # freeze the pretrained speaker encoder
             self.speaker_encoder.freeze()
             print("Speaker encoder loaded and frozen !!")
