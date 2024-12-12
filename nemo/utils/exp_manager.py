@@ -800,7 +800,14 @@ def check_resume(
                     checkpoint = last_checkpoints[0]
                     checkpoint = uninject_model_parallel_rank(checkpoint)
                 else:
-                    raise ValueError(f"Multiple checkpoints {last_checkpoints} that matches *last.ckpt.")
+                    print(f"Multiple checkpoints {last_checkpoints} that matches *last.ckpt found ! Selecting the lastest checkpoint to continue from !!")
+                    epoch_dict = {}
+                    for i, ckp_name in enumerate(last_checkpoints):
+                        epoch = int(str(ckp_name).split("-")[-2].split("=")[-1])
+                        epoch_dict[epoch] = ckp_name
+
+                    checkpoint = epoch_dict[max(epoch_dict.keys())]
+                    # raise ValueError(f"Multiple checkpoints {last_checkpoints} that matches *last.ckpt.")
             else:
                 checkpoint = last_checkpoints[0]
 
