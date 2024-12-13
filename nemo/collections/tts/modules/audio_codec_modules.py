@@ -2088,7 +2088,7 @@ class CausalHiFiGANEncoder(NeuralModule):
         super().__init__()
 
         self.down_sample_rates = down_sample_rates
-        self.pre_conv = CausalConv1dNorm(in_channels=1, out_channels=base_channels, kernel_size=in_kernel_size, pad_mode="zeros")
+        self.pre_conv = CausalConv1dNorm(in_channels=1, out_channels=base_channels, kernel_size=in_kernel_size, pad_mode=pad_mode)
 
         in_channels = base_channels
         self.activations = nn.ModuleList([])
@@ -2101,7 +2101,7 @@ class CausalHiFiGANEncoder(NeuralModule):
                 dilations=resblock_dilation_sizes,
                 activation=activation,
                 is_causal=True,
-                pad_mode="zeros",
+                pad_mode=pad_mode,
             )
             self.res_layers.append(res_layer)
 
@@ -2117,13 +2117,13 @@ class CausalHiFiGANEncoder(NeuralModule):
                 out_channels=out_channels,
                 kernel_size=kernel_size,
                 stride=down_sample_rate,
-                pad_mode="zeros",
+                pad_mode=pad_mode,
             )
             in_channels = out_channels
             self.down_sample_conv_layers.append(down_sample_conv)
 
         self.post_activation = CodecActivation(activation, channels=in_channels)
-        self.post_conv = CausalConv1dNorm(in_channels=in_channels, out_channels=encoded_dim, kernel_size=out_kernel_size, pad_mode="zeros")
+        self.post_conv = CausalConv1dNorm(in_channels=in_channels, out_channels=encoded_dim, kernel_size=out_kernel_size, pad_mode=pad_mode)
 
     @property
     def input_types(self):
@@ -2325,9 +2325,10 @@ class CausalHiFiGANDecoder(NeuralModule):
         assert out_kernel_size > 0
 
         super().__init__()
+
         self.up_sample_rates = up_sample_rates
 
-        self.pre_conv = CausalConv1dNorm(in_channels=input_dim, out_channels=base_channels, kernel_size=in_kernel_size, pad_mode="zeros")
+        self.pre_conv = CausalConv1dNorm(in_channels=input_dim, out_channels=base_channels, kernel_size=in_kernel_size, pad_mode=pad_mode)
 
         in_channels = base_channels
         self.activations = nn.ModuleList([])
@@ -2352,12 +2353,12 @@ class CausalHiFiGANDecoder(NeuralModule):
                 dilations=resblock_dilation_sizes,
                 activation=activation,
                 is_causal=True,
-                pad_mode="zeros",
+                pad_mode=pad_mode,
             )
             self.res_layers.append(res_layer)
 
         self.post_activation = CodecActivation(activation, channels=in_channels)
-        self.post_conv = CausalConv1dNorm(in_channels=in_channels, out_channels=1, kernel_size=out_kernel_size, pad_mode="zeros")
+        self.post_conv = CausalConv1dNorm(in_channels=in_channels, out_channels=1, kernel_size=out_kernel_size, pad_mode=pad_mode)
         if output_activation == "tanh":
             self.out_activation = nn.Tanh()
         elif output_activation == "clamp":
