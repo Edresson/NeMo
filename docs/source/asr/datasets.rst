@@ -279,7 +279,7 @@ Semi sorted batching is supported by the following models:
     nemo.collections.asr.models.EncDecHybridRNNTCTCModel
     nemo.collections.asr.models.EncDecHybridRNNTCTCBPEModel
 
-For more details about this algorithm, see the `paper <https://www.isca-speech.org/archive/pdfs/interspeech_2021/ge21_interspeech.pdf>`_ .
+For more details about this algorithm, see the `paper <https://www.isca-archive.org/interspeech_2021/ge21_interspeech.pdf>`_ .
 
 Bucketing Datasets
 ---------------------
@@ -642,9 +642,11 @@ Some other Lhotse related arguments we support:
     Specifying this option will result in ``manifest_filepaths`` and ``tarred_audio_filepaths`` being ignored.
 * ``shar_path``
     Can be provided to read data from a Lhotse Shar manifest instead of a NeMo manifest.
+    Specifying this option will result in ``manifest_filepaths`` and ``tarred_audio_filepaths`` being ignored.
     This argument can be a string (single Shar directory), a list of strings (Shar directories),
     or a list of 2-item lists, where the first item is a Shar directory path, and the other is a sampling weight.
-    Specifying this option will result in ``manifest_filepaths`` and ``tarred_audio_filepaths`` being ignored.
+    The user can also provide a dict mapping Lhotse Shar fields to a list of shard paths with data for that field.
+    For details about Lhotse Shar format, see: |tutorial_shar|
 * ``bucket_duration_bins``
     Duration bins are a list of float values (seconds) that when provided, will skip the initial bucket bin estimation
     and save some time. It has to have a length of ``num_buckets - 1``. An optimal value can be obtained by running CLI:
