@@ -285,6 +285,7 @@ class ModularAudioGPTModel(SpeechLLMAdapterMixin, MegatronGPTSFTModel):
         lm_embedding = (
             base_module.language_model.embedding if hasattr(base_module, 'language_model') else base_module.embedding
         )
+
         input_embeds = lm_embedding.word_embeddings(input_ids)
         if isinstance(encoded, torch.Tensor):
             # single audio
