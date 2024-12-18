@@ -3,7 +3,7 @@ import json
 import os
 from collections import OrderedDict
 from typing import List, Optional, Union
-
+import tempfile
 import numpy as np
 import sacrebleu
 import torch
@@ -21,6 +21,8 @@ from nemo.collections.nlp.models.language_modeling.megatron_gpt_model import Emb
 from nemo.collections.nlp.models.language_modeling.megatron_gpt_sft_model import MegatronGPTSFTModel
 from nemo.collections.nlp.parts.utils_funcs import get_last_rank
 from nemo.utils import AppState, logging, model_utils
+
+from nemo.collections.nlp.parts.nlp_overrides import NLPSaveRestoreConnector
 
 try:
     from megatron.core import InferenceParams, parallel_state, tensor_parallel
@@ -122,7 +124,8 @@ class S2sMCoreGPTModel(MCoreGPTModel):
                     bias=False,
                     skip_bias_add=False,
                     gather_output=not self.parallel_output,
-                    skip_weight_param_allocation=self.pre_process and self.share_embeddings_and_output_weights,
+                    skip_weight_param_allocation=self.pre_process
+                    and self.share_embeddings_and_output_weights,  # if skip_weight_param_allocation=True, weights are initialized from setup_embeddings_and_output_layer
                     embedding_activation_buffer=self.embedding_activation_buffer,
                     grad_output_buffer=self.grad_output_buffer,
                 )
@@ -151,6 +154,8 @@ class S2sMCoreGPTModel(MCoreGPTModel):
         # Zero out the new embeddings to make the model behave the same as it was pre-trained
         self.embedding.word_embeddings.weight.data[pretrained_emb.word_embeddings.weight.shape[0] :].zero_()
         del pretrained_emb
+        if self.pre_process or self.post_process:
+            self.setup_embeddings_and_output_layer()
 
     def forward(
         self,
@@ -204,11 +209,22 @@ class S2sMCoreGPTModel(MCoreGPTModel):
             return hidden_states
 
         # logits and loss
-        all_logits = [self.output_layers[i](hidden_states)[0] for i in range(self.n_proj_heads)]
-        output_weight = None
         if self.share_embeddings_and_output_weights:
             output_weight = self.shared_embedding_or_output_weight()
-        all_logits[0], _ = self.output_layer(hidden_states, weight=output_weight)
+        else:
+            output_weight = None
+        all_logits = []
+        cur_dims = 0
+        for i in range(self.n_proj_heads):
+            cur_output_weight = (
+                output_weight[cur_dims : cur_dims + self.proj_head_dims[i]] if output_weight is not None else None
+            )
+            all_logits.append(self.output_layers[i](hidden_states, weight=cur_output_weight)[0])
+            cur_dims += self.proj_head_dims[i]
+        assert self.vocab_size == self.proj_head_dims[0]
+        all_logits[0], _ = self.output_layer(
+            hidden_states, weight=output_weight[: self.vocab_size] if output_weight is not None else None
+        )
 
         if labels is None:
             # [s b h] => [b s h]
@@ -287,7 +303,18 @@ class S2sModularAudioGPTModel(ModularAudioGPTModel):
 
         model, codec_model, asr_model, mos_model = super().restore_from_pretrained_models(cfg, trainer)
         if cfg.model.get('salm_model_path') is not None:
-            torch_state_dict = torch.load(cfg.model.get('salm_model_path'))['state_dict']
+            # this may only work for tp=1
+            # check scripts/nlp_language_modeling/merge_lora_weights/merge_salm.py on tp>1
+            salm_model_path = cfg.model.get('salm_model_path')
+            if '.nemo' in salm_model_path:
+                with tempfile.TemporaryDirectory() as tmpdir:
+                    NLPSaveRestoreConnector._unpack_nemo_file(salm_model_path, tmpdir)
+                    salm_model_path = f"{tmpdir}/model_weights.ckpt"
+                    torch_state_dict = torch.load(salm_model_path)
+            else:
+                torch_state_dict = torch.load(salm_model_path)['state_dict']
+
+            # torch_state_dict = torch.load(cfg.model.get('salm_model_path'))['state_dict']
             model.setup_complete = False
             model.load_state_dict(torch_state_dict, strict=False)
             logging.info(f"loading from {cfg.model.get('salm_model_path')}: {torch_state_dict.keys()}")
