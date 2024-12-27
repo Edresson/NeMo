@@ -159,6 +159,11 @@ class AudioCodecModel(ModelPT):
 
             self.vae = GaussianVAE(cfg.audio_encoder.encoded_dim, cfg.audio_encoder.encoded_dim, use_large_encoder_decoder=self.vae_use_large_enc_dec, vae_out_clamp=self.vae_out_clamp, use_mse_loss=self.vae_use_mse_loss)
 
+
+        if cfg.get("freeze_audio_encoder", False):
+            logging.warning('Freezing Audio Encoder.')
+            self.audio_encoder.freeze()
+
         # Freeze audio encoder and vector quantizer if needed
         if cfg.get("freeze_audio_encoder_and_vector_quantizer", False):
             logging.warning('Freezing Audio Encoder and Vector quantizer.')

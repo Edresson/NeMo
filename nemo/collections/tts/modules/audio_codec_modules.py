@@ -108,7 +108,7 @@ class SLMDiscriminator(NeuralModule):
 
         self.resample = torchaudio.transforms.Resample(input_sr, slm_sr)
 
-        norm_f = torch.nn.utils.weight_norm if use_spectral_norm == False else torch.nn.utils.spectral_norm
+        norm_f = torch.nn.utils.parametrizations.weight_norm if use_spectral_norm == False else torch.nn.utils.spectral_norm
         self.pre = norm_f(nn.Conv1d(slm_hidden * slm_layers, initial_channel, 1, 1, padding=0))
 
         self.convs = nn.ModuleList(
@@ -961,10 +961,10 @@ class CausalConvTranspose1dNorm(NeuralModule):
         self.padding_left = padding_total - self.padding_right
 
         # add weight norm
-        self.conv = nn.utils.weight_norm(self.conv)
+        self.conv = nn.utils.parametrizations.weight_norm(self.conv)
 
     def apply_weight_norm(self):
-        weight_norm = nn.utils.weight_norm
+        weight_norm = nn.utils.parametrizations.weight_norm
         if hasattr(nn.utils.parametrizations, "weight_norm"):
             weight_norm = nn.utils.parametrizations.weight_norm
 
@@ -1025,7 +1025,7 @@ class CausalConv1dNorm(NeuralModule):
         self.register_buffer("padding_total", torch.tensor(kernel_size - stride, dtype=torch.int64), persistent=False)
 
         # add weight norm
-        self.conv = nn.utils.weight_norm(self.conv)
+        self.conv = nn.utils.parametrizations.weight_norm(self.conv)
 
     def remove_weight_norm(self):
         nn.utils.remove_weight_norm(self.conv)
@@ -1099,7 +1099,7 @@ class Conv1dNorm(NeuralModule):
             dilation=dilation,
             padding_mode=pad_mode,
         )
-        self.conv = nn.utils.weight_norm(conv)
+        self.conv = nn.utils.parametrizations.weight_norm(conv)
 
     @property
     def input_types(self):
@@ -1138,7 +1138,7 @@ class ConvTranspose1dNorm(NeuralModule):
             padding_mode="zeros",
             groups=groups
         )
-        self.conv = nn.utils.weight_norm(conv)
+        self.conv = nn.utils.parametrizations.weight_norm(conv)
 
     @property
     def input_types(self):
@@ -1184,7 +1184,7 @@ class Conv2dNorm(NeuralModule):
             padding=padding,
             padding_mode="reflect",
         )
-        self.conv = nn.utils.weight_norm(conv)
+        self.conv = nn.utils.parametrizations.weight_norm(conv)
 
     @property
     def input_types(self):
