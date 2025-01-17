@@ -535,12 +535,18 @@ class AudioCodecModel(ModelPT):
     def _process_batch(self, batch):
         # [B, T_audio]
         audio = batch.get("audio")
+
         # [B]
         audio_len = batch.get("audio_lens")
         audio, audio_len = self.pad_audio(audio, audio_len)
 
-        # [B, D, T_encoded]
-        encoded, encoded_len = self.audio_encoder(audio=audio, audio_len=audio_len)
+        if "audio_input" in batch and batch["audio_input"] is not None:
+            audio_input, _ = self.pad_audio(batch.get("audio_input"), batch.get("audio_lens"))
+            # [B, D, T_encoded]
+            encoded, encoded_len = self.audio_encoder(audio=audio_input, audio_len=audio_len)
+        else:
+            # [B, D, T_encoded]
+            encoded, encoded_len = self.audio_encoder(audio=audio, audio_len=audio_len)
 
         if self.encoder_noise is not None:
             encoded = self.encoder_noise(encoded)
@@ -819,6 +825,7 @@ class AudioCodecModel(ModelPT):
             world_size=self.trainer.world_size,
             dataset_args=dataset_config.dataset_args,
             is_train=True
+
         )
         sampler = dataset.get_sampler(batch_size=dataloader_params.batch_size, world_size=self.trainer.world_size)
         data_loader = torch.utils.data.DataLoader(

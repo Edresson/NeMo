@@ -39,11 +39,13 @@ import os
 import random
 import subprocess
 from tempfile import NamedTemporaryFile
-from typing import Any, List, Optional, Union
+from typing import Any, Dict, List, Optional, Union
 
 import librosa
 import numpy as np
 import soundfile as sf
+import torch
+from packaging import version
 from scipy import signal
 
 from nemo.collections.asr.parts.preprocessing.segment import AudioSegment
@@ -51,10 +53,19 @@ from nemo.collections.common.parts.preprocessing import collections, parsers
 from nemo.core.classes import IterableDataset
 from nemo.utils import logging
 
+try:
+    import torchaudio
+
+    TORCHAUDIO_VERSION = version.parse(torchaudio.__version__)
+    TORCHAUDIO_VERSION_MIN = version.parse('2.1')
+    HAVE_TORCHAUDIO = True
+except ModuleNotFoundError:
+    HAVE_TORCHAUDIO = False
+
 # TODO @blisc: Perhaps refactor instead of import guarding
 HAVE_OMEGACONG_WEBDATASET = True
 try:
-    import webdataset as wds
+    import webdataset as wd
     from omegaconf import DictConfig, OmegaConf
 except ModuleNotFoundError:
     from nemo.utils.exceptions import LightningNotInstalledException
@@ -446,6 +457,7 @@ class NoisePerturbation(Perturbation):
         shuffle_n (int): Shuffle parameter for shuffling buffered files from the tar files
         orig_sr (int): Original sampling rate of the noise files
         rng (int): Random seed. Default is None
+        repeat_noise (bool): Repeat noise to match the duration of data if True, otherwise, apply noise to a subsegment of data.
     """
 
     def __init__(
@@ -458,12 +470,14 @@ class NoisePerturbation(Perturbation):
         audio_tar_filepaths=None,
         shuffle_n=100,
         orig_sr=16000,
+        repeat_noise: bool = False,
     ):
         self._manifest = collections.ASRAudioText(manifest_path, parser=parsers.make_parser([]), index_by_file_id=True)
         self._audiodataset = None
         self._tarred_audio = False
         self._orig_sr = orig_sr
         self._data_iterator = None
+        self._repeat_noise = repeat_noise
 
         if audio_tar_filepaths:
             self._tarred_audio = True
@@ -525,20 +539,30 @@ class NoisePerturbation(Perturbation):
             noise_gain_db = data_rms - noise.rms_db - snr_db
         noise_gain_db = min(noise_gain_db, self._max_gain_db)
 
-        # calculate noise segment to use
-        start_time = random.uniform(0.0, noise.duration - data.duration)
-        if noise.duration > (start_time + data.duration):
-            noise.subsegment(start_time=start_time, end_time=start_time + data.duration)
-
-        # adjust gain for snr purposes and superimpose
-        noise.gain_db(noise_gain_db)
-
-        if noise._samples.shape[0] < data._samples.shape[0]:
-            noise_idx = random.randint(0, data._samples.shape[0] - noise._samples.shape[0])
-            data._samples[noise_idx : noise_idx + noise._samples.shape[0]] += noise._samples
-
-        else:
+        # add noise to data
+        noise_length = noise._samples.shape[0]
+        data_length = data._samples.shape[0]
+        # case 1: noise duration is longer than data's, then apply subsegment of noise to data.
+        if noise_length >= data_length:
+            start_index = random.randint(0, noise_length - data_length)
+            end_index = start_index + data_length
+            noise._samples = noise._samples[start_index:end_index]
+            # adjust gain for snr purposes and superimpose
+            noise.gain_db(noise_gain_db)
             data._samples += noise._samples
+        # case 2: noise duration is shorter than data's,
+        else:
+            # adjust gain for snr purposes and superimpose
+            noise.gain_db(noise_gain_db)
+            # case 2.1: repeat noise until reaching the full duration of data's, and apply it to data.
+            if self._repeat_noise:
+                noise._samples = np.tile(noise._samples, data_length // noise_length + 1)[:data_length]
+                data._samples += noise._samples
+            # case 2.2: apply noise to a subsegment of data.
+            else:
+                start_index = random.randint(0, data_length - noise_length)
+                end_index = noise_length
+                data._samples[start_index:end_index] += noise._samples
 
     def perturb_with_foreground_noise(self, data, noise, data_rms=None, max_noise_dur=2, max_additions=1, ref_mic=0):
         """
@@ -722,7 +746,7 @@ class NoisePerturbationWithNormalization(Perturbation):
 
         # Set the noise level for a given SNR
         # note that if your noise doesn't overlap with your audio then your target SNR
-        # may not be achievable. Consider using an rms-threshold in the future
+        # may not be achievable. Consider using a rms-threshold in the future
         noisescalar = 10 ** (-snr / 20.0)
         noisenewlevel = noise * noisescalar
         noisyspeech = clean + noisenewlevel
@@ -845,7 +869,7 @@ class RirAndNoisePerturbation(Perturbation):
             min_snr_db: Min SNR for foreground noise
             max_snr_db: Max SNR for background noise,
             noise_tar_filepaths: Tar files, if noise files are tarred
-            apply_noise_rir: Whether to convolve foreground noise with a a random RIR
+            apply_noise_rir: Whether to convolve foreground noise with a random RIR
             orig_sample_rate: Original sampling rate of foreground noise audio
             max_additions: Max number of times foreground noise is added to an utterance,
             max_duration: Max duration of foreground noise
@@ -877,9 +901,11 @@ class RirAndNoisePerturbation(Perturbation):
         bg_noise_prob=1.0,
         bg_min_snr_db=10,
         bg_max_snr_db=50,
+        bg_max_gain_db: float = 300.0,
         bg_noise_tar_filepaths=None,
         bg_orig_sample_rate=None,
         rng=None,
+        repeat_noise: bool = False,
     ):
 
         self._rir_prob = rir_prob
@@ -921,8 +947,10 @@ class RirAndNoisePerturbation(Perturbation):
                     manifest_path=bg_noise_manifest_paths[i],
                     min_snr_db=bg_min_snr_db[i],
                     max_snr_db=bg_max_snr_db[i],
+                    max_gain_db=bg_max_gain_db,
                     audio_tar_filepaths=bg_noise_tar_filepaths[i],
                     orig_sr=orig_sr,
+                    repeat_noise=repeat_noise,
                 )
 
         self._apply_noise_rir = apply_noise_rir
@@ -957,13 +985,112 @@ class RirAndNoisePerturbation(Perturbation):
             bg_perturber.perturb_with_input_noise(data, noise, data_rms=data_rms)
 
 
+class CodecPerturbation(Perturbation):
+    def __init__(self, format_params: List[Dict[str, Any]], rng: Optional[int] = None, eps: float = 1e-8):
+        """
+        Add audio codec artifacts to the input audio using `torchaudio.io.AudioEffector`. All params should be supported
+        by `torchaudio.io.AudioEffector`, where`format` can be audio format or container format. if the container format
+        supports multiple encoders, you can specify it with `encoder` argument.
+
+        Args:
+            format_params (List[Dict[str, Any]]): a list of dict with the format below,
+                `[{"format": x, "prob": y, "bit_rate": z, "encoder": a}]`.
+            rng (Optional[int]): random seed.
+            eps (Optional[float]): precision control
+        """
+        if not HAVE_TORCHAUDIO:
+            logging.error('Could not import torchaudio. Some features might not work.')
+            raise ModuleNotFoundError(
+                "torchaudio is not installed but is necessary to instantiate a {self.__class__.__name__}"
+            )
+
+        random.seed(rng) if rng else None
+        self.probs = list()
+        self.codec_augmenters = list()
+        for format_dict in format_params:
+            prob = format_dict.get("prob", -1.0)
+            if prob < 0.0 or prob > 1.0:
+                raise ValueError("`prob` must be a float value between 0 and 1.")
+
+            # each bit rate is randomly selected by equal chance.
+            prob_bitrate = prob * (1 / len(format_dict['bit_rates']))
+            for bit_rate in format_dict['bit_rates']:
+                format = format_dict["format"]
+                encoder = format_dict.get("encoder", None)
+                codec_config = torchaudio.io.CodecConfig(bit_rate=bit_rate)
+                effector = torchaudio.io.AudioEffector(format=format, codec_config=codec_config, encoder=encoder)
+                self.probs.append(prob_bitrate)
+                self.codec_augmenters.append(effector)
+
+        assert (
+            1.0 - eps <= sum(self.probs) <= 1.0 + eps
+        ), f"The summation of all probabilities over all audio effectors is not equal to 1: {sum(self.probs)}."
+
+    def perturb(
+        self, data: AudioSegment, output_sample_rate: Optional[int] = None, verbose: bool = False,
+    ):
+        """
+        Args:
+            data (AudioSegment): input audio segment. Its samples shape (time, channels) if multichannel, otherwise, (time,)
+            output_sample_rate (int or None, optional): Output sample rate. If provided, override the output sample rate.
+                Otherwise, the resulting tensor is resampled to have the same sample rate as the input. Default: ``None``.
+            verbose (bool): whether to print the chosen torchaudio.io.AudioEffector. Default: False.
+
+        Returns:
+            overrides the input audio segment's samples. But the number of frames could be different from that of the
+            input. For example, mp3 format may increase the input waveform by zero-padding at the start and the end of
+            the audio.
+        """
+        assert data.num_channels == 1, NotImplementedError(
+            "TODO @xueyang: Multi-channel codec perturbation is not supported yet!"
+        )
+
+        # randomly choose one augmenter from the pool.
+        augmenter = random.choices(population=self.codec_augmenters, weights=self.probs, k=1)[0]
+        if verbose:
+            logging.info(
+                f"AudioEffector: format={augmenter.format}, encoder={augmenter.encoder}, bit_rate={augmenter.codec_config.bit_rate}."
+            )
+        data_tensor = torch.tensor(data.samples).unsqueeze(1)  # shape (time, 1)
+        data_aug = augmenter.apply(
+            data_tensor, sample_rate=data.sample_rate, output_sample_rate=output_sample_rate
+        )  # shape (time, 1)
+        data_aug = data_aug.squeeze().numpy()  # convert torch tensor to numpy array.
+
+        # zero-padding at the start and end of audio may be applied for some AudioEffector, such as mp3. Find the best
+        # subsegment that minimizes the diff in between. Current method is to find the minimal MSE by a sliding window.
+        # TODO @xueyang: implement a more efficient method to remove the leading and trailing zeros.
+        data_aug_length = data_aug.shape[0]
+        data_length = data.num_samples
+        if data_aug_length > data_length:
+            if verbose:
+                logging.info(
+                    f"  Adjusting augmented audio length by minimizing zero pads: augmented > original == {data_aug_length} > {data_length}"
+                )
+
+            zero_pads = data_aug_length - data_length
+            start_index = -1
+            mse_min = float('inf')
+            for index in range(zero_pads):
+                seg = data_aug[index : index + data_length]
+                mse = np.square(seg - data.samples).mean()
+                if mse < mse_min:
+                    mse_min = mse
+                    start_index = index
+            data._samples = data_aug[start_index : start_index + data_length]
+        elif data_aug_length == data_length:
+            data._samples = data_aug
+        else:
+            raise ValueError(f"Unexpected audio length: augmented < original == {data_aug_length} < {data_length}!")
+
+
 class TranscodePerturbation(Perturbation):
     """
         Audio codec augmentation. This implementation uses sox to transcode audio with low rate audio codecs,
         so users need to make sure that the installed sox version supports the codecs used here (G711 and amr-nb).
 
         Args:
-            codecs (List[str]):A list of codecs to be trancoded to. Default is None.
+            codecs (List[str]):A list of codecs to be transcoded to. Default is None.
             rng (int): Random seed. Default is None.
     """
 
@@ -975,7 +1102,7 @@ class TranscodePerturbation(Perturbation):
             for codec in codecs:
                 if codec not in ["g711", "amr-nb", "ogg"]:
                     raise ValueError(
-                        f"TranscodePerturbation with {codec} isnot supported. Only {codecs} are supported"
+                        f"TranscodePerturbation with {codec} is not supported. Only {codecs} are supported"
                     )
 
     def perturb(self, data):
@@ -1067,6 +1194,7 @@ perturbation_types = {
     "rir_noise_aug": RirAndNoisePerturbation,
     "transcode_aug": TranscodePerturbation,
     "random_segment": RandomSegmentPerturbation,
+    "codec": CodecPerturbation,
 }
 
 
@@ -1183,7 +1311,7 @@ def process_augmentations(augmenter, global_rank=0, world_size=1) -> Optional[Au
             to initialize an AudioAugmentor.
             Note: It is crucial that each individual augmentation has
             a keyword `prob`, that defines a float probability in the
-            the range [0, 1] of this augmentation being applied.
+            ange [0, 1] of this augmentation being applied.
             If this keyword is not present, then the augmentation is
             disabled and a warning is logged.
     Returns: AudioAugmentor object
@@ -1274,13 +1402,17 @@ class AugmentationDataset(IterableDataset):
 
         if not HAVE_OMEGACONG_WEBDATASET:
             raise LightningNotInstalledException(self)
-        self.audio_dataset = wds.DataPipeline(
-            wds.SimpleShardList(urls=tar_filepaths),
-            wds.shuffle(shuffle_n),
-            wds.tarfile_to_samples(),
-            wds.rename(audio='wav;ogg;flac', key='__key__'),
-            wds.to_tuple('audio', 'key'),
-            self._loop_offsets,
+        self.audio_dataset = wd.WebDataset(urls=tar_filepaths, nodesplitter=None)
+
+        if shuffle_n > 0:
+            self.audio_dataset = self.audio_dataset.shuffle(shuffle_n)
+        else:
+            logging.info("WebDataset will not shuffle files within the tar files.")
+
+        self.audio_dataset = (
+            self.audio_dataset.rename(audio='wav;ogg;flac', key='__key__')
+            .to_tuple('audio', 'key')
+            .pipe(self._loop_offsets)
         )
 
     def __len__(self):

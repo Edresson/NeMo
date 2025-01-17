@@ -43,6 +43,8 @@ from nemo.core.classes import Dataset
 from nemo.utils import logging
 from nemo.utils.decorators import experimental
 from torch.utils.data import IterableDataset, Sampler
+from nemo.collections.asr.parts.preprocessing import perturb, segment
+import random
 
 
 @dataclass
@@ -84,23 +86,32 @@ def vocoder_collate_fn(batch: List[dict], feature_processors: List[FeatureProces
     audio_filepath_list = []
     audio_list = []
     audio_len_list = []
+    audio_input_list = []
 
     for example in batch:
         dataset_name_list.append(example["dataset_name"])
         audio_filepath_list.append(example["audio_filepath"])
         audio_list.append(example["audio"])
         audio_len_list.append(example["audio_len"])
+        if "audio_input" in example:
+            audio_input_list.append(example["audio_input"])
 
     batch_audio_len = torch.IntTensor(audio_len_list)
     audio_max_len = int(batch_audio_len.max().item())
 
     batch_audio = stack_tensors(audio_list, max_lens=[audio_max_len])
 
+    if audio_input_list:
+        batch_audio_input = stack_tensors(audio_input_list, max_lens=[audio_max_len])
+    else:
+        batch_audio_input = None
+
     batch_dict = {
         "dataset_names": dataset_name_list,
         "audio_filepaths": audio_filepath_list,
         "audio": batch_audio,
         "audio_lens": batch_audio_len,
+        "audio_input": batch_audio_input,
     }
 
     for feature_processor in feature_processors:
@@ -329,6 +340,7 @@ class TarredVocoderDataset(IterableDataset):
         shard_strategy: str = "scatter",
         global_rank: int = 0,
         world_size: int = 0,
+        audio_augmentator_config: Optional[Dict] = None,
     ):
         super().__init__()
         self.sample_rate = sample_rate
@@ -346,6 +358,12 @@ class TarredVocoderDataset(IterableDataset):
             self.feature_processors = list(feature_processors.values())
         else:
             self.feature_processors = []
+        
+        self.augmenter = None
+        if audio_augmentator_config is not None:
+            self._aug_prob = audio_augmentator_config.prob
+            del audio_augmentator_config.prob
+            self.augmenter = perturb.process_augmentations(audio_augmentator_config)
 
         web_datasets = []
         dataset_lengths = []
@@ -454,6 +472,15 @@ class TarredVocoderDataset(IterableDataset):
             "audio": audio,
             "audio_len": audio_len,
         }
+
+        if self.augmenter is not None:
+            if random.random() < self._aug_prob:
+                audio_seg = segment.AudioSegment(samples=audio.cpu().numpy(), sample_rate=self.sample_rate)
+                self.augmenter.perturb(audio_seg)
+                audio_inp = audio_seg.samples.transpose()
+                example["audio_input"] = torch.from_numpy(audio_inp)
+            else:
+                example["audio_input"] = example["audio"]
 
         for processor in self.feature_processors:
             processor.process(example)
