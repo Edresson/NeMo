@@ -943,7 +943,10 @@ class S2sModularAudioGPTModel(ModularAudioGPTModel):
                     text_metric_name = metric_name.replace("asr-", "")
 
                     def get_turn_split(input_preds, num_turn):
-                        return [re.split('   *', pred)[num_turn] for pred in input_preds]
+                        if all([i> num_turn for i in get_num_turn(input_preds)]):
+                            return [re.split('   *', pred)[num_turn] for pred in input_preds]
+                        else:
+                            return input_preds
 
                     def get_num_turn(input_preds):
                         return [len(re.split('   *', pred)) for pred in input_preds]
@@ -967,7 +970,7 @@ class S2sModularAudioGPTModel(ModularAudioGPTModel):
                             [sacrebleu.corpus_bleu(get_turn_split(text_preds, 2), [get_turn_split(labels, 2)]).score]
                         ).to(self.device)
                     elif metric_name == 'turndiff':
-                        metric_result = np.mean(np.subtract(get_num_turn(text_preds), get_num_turn(labels)))
+                        metric_result = torch.Tensor([np.mean(np.abs(np.subtract(get_num_turn(text_preds), get_num_turn(labels))))])
                     else:
                         for pred, label in zip(deduplicated_outputs['preds'], labels):
                             _ = metric_fn(pred, label)
@@ -1394,8 +1397,6 @@ class S2sModularAudioGPTModel(ModularAudioGPTModel):
         input_ids = input_ids[:, : encoded.shape[1]]
         if 'target_texts_merge' in audio_batch:
             loss_mask = torch.ones_like(labels)
-            if 's2s_duplex_overlap' in audio_batch:
-                loss_mask[:, :, 1:] = 0
             assert self.cfg.get(
                 'duplex_loss_on_all_steps', False
             ), "only support duplex_loss_on_all_steps in real duplex data read from dataloader"
