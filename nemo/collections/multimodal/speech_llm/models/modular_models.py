@@ -425,6 +425,7 @@ class ModularAudioGPTModel(SpeechLLMAdapterMixin, MegatronGPTSFTModel):
                 None, None, encoder_input, attention_mask, labels, checkpoint_activations_all_layers
             )
             multimodal_output['audio_text'] = (output, loss_mask)
+
         if text_batch:
             input_ids = text_batch["text_input_ids"][:, :-1]
             labels = text_batch["text_input_ids"][:, 1:]
