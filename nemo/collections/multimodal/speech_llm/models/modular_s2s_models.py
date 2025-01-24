@@ -238,17 +238,150 @@ class S2sMCoreGPTModel(MCoreGPTModel):
             output_weight = self.shared_embedding_or_output_weight()
         else:
             output_weight = None
+
+        if input_ids is not None and input_ids.dim() == 2:  # pure text example
+            logits, _ = self.output_layer(
+                hidden_states, weight=output_weight[: self.vocab_size] if output_weight is not None else None
+            )
+
+            if labels is None:
+                # [s b h] => [b s h]
+                return logits.transpose(0, 1).contiguous()
+
+            loss = self.compute_language_model_loss(labels, logits)
+
+            return loss
+        else:
+            all_logits = []
+            cur_dims = 0
+            for i in range(self.n_proj_heads):
+                cur_output_weight = (
+                    output_weight[cur_dims : cur_dims + self.proj_head_dims[i]] if output_weight is not None else None
+                )
+                all_logits.append(self.output_layers[i](hidden_states, weight=cur_output_weight)[0])
+                cur_dims += self.proj_head_dims[i]
+            assert self.vocab_size == self.proj_head_dims[0]
+            all_logits[0], _ = self.output_layer(
+                hidden_states, weight=output_weight[: self.vocab_size] if output_weight is not None else None
+            )
+
+            if labels is None:
+                # [s b h] => [b s h]
+                return_logits = [logits.transpose(0, 1).contiguous() for logits in all_logits]
+                return torch.cat(return_logits, dim=-1)  # cat the last dim together to make other mcore code happy
+
+            tokens_loss = torch.stack(
+                [self.compute_language_model_loss(labels[:, :, i], all_logits[i]) for i in range(self.n_proj_heads)],
+                axis=2,
+            )
+            tokens_loss = (
+                tokens_loss
+                * torch.FloatTensor(self.proj_head_loss_weights).to(tokens_loss.device)
+                / sum(self.proj_head_loss_weights)
+            )
+            return tokens_loss
+
+
+class S2sMCoreGPTModelDepth(S2sMCoreGPTModel):
+
+    def __init__(
+        self,
+        config: TransformerConfig,
+        proj_head_dims: List[int],
+        proj_head_loss_weights: List[float],
+        *args,
+        **kwargs,
+    ) -> None:
+        super().__init__(config, proj_head_dims, proj_head_loss_weights, *args, **kwargs)
+        from nemo.collections.nlp.modules.common.transformer.transformer_encoders import TransformerEncoder
+
+        self.proj_head_dims = proj_head_dims
+        self.depth = TransformerEncoder(
+            hidden_size=config.hidden_size,
+            num_layers=1,
+            inner_size=1 * config.hidden_size,
+            num_attention_heads=8,
+            mask_future=True,
+        )
+
+    def forward(
+        self,
+        input_ids: Tensor,
+        position_ids: Tensor,
+        attention_mask: Tensor,
+        decoder_input: Tensor = None,
+        labels: Tensor = None,
+        inference_params: InferenceParams = None,
+        packed_seq_params: PackedSeqParams = None,
+        extra_block_kwargs: dict = None,
+    ) -> Tensor:
+        """Forward function of the GPT Model This function passes the input tensors
+        through the embedding layer, and then the decoeder and finally into the post
+        processing layer (optional).
+
+        It either returns the Loss values if labels are given  or the final hidden units
+        """
+        # If decoder_input is provided (not None), then input_ids and position_ids are ignored.
+        # Otherwise, apply embedding layer on input_ids and position_ids to get decoder_input.
+
+        # Decoder embedding.
+        if decoder_input is not None:
+            pass
+        elif self.pre_process:
+            decoder_input = self.embedding(input_ids=input_ids, position_ids=position_ids)
+        else:
+            # intermediate stage of pipeline
+            # decoder will get hidden_states from encoder.input_tensor
+            decoder_input = None
+
+        # Rotary positional embeddings (embedding is None for PP intermediate devices)
+        rotary_pos_emb = None
+        if self.position_embedding_type == 'rope':
+            rotary_seq_len = self.rotary_pos_emb.get_rotary_seq_len(
+                inference_params, self.decoder, decoder_input, self.config
+            )
+            rotary_pos_emb = self.rotary_pos_emb(rotary_seq_len)
+
+        # Run decoder.
+        hidden_states = self.decoder(
+            hidden_states=decoder_input,
+            attention_mask=attention_mask,
+            inference_params=inference_params,
+            rotary_pos_emb=rotary_pos_emb,
+            packed_seq_params=packed_seq_params,
+            **(extra_block_kwargs or {}),
+        )
+
+        if not self.post_process:
+            return hidden_states
+
+        depth_hidden_states = (
+            hidden_states.squeeze(2)
+            .tile([1, 1, len(self.proj_head_dims), 1])
+            .reshape(-1, len(self.proj_head_dims), hidden_states.shape[-1])
+        )
+        y = self.depth(
+            depth_hidden_states,
+            torch.ones_like(depth_hidden_states[:, :, 0]),
+        )
+        depth_hidden_states = y.reshape(hidden_states.shape[0], hidden_states.shape[1], len(self.proj_head_dims), -1)
+        # logits and loss
+        if self.share_embeddings_and_output_weights:
+            output_weight = self.shared_embedding_or_output_weight()
+        else:
+            output_weight = None
         all_logits = []
         cur_dims = 0
         for i in range(self.n_proj_heads):
             cur_output_weight = (
                 output_weight[cur_dims : cur_dims + self.proj_head_dims[i]] if output_weight is not None else None
             )
-            all_logits.append(self.output_layers[i](hidden_states, weight=cur_output_weight)[0])
+            all_logits.append(self.output_layers[i](depth_hidden_states[:, :, i], weight=cur_output_weight)[0])
             cur_dims += self.proj_head_dims[i]
         assert self.vocab_size == self.proj_head_dims[0]
         all_logits[0], _ = self.output_layer(
-            hidden_states, weight=output_weight[: self.vocab_size] if output_weight is not None else None
+            depth_hidden_states[:, :, 0],
+            weight=output_weight[: self.vocab_size] if output_weight is not None else None,
         )
 
         if labels is None:
@@ -270,6 +403,8 @@ class S2sMCoreGPTModel(MCoreGPTModel):
 
 class S2sModularAudioGPTModel(ModularAudioGPTModel):
     """S2S version of Modularized speech GPT model."""
+
+    gpt_model_cls = S2sMCoreGPTModel
 
     def model_provider_func(self, pre_process, post_process):
         """Model depends on pipeline paralellism."""
@@ -300,7 +435,7 @@ class S2sModularAudioGPTModel(ModularAudioGPTModel):
                         self.cfg.proj_head_loss_weights[0]
                     ] + self.cfg.proj_head_loss_weights[1:] * self.decoder_reduction_factor
 
-            model = S2sMCoreGPTModel(
+            model = self.gpt_model_cls(
                 config=self.transformer_config,
                 transformer_layer_spec=get_specs(
                     self.spec_name,
@@ -331,15 +466,7 @@ class S2sModularAudioGPTModel(ModularAudioGPTModel):
             raise ValueError("S2S ModularAudioGPTModel requires Megatron-core GPT model.")
         return model
 
-    @classmethod
-    def restore_from_pretrained_models(
-        cls,
-        cfg: Optional[Union[OmegaConf, str]] = None,
-        trainer: Optional[Trainer] = None,
-    ):
-
-        model = super().restore_from_pretrained_models(cfg, trainer)
-
+    def post_restore_from_pretrained_models(cls, model, cfg):
         codec_model, codec_model_cfg = cls.get_codec_models_and_configs(cfg)
         logging.info(f"Loaded Codec Model: {codec_model}")
 
@@ -378,7 +505,27 @@ class S2sModularAudioGPTModel(ModularAudioGPTModel):
         cls.codec_model = codec_model.cuda()
         cls.asr_model = asr_model.cuda()
         cls.mos_model = mos_model.cuda()
+
+    @classmethod
+    def restore_from_pretrained_models(
+        cls,
+        cfg: Optional[Union[OmegaConf, str]] = None,
+        trainer: Optional[Trainer] = None,
+    ):
+        model = super().restore_from_pretrained_models(cfg, trainer)
+        cls.post_restore_from_pretrained_models(cls, model, cfg)
+
         return model
+
+    def load_state_dict(self, state_dict, strict: bool = True):
+        try:
+            super().load_state_dict(state_dict, strict=strict)
+        except RuntimeError as e:
+            logging.info(f"Error loading model: {e} retrying with extend_embedding")
+            with open_dict(self.cfg):
+                self.cfg.model = self.cfg
+            self.post_restore_from_pretrained_models(self, self.cfg)
+            super().load_state_dict(state_dict, strict=strict)
 
     # change to add one more dimension
     def _shift_labels_by_emb_len(self, labels, label_lens, emb_lens, max_len, pad_token=0):
@@ -795,6 +942,16 @@ class S2sModularAudioGPTModel(ModularAudioGPTModel):
                         text_preds = deduplicated_outputs['speech_preds_transcribed']
 
                     text_metric_name = metric_name.replace("asr-", "")
+
+                    def get_turn_split(input_preds, num_turn):
+                        if all([i> num_turn for i in get_num_turn(input_preds)]):
+                            return [re.split('   *', pred)[num_turn] for pred in input_preds]
+                        else:
+                            return input_preds
+
+                    def get_num_turn(input_preds):
+                        return [len(re.split('   *', pred)) for pred in input_preds]
+
                     if text_metric_name == 'bleu':  # asr-bleu, bleu
                         metric_result = torch.Tensor([sacrebleu.corpus_bleu(text_preds, [labels]).score]).to(
                             self.device
@@ -809,6 +966,12 @@ class S2sModularAudioGPTModel(ModularAudioGPTModel):
                         metric_result = sum(deduplicated_outputs['mos_scores']) / len(
                             deduplicated_outputs['mos_scores']
                         )
+                    elif metric_name == 'bleu2':
+                        metric_result = torch.Tensor(
+                            [sacrebleu.corpus_bleu(get_turn_split(text_preds, 2), [get_turn_split(labels, 2)]).score]
+                        ).to(self.device)
+                    elif metric_name == 'turndiff':
+                        metric_result = torch.Tensor([np.mean(np.abs(np.subtract(get_num_turn(text_preds), get_num_turn(labels))))])
                     else:
                         for pred, label in zip(deduplicated_outputs['preds'], labels):
                             _ = metric_fn(pred, label)
@@ -1439,3 +1602,9 @@ class S2sModularAudioGPTModel(ModularAudioGPTModel):
                 param.requires_grad = True
             for param in self.model.output_layers.parameters():
                 param.requires_grad = True
+
+
+class S2sModularAudioGPTModelDepth(S2sModularAudioGPTModel):
+    """S2S version of Modularized speech GPT model."""
+
+    gpt_model_cls = S2sMCoreGPTModelDepth
