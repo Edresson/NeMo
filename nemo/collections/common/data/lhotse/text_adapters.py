@@ -17,7 +17,8 @@ from collections import deque
 from dataclasses import dataclass
 from itertools import groupby
 from pathlib import Path
-from typing import Iterator, Literal, Optional, Union
+from typing import Any, Iterator, Literal, Optional, Union
+
 
 import numpy as np
 import torch
@@ -298,6 +299,8 @@ class NeMoSFTJsonlAdapter:
         for path in paths:
             for data in load_jsonl(path):
                 yield NeMoSFTExample(data, language=self.language)
+
+
 
 
 """
@@ -592,3 +595,176 @@ class NeMoMultimodalConversationTarWriter:
             Path(self.output_dir).mkdir(exist_ok=True)
         self.manifest_writer = JsonlShardWriter(f"{self.output_dir}/manifest_{self.shard_idx}.jsonl", shard_size=None)
         self.tar_writer = AudioTarWriter(f"{self.output_dir}/audio_{self.shard_idx}.tar", shard_size=None)
+
+
+"""
+NeMoMultiturnTextConversation: data types, file parser, default prompt formatting logic.
+
+"""
+
+@dataclass
+class NeMoMultiturnTextConversation(Formattable, CustomFieldMixin):
+    id: str
+    turns: list[TextTurn]
+    token_equivalent_duration: float = None
+    custom: dict = None
+
+    @property
+    def input_length(self) -> int | None:
+        if self.context_ids is None:
+            return None
+        return self.context_ids.shape[0]
+
+    @property
+    def output_length(self) -> int | None:
+        if self.answer_ids is None:
+            return None
+        return self.answer_ids.shape[0]
+
+    @property
+    def total_length(self) -> int | None:
+        if self.input_ids is None:
+            return None
+        return self.input_ids.shape[0]
+
+    @property
+    def has_turns(self) -> bool:
+        return any(isinstance(t, TextTurn) for t in self.turns)
+
+    def to_dict(self):
+        return {"id": self.id, "conversations": [t.to_dict() for t in self.turns]}
+
+    def list_cuts(self) -> list[Cut]:
+        return [turn.role+": "+turn.value for turn in self.turns if isinstance(turn, TextTurn)]
+
+"""
+    def tokenize(self, tokenizer: TokenizerWrapper):
+        pad_id = 0  # self.text_processor.tokenizer.pad_id if hasattr(self.text_processor.tokenizer, 'pad_id') and self.text_processor.tokenizer.pad_id >= 0 else self.text_processor.tokenizer.unk_id
+        bos_id = pad_id # self.text_processor.bos_id
+        eos_id = pad_id # self.text_processor.eos_id
+
+        input_ids_list = []
+        answer_ids_list = []
+        context_ids_list = []
+        for turn in self.turns:
+            cur_turn_tokens = tokenizer(turn.value)
+            pad_full_cur_input = np.full(
+                shape=len(cur_turn_tokens)+2,
+                fill_value=pad_id
+            )
+            # create a copy to fill the input
+            cur_input_text = np.copy(pad_full_cur_input)
+
+            cur_input_text[0] = bos_id
+            cur_input_text[-1] = eos_id
+            cur_input_text[1:-1] = cur_turn_tokens
+
+            if turn.role == "user":
+                input_ids_list.append(cur_input_text)
+                answer_ids_list.append(pad_full_cur_input)
+            else:
+                input_ids_list.append(pad_full_cur_input)
+                answer_ids_list.append(cur_input_text)
+
+            context_ids_list.append(cur_turn_tokens)
+
+        self.input_ids = np.concatenate(input_ids_list, axis=0)
+        self.answer_ids = np.concatenate(answer_ids_list, axis=0)
+        self.context_ids = np.concatenate(context_ids_list, axis=0)
+
+        return self
+"""
+
+@registered_prompt_format_fn(NeMoMultiturnTextConversation)
+def default_multiturn_text_conversation_prompt_format_fn(example: NeMoMultiturnTextConversation, prompt):
+    # Collapse consecutive same-role turns into single turn for proper prompt formatting.
+    turns = groupby(
+        [
+            {
+                "role": turn.role,
+                "slots": {"message": turn.value},
+            }
+            for turn in example.turns
+        ],
+        key=lambda turn: turn["role"],
+    )
+    turns = [
+        {"role": role, "slots": {"message": " ".join(t["slots"]["message"] for t in turn_grp)}}
+        for role, turn_grp in turns
+    ]
+    return prompt.encode_dialog(turns)
+
+
+@dataclass
+class NeMoMultiturnTextConversationJsonlAdapter:
+    """
+    ``NeMoMultiturnTextConversationJsonlAdapter`` is used to read a NeMo Multiturn conversation JSONL
+    and yield objects of type ``NeMoMultiturnTextConversation`` that can be sampled with Lhotse.
+
+    We expect the following schema (contained in a single line per example)::
+
+        {
+            "conversations": [
+                {
+                    "value": str,  # text message or path to audio
+                    "from": "User" | "Assistant",
+                    "type": "text"
+                },
+                ...
+            ],
+        }
+    """
+    manifest_filepath: str | list[str]
+    token_equivalent_duration: float = None
+    shuffle_shards: bool = False
+    shard_seed: Union[int, Literal["trng", "randomized"]] = "trng"
+
+    def __post_init__(self):
+        self.manifest_filepath = expand_sharded_filepaths(self.manifest_filepath)
+
+    def __iter__(self) -> Iterator[NeMoMultiturnTextConversation]:
+        yield from self._iter_jsonl()
+
+    def _iter_tar(self):
+        if self.shuffle_shards:
+            seed = resolve_seed(self.shard_seed)
+            random.Random(seed).shuffle(self.manifest_filepath)
+        for jsonl_path in self.manifest_filepath:
+            for data in load_jsonl(jsonl_path):
+                yield NeMoMultiturnTextConversation(
+                    id=data.get("id", ""),
+                    turns=[
+                        (
+                            TextTurn(
+                                value=turn["value"],
+                                role=turn[
+                                    "from"
+                                ].lower(),  # prompt formatter role's are typically lowercase: user/assistant
+                            )
+                        )
+                        for turn in data["conversations"]
+                    ],
+                )
+
+    def _iter_jsonl(self):
+        paths = self.manifest_filepath
+        if self.shuffle_shards:
+            seed = resolve_seed(self.shard_seed)
+            random.Random(seed).shuffle(paths)
+        for path in paths:
+            for data in load_jsonl(path):
+                yield NeMoMultiturnTextConversation(
+                    id=data.get("id", "multiturn_text_conversation"),
+                    turns=[
+                        (
+                            TextTurn(
+                                value=turn["value"],
+                                role=turn[
+                                    "from"
+                                ].lower(),  # prompt formatter role's are typically lowercase: user/assistant
+                            )
+                        )
+                        for turn in data["conversations"]
+                    ],
+                    token_equivalent_duration=self.token_equivalent_duration,
+                )

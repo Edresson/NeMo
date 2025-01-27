@@ -425,10 +425,11 @@ class ModularAudioGPTModel(SpeechLLMAdapterMixin, MegatronGPTSFTModel):
                 None, None, encoder_input, attention_mask, labels, checkpoint_activations_all_layers
             )
             multimodal_output['audio_text'] = (output, loss_mask)
+
         if text_batch:
-            input_ids = text_batch["text_input_ids"][:, :-1]
-            labels = text_batch["text_input_ids"][:, 1:]
-            loss_mask = text_batch["text_masks"][:, 1:]
+            input_ids = text_batch["text_input_ids"]
+            labels = text_batch["text_labels_ids"]
+            loss_mask = text_batch["text_loss_masks"]
             limit_max_seq_length = self.cfg.get("limit_max_seq_length", None)
             if limit_max_seq_length is not None and limit_max_seq_length < labels.shape[1] and self.training:
                 import random
