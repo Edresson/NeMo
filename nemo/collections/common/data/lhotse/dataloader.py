@@ -754,8 +754,8 @@ def tokenize(example, tokenizer):
 
 def tokenize_with_prompt(example, tokenizer, prompt_format: str | PromptFormatter):
     # ignore prompt formatting for NeMoMultiturnTextConversation
-    # if isinstance(example, NeMoMultiturnTextConversation):
-    #     return example
+    if isinstance(example, NeMoMultiturnTextConversation):
+        return example
 
     if isinstance(prompt_format, str):
         prompt_format = PromptFormatter.resolve(prompt_format)(tokenizer)
