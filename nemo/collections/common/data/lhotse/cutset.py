@@ -34,6 +34,7 @@ from nemo.collections.common.data.lhotse.text_adapters import (
     LhotseTextAdapter,
     LhotseTextPairAdapter,
     NeMoMultimodalConversationJsonlAdapter,
+    NeMoMultiturnTextConversationJsonlAdapter,
     NeMoSFTJsonlAdapter,
 )
 from nemo.collections.common.parts.preprocessing.manifest import get_full_path
@@ -276,6 +277,21 @@ def read_multimodal_conversation_jsonl(config: DictConfig) -> tuple[CutSet, bool
             manifest_filepath=config.manifest_filepath,
             tarred_audio_filepaths=config.get("tarred_audio_filepaths"),
             audio_locator_tag=config.get("audio_locator_tag"),
+            token_equivalent_duration=config.get("token_equivalent_duration"),
+            shuffle_shards=config.shuffle,
+            shard_seed=config.shard_seed,
+        )
+    )
+    if not config.get("force_finite", False):
+        cuts = cuts.repeat()
+    return cuts, True
+
+
+@data_type_parser("multiturn_text_conversation")
+def read_multiturn_text_conversation_jsonl(config: DictConfig) -> tuple[CutSet, bool]:
+    cuts = CutSet(
+        NeMoMultiturnTextConversationJsonlAdapter(
+            manifest_filepath=config.manifest_filepath,
             token_equivalent_duration=config.get("token_equivalent_duration"),
             shuffle_shards=config.shuffle,
             shard_seed=config.shard_seed,

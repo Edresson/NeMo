@@ -742,19 +742,75 @@ class LhotseAudioQuestionAnswerDataset(torch.utils.data.Dataset):
         if getattr(cuts[0], "s2s_duplex_overlap", False):
             return self.__getitem__duplex_overlap_(cuts)
         # full text data goes here
-        from nemo.collections.common.data.lhotse.text_adapters import NeMoSFTExample, SourceTargetTextExample, NeMoMultimodalConversation
+        from nemo.collections.common.data.lhotse.text_adapters import NeMoSFTExample, SourceTargetTextExample, NeMoMultiturnTextConversation
 
-        text_examples = cuts.filter(lambda c: isinstance(c, (SourceTargetTextExample, NeMoSFTExample, NeMoMultimodalConversation)))
+        text_examples = cuts.filter(lambda c: isinstance(c, (SourceTargetTextExample, NeMoSFTExample, NeMoMultiturnTextConversation)))
         if text_examples:
-            pad_id = self.text_processor.pad_id
-            text_minibatch = dict(
-                text_input_ids=collate_vectors_lhotse([e.input_ids for e in text_examples], padding_value=pad_id),
-                text_answer_ids=collate_vectors_lhotse([e.answer_ids for e in text_examples], padding_value=pad_id),
-                text_context_ids=collate_vectors_lhotse([e.context_ids for e in text_examples], padding_value=pad_id),
-                text_masks=collate_vectors_lhotse([e.mask for e in text_examples], padding_value=0),
-            )
-            print("Text mini batch")
-            exit()
+            if isinstance(text_examples[0], NeMoMultiturnTextConversation):
+                pad_id = self.text_processor.tokenizer.pad_id if hasattr(self.text_processor.tokenizer, 'pad_id') and self.text_processor.tokenizer.pad_id >= 0 else self.text_processor.tokenizer.unk_id
+                bos_id = self.text_processor.bos_id
+                eos_id = self.text_processor.eos_id
+
+                input_ids_all = []
+                answer_ids_all = []
+                context_ids_all = []
+                answer_masks_all = []
+                for text_example in text_examples:
+                    input_ids_list = []
+                    answer_ids_list = []
+                    context_ids_list = []
+                    anwser_mask_list = []
+                    for turn in self.turns:
+                        cur_turn_tokens = self.text_processor._process_example(context="", output=turn.value)
+                        pad_full_cur_input = np.full(
+                            shape=len(cur_turn_tokens)+2,
+                            fill_value=pad_id
+                        )
+                        # create a copy to fill the input
+                        cur_input_text = np.copy(pad_full_cur_input)
+
+                        cur_input_text[0] = bos_id
+                        cur_input_text[-1] = eos_id
+                        cur_input_text[1:-1] = cur_turn_tokens
+
+                        if turn.role == "user":
+                            input_ids_list.append(cur_input_text)
+                            answer_ids_list.append(pad_full_cur_input)
+                            anwser_mask_list.append(np.zeros(len(cur_input_text)))
+                        else:
+                            input_ids_list.append(pad_full_cur_input)
+                            answer_ids_list.append(cur_input_text)
+                            anwser_mask_list.append(np.ones(len(cur_input_text)))
+
+                        context_ids_list.append(cur_turn_tokens)
+
+                    input_ids = np.concatenate(input_ids_list, axis=0)
+                    input_ids_all.append(input_ids)
+                    answer_ids = np.concatenate(answer_ids_list, axis=0)
+                    answer_ids_all.append(answer_ids)
+                    context_ids = np.concatenate(context_ids_list, axis=0)
+                    context_ids_all.append(context_ids)
+                    anwser_mask = np.concatenate(anwser_mask_list, axis=0)
+                    answer_masks_all.append(anwser_mask)
+
+                text_minibatch = dict(
+                    text_input_ids=collate_vectors_lhotse(input_ids_all, padding_value=pad_id),
+                    text_labels_ids=collate_vectors_lhotse(answer_ids_all, padding_value=pad_id),
+                    text_context_ids=collate_vectors_lhotse(context_ids_all, padding_value=pad_id),
+                    text_loss_masks=collate_vectors_lhotse(answer_masks_all, padding_value=0),
+                )
+            else:
+                pad_id = self.text_processor.pad_id
+                text_minibatch = dict(
+                    text_input_ids=collate_vectors_lhotse([e.input_ids for e in text_examples], padding_value=pad_id),
+                    text_answer_ids=collate_vectors_lhotse([e.answer_ids for e in text_examples], padding_value=pad_id),
+                    text_context_ids=collate_vectors_lhotse([e.context_ids for e in text_examples], padding_value=pad_id),
+                    text_loss_masks=collate_vectors_lhotse([e.mask for e in text_examples], padding_value=0),
+                )
+                text_minibatch["text_labels_ids"] = text_minibatch["text_input_ids"][:, 1:]
+                text_minibatch["text_input_ids"] = text_minibatch["text_input_ids"][:, :-1]
+                text_minibatch["text_loss_masks"] = text_minibatch["text_loss_masks"][:, 1:]
+
             return text_minibatch
 
         '''
