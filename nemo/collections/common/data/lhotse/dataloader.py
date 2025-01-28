@@ -745,8 +745,8 @@ def tokenize(example, tokenizer):
     elif hasattr(example, "tokenize") and callable(example.tokenize):
         example = example.tokenize(tokenizer)
     # ignore tokenization for NeMoMultiturnTextConversation
-    elif isinstance(example, NeMoMultiturnTextConversation):
-        return example
+    # elif isinstance(example, NeMoMultiturnTextConversation):
+    #     return example
     else:
         raise RuntimeError(f"Unsupported type of example: {type(example)}")
     return example
@@ -754,8 +754,10 @@ def tokenize(example, tokenizer):
 
 def tokenize_with_prompt(example, tokenizer, prompt_format: str | PromptFormatter):
     # ignore prompt formatting for NeMoMultiturnTextConversation
-    if isinstance(example, NeMoMultiturnTextConversation):
-        return example
+    # if isinstance(example, NeMoMultiturnTextConversation):
+    #     if hasattr(example, "tokenize") and callable(example.tokenize):
+    #         example = example.tokenize(tokenizer)
+    #     return example
 
     if isinstance(prompt_format, str):
         prompt_format = PromptFormatter.resolve(prompt_format)(tokenizer)
