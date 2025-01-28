@@ -239,25 +239,34 @@ model:
   data:
     end_string: ""
     train_ds:
+      use_lhotse: true
+      seed: 0
+      shard_seed: "trng"
+      num_workers: 2
+      shuffle: true
       multi_config: true
+      sampler_fusion: randomized_round_robin
+      sampler_weights:
+        duplex: 0.005
+        text: 1.5
       text:
-        sampler_fusion: randomized_round_robin
-        sampler_weights : [1.0, 0.05]
-        # sampler_weights : [0.05,1.0]
-        input_cfg: ???
+        input_cfg: 
+          - type: multimodal_conversation
+            # manifest_filepath: /data/canary_llm/v0/datablends/text_data/daring-anteater_commercial.shuf.removelong.3k.jsonl
+            manifest_filepath: /data/canary_llm/v0/datablends/text_data/daring-anteater_commercial.shuf.removelong.3k.jsonl
+            weight: 1.0
+            tags:
+              s2s_duplex: True
+
+        prompt_format: "llama2"
         use_multimodal_sampling: true
         batch_size: 1
         token_equivalent_duration: 0.08
-        use_bucketing: false
+        use_bucketing: true
         bucket_buffer_size: 500
         shuffle_buffer_size: 5000
-        num_workers: 2
-        shuffle: true
 
       duplex:
-        sampler_fusion: randomized_round_robin
-        sampler_weights : [1.0, 0.05]
-        # sampler_weights : [0.05,1.0]
         input_cfg:
         - type: group
           weight: 0.3
@@ -3067,8 +3076,6 @@ model:
       codec_model_downsampling_factor: ${model.codec_model_downsampling_factor}
       global_batch_size: ${model.global_batch_size}
       micro_batch_size: ${model.micro_batch_size}
-      shuffle: True
-      num_workers: 0
       pin_memory: True
       max_seq_length: 512
       min_seq_length: 1
@@ -3108,7 +3115,6 @@ model:
       # bucketing params
       bucketing_strategy: "fully_randomized"
       bucketing_batch_size: null
-      use_lhotse: True
       text_field : "text"
       batch_duration : 80  # 0
       quadratic_duration : 30

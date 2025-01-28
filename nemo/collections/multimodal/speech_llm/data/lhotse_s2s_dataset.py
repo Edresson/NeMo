@@ -736,17 +736,14 @@ class LhotseAudioQuestionAnswerDataset(torch.utils.data.Dataset):
     def __getitem__(self, cuts) -> dict[str, torch.Tensor | list[str] | dict]:
         import re
 
-        # full-duplex data goes here
-        if getattr(cuts[0], "s2s_duplex", False) or getattr(cuts[0], "s2s_duplex_align", False):
-            return self.__getitem__duplex_(cuts)
-        if getattr(cuts[0], "s2s_duplex_overlap", False):
-            return self.__getitem__duplex_overlap_(cuts)
         # full text data goes here
-        from nemo.collections.common.data.lhotse.text_adapters import NeMoSFTExample, SourceTargetTextExample, NeMoMultiturnTextConversation
+        from nemo.collections.common.data.lhotse.text_adapters import NeMoSFTExample, SourceTargetTextExample, NeMoMultimodalConversation
 
-        text_examples = cuts.filter(lambda c: isinstance(c, (SourceTargetTextExample, NeMoSFTExample, NeMoMultiturnTextConversation)))
+        text_examples = cuts.filter(lambda c: isinstance(c, (SourceTargetTextExample, NeMoSFTExample, NeMoMultimodalConversation)))
         if text_examples:
-            if isinstance(text_examples[0], NeMoMultiturnTextConversation):
+            # reformat text for duplex format
+            if getattr(text_examples[0], "s2s_duplex", False):
+            # if isinstance(text_examples[0], NeMoMultiturnTextConversation):
                 pad_id = self.text_processor.tokenizer.pad_id if hasattr(self.text_processor.tokenizer, 'pad_id') and self.text_processor.tokenizer.pad_id >= 0 else self.text_processor.tokenizer.unk_id
                 bos_id = self.text_processor.bos_id
                 eos_id = self.text_processor.eos_id
@@ -759,9 +756,8 @@ class LhotseAudioQuestionAnswerDataset(torch.utils.data.Dataset):
                     input_ids_list = []
                     answer_ids_list = []
                     context_ids_list = []
-                    anwser_mask_list = []
-                    for turn in self.turns:
-                        cur_turn_tokens = self.text_processor._process_example(context="", output=turn.value)
+                    for turn in text_example.turns:
+                        cur_turn_tokens = self.text_processor._process_example(context="", output=turn.value)["answer_ids"][:-1]
                         pad_full_cur_input = np.full(
                             shape=len(cur_turn_tokens)+2,
                             fill_value=pad_id
@@ -776,11 +772,9 @@ class LhotseAudioQuestionAnswerDataset(torch.utils.data.Dataset):
                         if turn.role == "user":
                             input_ids_list.append(cur_input_text)
                             answer_ids_list.append(pad_full_cur_input)
-                            anwser_mask_list.append(np.zeros(len(cur_input_text)))
                         else:
                             input_ids_list.append(pad_full_cur_input)
                             answer_ids_list.append(cur_input_text)
-                            anwser_mask_list.append(np.ones(len(cur_input_text)))
 
                         context_ids_list.append(cur_turn_tokens)
 
@@ -790,8 +784,8 @@ class LhotseAudioQuestionAnswerDataset(torch.utils.data.Dataset):
                     answer_ids_all.append(answer_ids)
                     context_ids = np.concatenate(context_ids_list, axis=0)
                     context_ids_all.append(context_ids)
-                    anwser_mask = np.concatenate(anwser_mask_list, axis=0)
-                    answer_masks_all.append(anwser_mask)
+                    # add mask based on the whole output, considering the padding as done on speech duplex mode
+                    answer_masks_all.append(np.ones(len(answer_ids)))
 
                 text_minibatch = dict(
                     text_input_ids=collate_vectors_lhotse(input_ids_all, padding_value=pad_id),
@@ -812,6 +806,12 @@ class LhotseAudioQuestionAnswerDataset(torch.utils.data.Dataset):
                 text_minibatch["text_loss_masks"] = text_minibatch["text_loss_masks"][:, 1:]
 
             return text_minibatch
+
+        # full-duplex data goes here
+        if getattr(cuts[0], "s2s_duplex", False) or getattr(cuts[0], "s2s_duplex_align", False):
+            return self.__getitem__duplex_(cuts)
+        if getattr(cuts[0], "s2s_duplex_overlap", False):
+            return self.__getitem__duplex_overlap_(cuts)
 
         '''
         # half-duplex single turn s2s data and multi turn s2s data go here

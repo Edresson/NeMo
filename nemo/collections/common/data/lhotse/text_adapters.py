@@ -492,7 +492,7 @@ class NeMoMultimodalConversationJsonlAdapter:
                     cuts.append(cut)
                 cuts = deque(cuts)
                 yield NeMoMultimodalConversation(
-                    id=data["id"],
+                    id=data.get("id", "multimodal_conversation"),
                     turns=[
                         (
                             TextTurn(
@@ -501,7 +501,7 @@ class NeMoMultimodalConversationJsonlAdapter:
                                     "from"
                                 ].lower(),  # prompt formatter role's are typically lowercase: user/assistant
                             )
-                            if turn["type"] == "text"
+                            if turn.get("type", "text") == "text"
                             else AudioTurn(
                                 cut=cuts.popleft(),
                                 role=turn[
@@ -522,7 +522,7 @@ class NeMoMultimodalConversationJsonlAdapter:
         for path in paths:
             for data in load_jsonl(path):
                 yield NeMoMultimodalConversation(
-                    id=data["id"],
+                    id=data.get("id", "multimodal_conversation"),
                     turns=[
                         (
                             TextTurn(
@@ -531,7 +531,7 @@ class NeMoMultimodalConversationJsonlAdapter:
                                     "from"
                                 ].lower(),  # prompt formatter role's are typically lowercase: user/assistant
                             )
-                            if turn["type"] == "text"
+                            if turn.get("type", "text") == "text"
                             else AudioTurn(
                                 cut=Recording.from_file(get_full_path(turn["value"], path)).to_cut(),
                                 role=turn[
@@ -637,11 +637,8 @@ class NeMoMultiturnTextConversation(Formattable, CustomFieldMixin):
     def list_cuts(self) -> list[Cut]:
         return [turn.role+": "+turn.value for turn in self.turns if isinstance(turn, TextTurn)]
 
-"""
     def tokenize(self, tokenizer: TokenizerWrapper):
-        pad_id = 0  # self.text_processor.tokenizer.pad_id if hasattr(self.text_processor.tokenizer, 'pad_id') and self.text_processor.tokenizer.pad_id >= 0 else self.text_processor.tokenizer.unk_id
-        bos_id = pad_id # self.text_processor.bos_id
-        eos_id = pad_id # self.text_processor.eos_id
+        pad_id = getattr(tokenizer, 'pad_id', 0) # self.text_processor.tokenizer.pad_id if hasattr(self.text_processor.tokenizer, 'pad_id') and self.text_processor.tokenizer.pad_id >= 0 else self.text_processor.tokenizer.unk_id
 
         input_ids_list = []
         answer_ids_list = []
@@ -649,15 +646,12 @@ class NeMoMultiturnTextConversation(Formattable, CustomFieldMixin):
         for turn in self.turns:
             cur_turn_tokens = tokenizer(turn.value)
             pad_full_cur_input = np.full(
-                shape=len(cur_turn_tokens)+2,
+                shape=len(cur_turn_tokens),
                 fill_value=pad_id
             )
             # create a copy to fill the input
             cur_input_text = np.copy(pad_full_cur_input)
-
-            cur_input_text[0] = bos_id
-            cur_input_text[-1] = eos_id
-            cur_input_text[1:-1] = cur_turn_tokens
+            cur_input_text = cur_turn_tokens
 
             if turn.role == "user":
                 input_ids_list.append(cur_input_text)
@@ -671,9 +665,8 @@ class NeMoMultiturnTextConversation(Formattable, CustomFieldMixin):
         self.input_ids = np.concatenate(input_ids_list, axis=0)
         self.answer_ids = np.concatenate(answer_ids_list, axis=0)
         self.context_ids = np.concatenate(context_ids_list, axis=0)
-
         return self
-"""
+
 
 @registered_prompt_format_fn(NeMoMultiturnTextConversation)
 def default_multiturn_text_conversation_prompt_format_fn(example: NeMoMultiturnTextConversation, prompt):
@@ -732,7 +725,7 @@ class NeMoMultiturnTextConversationJsonlAdapter:
         for jsonl_path in self.manifest_filepath:
             for data in load_jsonl(jsonl_path):
                 yield NeMoMultiturnTextConversation(
-                    id=data.get("id", ""),
+                    id=data.get("id", "multiturn_text_conversation"),
                     turns=[
                         (
                             TextTurn(
