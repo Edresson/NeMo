@@ -257,6 +257,8 @@ model:
             weight: 1.0
             tags:
               s2s_duplex: True
+              random_padding_vtblender: True
+              limit_max_seq_length: ${model.limit_max_seq_length}
 
         prompt_format: "llama2"
         use_multimodal_sampling: true
@@ -264,15 +266,16 @@ model:
         micro_batch_size: ${model.micro_batch_size}
         pin_memory: True
         token_equivalent_duration: 0.08
-        use_bucketing: true
+        use_bucketing: false
         num_buckets : 30
-        buffer_size : 10000
-        shuffle_buffer_size : 10000
+        bucket_buffer_size: 20000
         bucketing_strategy: "fully_randomized"
         bucketing_batch_size: null
         min_tokens: 1
-        max_tokens: 5000
-        batch_tokens: 5000
+        max_tokens: 8000
+        batch_tokens: 80000
+        batch_size: 1
+        quadratic_factor: 192
       duplex:
         use_multimodal_sampling: false
         input_cfg:
