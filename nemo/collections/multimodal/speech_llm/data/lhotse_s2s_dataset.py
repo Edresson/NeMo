@@ -359,7 +359,7 @@ class LhotseAudioQuestionAnswerDataset(torch.utils.data.Dataset):
                 "cut does not have target_audio. In duplex mode, recording keeps user channel and target_audio keeps agent channel"
             )
 
-        text_pad_id = self.text_processor.pad_id
+        text_pad_id = self.text_processor.tokenizer.pad_id if hasattr(self.text_processor.tokenizer, 'pad_id') and self.text_processor.tokenizer.pad_id >= 0 else self.text_processor.tokenizer.unk_id
 
         def get_3d_empty_tensor(batch_size, length, text_fill_id, speech_fill_id):
             return torch.cat(
@@ -402,6 +402,8 @@ class LhotseAudioQuestionAnswerDataset(torch.utils.data.Dataset):
         skipped = 0
         new_target_texts = []
         new_source_texts = []
+        target_texts_on_text_level = []
+        text_end_step_previous = None
         for i in range(len(num_turns)):
             each_target_texts = []
             total_steps = (
@@ -411,6 +413,14 @@ class LhotseAudioQuestionAnswerDataset(torch.utils.data.Dataset):
                 + 1
             )
             cur_target_text = torch.full(
+                [total_steps],
+                (
+                    self.text_processor.tokenizer.pad_id
+                    if hasattr(self.text_processor.tokenizer, 'pad_id') and self.text_processor.tokenizer.pad_id >= 0
+                    else self.text_processor.tokenizer.unk_id
+                ),
+            )
+            cur_target_text_on_text_level = torch.full(
                 [total_steps],
                 (
                     self.text_processor.tokenizer.pad_id
@@ -451,6 +461,8 @@ class LhotseAudioQuestionAnswerDataset(torch.utils.data.Dataset):
                     cur_source_text[(text_start_step + 1) : (text_start_step + 1 + src_text_len)] = source_texts[cnt][
                         :src_text_len
                     ]
+                    cur_target_text[text_end_step] = self.text_processor.eos_id
+                    cur_source_text[text_end_step] = self.text_processor.eos_id
                 elif getattr(cut, "s2s_duplex_align", False):
                     text_len_plus_eos = torch.tensor(text_end_step - text_start_step)
                     target_texts_expanded = self._expand_text_with_timestamps_and_word_lengths(
@@ -464,16 +476,51 @@ class LhotseAudioQuestionAnswerDataset(torch.utils.data.Dataset):
                     cur_target_text[(text_start_step + 1) : (text_start_step + 1 + text_len_plus_eos)] = (
                         target_texts_expanded[0]
                     )
+                    cur_target_text[text_end_step] = self.text_processor.eos_id
+                    cur_source_text[text_end_step] = self.text_processor.eos_id
+
+                elif getattr(cut, "s2s_duplex_cross_attn", False):
+                    # if s2s_duplex_cross_attn get the target text on text level, ignoring the speech padding.
+                    text_len = min(text_end_step - text_start_step - 1, target_texts[cnt].shape[0])
+                    cur_target_text_on_text_level[text_start_step] = self.text_processor.bos_id
+                    cur_target_text_on_text_level[(text_start_step + 1) : (text_start_step + 1 + text_len)] = target_texts[cnt][
+                        :text_len
+                    ].clone()
+                    # add eos and maker extra padding to remove later
+                    text_end_step_no_pad = text_start_step + 1 + text_len # compute where actually the text end
+                    cur_target_text_on_text_level[text_end_step_no_pad] = self.text_processor.eos_id
+                    cur_target_text_on_text_level[text_end_step_no_pad+1: text_end_step+1] = -1
+
+                    # compute the rest normally as in s2s_duplex mode
+                    cur_target_text[(text_start_step + 1) : (text_start_step + 1 + text_len)] = target_texts[cnt][
+                        :text_len
+                    ]
+                    src_text_len = min(text_end_step - text_start_step - 1, source_texts[cnt].shape[0])
+                    cur_source_text[(text_start_step + 1) : (text_start_step + 1 + src_text_len)] = source_texts[cnt][
+                        :src_text_len
+                    ]
+                    cur_target_text[text_end_step] = self.text_processor.eos_id
+                    cur_source_text[text_end_step] = self.text_processor.eos_id
                 else:
                     raise Exception("Undefined assistant channel text format.")
 
-                cur_target_text[text_end_step] = self.text_processor.eos_id
-                cur_source_text[text_end_step] = self.text_processor.eos_id
                 cnt += 1
+
             new_target_texts.append(cur_target_text)
             new_source_texts.append(cur_source_text)
+            if getattr(cut, "s2s_duplex_cross_attn", False):
+                cur_target_text_on_text_level = cur_target_text_on_text_level[cur_target_text_on_text_level != -1]
+                # add the cur_target_text_on_text_level removing the extra padding that was there because of the speech channel
+                target_texts_on_text_level.append(cur_target_text_on_text_level)
+
         target_texts_merge, target_text_lengths = collate_and_pad(new_target_texts)
         source_texts_merge, source_text_lengths = collate_and_pad(new_source_texts)
+
+        # s2s_duplex_cross_attn
+        target_texts_on_text_level_lengths = None
+        if getattr(cut, "s2s_duplex_cross_attn", False):
+            target_texts_on_text_level, target_texts_on_text_level_lengths = collate_and_pad(target_texts_on_text_level)
+
         assert cnt + skipped == len(target_texts)
         assert target_texts_merge.shape[0] == len(num_turns)
         assert cnt + skipped + skipped_source == len(source_texts)
@@ -500,6 +547,8 @@ class LhotseAudioQuestionAnswerDataset(torch.utils.data.Dataset):
             "answer_audio": answer_audios,
             "answer_audio_lens": answer_audio_lens,
             "num_turns": torch.Tensor(num_turns).long(),
+            "target_texts_on_text_level": target_texts_on_text_level,
+            "target_texts_on_text_level_lengths":target_texts_on_text_level_lengths,
         }
 
         return return_batch
@@ -561,7 +610,8 @@ class LhotseAudioQuestionAnswerDataset(torch.utils.data.Dataset):
                 "cut does not have target_audio. In duplex mode, recording keeps user channel and target_audio keeps agent channel"
             )
 
-        text_pad_id = self.text_processor.pad_id
+        # text_pad_id = self.text_processor.pad_id
+        text_pad_id = self.text_processor.tokenizer.pad_id if hasattr(self.text_processor.tokenizer, 'pad_id') and self.text_processor.tokenizer.pad_id >= 0 else self.text_processor.tokenizer.unk_id
 
         def get_3d_empty_tensor(batch_size, length, text_fill_id, speech_fill_id):
             return torch.cat(
@@ -784,7 +834,8 @@ class LhotseAudioQuestionAnswerDataset(torch.utils.data.Dataset):
                     text_loss_masks=collate_vectors_lhotse(answer_masks_all, padding_value=0),
                 )
             else:
-                pad_id = self.text_processor.pad_id
+                # pad_id = self.text_processor.pad_id
+                pad_id = self.text_processor.tokenizer.pad_id if hasattr(self.text_processor.tokenizer, 'pad_id') and self.text_processor.tokenizer.pad_id >= 0 else self.text_processor.tokenizer.unk_id
                 text_minibatch = dict(
                     text_input_ids=collate_vectors_lhotse([e.input_ids for e in text_examples], padding_value=pad_id),
                     text_answer_ids=collate_vectors_lhotse([e.answer_ids for e in text_examples], padding_value=pad_id),
@@ -798,7 +849,7 @@ class LhotseAudioQuestionAnswerDataset(torch.utils.data.Dataset):
             return text_minibatch
 
         # full-duplex data goes here
-        if getattr(cuts[0], "s2s_duplex", False) or getattr(cuts[0], "s2s_duplex_align", False):
+        if getattr(cuts[0], "s2s_duplex", False) or getattr(cuts[0], "s2s_duplex_align", False) or getattr(cuts[0], "s2s_duplex_cross_attn", False):
             return self.__getitem__duplex_(cuts)
         if getattr(cuts[0], "s2s_duplex_overlap", False):
             return self.__getitem__duplex_overlap_(cuts)
@@ -979,6 +1030,7 @@ class LhotseAudioQuestionAnswerDataset(torch.utils.data.Dataset):
                 ],
                 axis=2,
             )
+
 
         def collate_and_pad(inputs):
             token_lengths = [len(seq) for seq in inputs]

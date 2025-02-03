@@ -252,12 +252,13 @@ model:
       text:
         input_cfg: 
           - type: multimodal_conversation
-            manifest_filepath: /data/canary_llm/v0/datablends/text_data/daring-anteater_commercial.shuf.removelong.3k.jsonl
+            # manifest_filepath: /data/canary_llm/v0/datablends/text_data/daring-anteater_commercial.shuf.removelong.3k.jsonl
             # manifest_filepath: /data/canary_llm/v0/datablends/text_data/daring-anteater_commercial.shuf.removelong.3k/text_000000.jsonl
+            manifest_filepath: /lustre/fsw/portfolios/convai/users/ecasanova/S2S-full-duplex/cuts.000304.jsonl
             weight: 1.0
             tags:
               s2s_duplex: True
-              random_padding_vtblender: True
+              random_padding_vtblender: False
               limit_max_seq_length: ${model.limit_max_seq_length}
 
 
