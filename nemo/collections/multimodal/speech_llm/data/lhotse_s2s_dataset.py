@@ -795,7 +795,7 @@ class LhotseAudioQuestionAnswerDataset(torch.utils.data.Dataset):
             if getattr(text_examples[0], "s2s_duplex", False):
                 use_random_padding = getattr(text_examples[0], "random_padding_vtblender", False) # 2.5 to 4
                 limit_max_seq_length = getattr(text_examples[0], "limit_max_seq_length", False)
-                text_pad_id = self.text_processor.pad_id # this token is 2, which is equivalent to eos token: self.text_processor.tokenizer.pad_id if hasattr(self.text_processor.tokenizer, 'pad_id') and self.text_processor.tokenizer.pad_id >= 0 else self.text_processor.tokenizer.unk_id
+                pad_id = self.text_processor.pad_id # this token is 2, which is equivalent to eos token: self.text_processor.tokenizer.pad_id if hasattr(self.text_processor.tokenizer, 'pad_id') and self.text_processor.tokenizer.pad_id >= 0 else self.text_processor.tokenizer.unk_id
                 # pad_id = self.text_processor.tokenizer.pad_id if hasattr(self.text_processor.tokenizer, 'pad_id') and self.text_processor.tokenizer.pad_id >= 0 else self.text_processor.tokenizer.unk_id
                 bos_id = self.text_processor.bos_id
                 eos_id = self.text_processor.eos_id
