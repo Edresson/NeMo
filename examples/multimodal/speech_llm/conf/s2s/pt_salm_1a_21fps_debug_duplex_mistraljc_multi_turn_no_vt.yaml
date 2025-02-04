@@ -247,14 +247,15 @@ model:
       multi_config: true
       sampler_fusion: randomized_round_robin
       sampler_weights:
-        duplex: 0.7
-        text: 0.3
+        duplex: 1.0
+        text: 0.0
       text:
         input_cfg: 
           - type: multimodal_conversation
+            # This confi is no VTblender !!
             # manifest_filepath: /data/canary_llm/v0/datablends/text_data/daring-anteater_commercial.shuf.removelong.3k.jsonl
-            # manifest_filepath: /lustre/fsw/portfolios/convai/users/ecasanova/S2S-full-duplex/cuts.000304.jsonl # dummy data
-            manifest_filepath: "/lustre/fsw/portfolios/convai/users/ecasanova/S2S-full-duplex/data/VTBlender/lindy.jsonl" # all lindy data
+            # manifest_filepath: /data/canary_llm/v0/datablends/text_data/daring-anteater_commercial.shuf.removelong.3k/text_000000.jsonl
+            manifest_filepath: /lustre/fsw/portfolios/convai/users/ecasanova/S2S-full-duplex/cuts.000304.jsonl
             weight: 1.0
             tags:
               s2s_duplex: True
