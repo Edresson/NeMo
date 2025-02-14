@@ -380,7 +380,7 @@ class ModularAudioGPTModel(SpeechLLMAdapterMixin, MegatronGPTSFTModel):
         return encoder_input, attention_mask, labels, loss_mask, encoder_length
 
     def _gpt_forward(
-        self, input_ids, position_ids, encoder_input, attention_mask, labels, checkpoint_activations_all_layers
+        self, input_ids, position_ids, encoder_input, attention_mask, labels, checkpoint_activations_all_layers, speech_mask=None
     ):
         """Forward pass of the GPT model."""
         if self.megatron_amp_O2:
@@ -392,6 +392,7 @@ class ModularAudioGPTModel(SpeechLLMAdapterMixin, MegatronGPTSFTModel):
                 decoder_input=encoder_input,
                 attention_mask=attention_mask,
                 labels=labels,
+                speech_mask=speech_mask,
             )
         else:
             output = self.model(
@@ -401,6 +402,7 @@ class ModularAudioGPTModel(SpeechLLMAdapterMixin, MegatronGPTSFTModel):
                 attention_mask=attention_mask,
                 labels=labels,
                 checkpoint_activations_all_layers=checkpoint_activations_all_layers,
+                speech_mask=speech_mask,
             )
         return output
 
@@ -421,8 +423,10 @@ class ModularAudioGPTModel(SpeechLLMAdapterMixin, MegatronGPTSFTModel):
         if 'audio_signal' in audio_batch:
             # in this branch, limit_max_seq_length is handled in prepare_llm_input
             encoder_input, attention_mask, labels, loss_mask, _ = self.prepare_llm_input(audio_batch)
+            # use last position of loss mask as speech mask
+            speech_mask = loss_mask[:, :, -1].squeeze(-1)
             output = self._gpt_forward(
-                None, None, encoder_input, attention_mask, labels, checkpoint_activations_all_layers
+                None, None, encoder_input, attention_mask, labels, checkpoint_activations_all_layers, speech_mask=speech_mask,
             )
             multimodal_output['audio_text'] = (output, loss_mask)
 

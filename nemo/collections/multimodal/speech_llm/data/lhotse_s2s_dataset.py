@@ -410,7 +410,7 @@ class LhotseAudioQuestionAnswerDataset(torch.utils.data.Dataset):
         new_target_texts = []
         new_source_texts = []
         target_texts_on_text_level = []
-        text_end_step_previous = None
+        input_audios_on_text_level = []
         for i in range(len(num_turns)):
             each_target_texts = []
             total_steps = (
@@ -443,6 +443,8 @@ class LhotseAudioQuestionAnswerDataset(torch.utils.data.Dataset):
                     else self.text_processor.tokenizer.unk_id
                 ),
             )
+
+            input_audio_on_text_level = audio[i].clone()[:audio_lens[i]]
             # assert len(text_start_time[i]) == num_turns[i] // 2
             for j in range(num_turns[i] // 2):
                 text_start_step = get_step_by_time(text_start_time[i][j])
@@ -458,9 +460,30 @@ class LhotseAudioQuestionAnswerDataset(torch.utils.data.Dataset):
 
                 cur_target_text[text_start_step] = self.text_processor.bos_id
                 cur_source_text[text_start_step] = self.text_processor.bos_id
+                if j+1 < num_turns[i] // 2:
+                    next_text_start_step = get_step_by_time(text_start_time[i][j+1])
+                else:
+                    next_text_start_step = None
+
                 if getattr(cut, "s2s_duplex", False):
-                    # Note: text can be truncated
                     text_len = min(text_end_step - text_start_step - 1, target_texts[cnt].shape[0])
+                    # text level
+                    cur_target_text_on_text_level[text_start_step] = self.text_processor.bos_id
+                    cur_target_text_on_text_level[(text_start_step + 1) : (text_start_step + 1 + text_len)] = target_texts[cnt][
+                        :text_len
+                    ].clone()
+                    # add eos and maker extra padding to remove later
+                    text_end_step_no_pad = text_start_step + 1 + text_len # compute where actually the text end
+                    cur_target_text_on_text_level[text_end_step_no_pad] = self.text_processor.eos_id
+                    cur_target_text_on_text_level[text_end_step_no_pad+1: text_end_step+1] = -1
+
+                    # text level target audio, mask from text end until the next next_text_start_step (to remove extra zeros from speech channel)
+                    # convert indices to audio 16khz
+                    audio_level_text_end_step_no_pad = round((text_end_step_no_pad+1) * (self.codec_model_downsampling_factor * self.decoder_reduction_factor) * (self.sample_rate/self.codec_sample_rate))
+                    audio_level_next_text_start_step = round((text_end_step+1) * (self.codec_model_downsampling_factor * self.decoder_reduction_factor) * (self.sample_rate/self.codec_sample_rate))
+                    input_audio_on_text_level[audio_level_text_end_step_no_pad:audio_level_next_text_start_step] = -1
+
+                    # speech level
                     cur_target_text[(text_start_step + 1) : (text_start_step + 1 + text_len)] = target_texts[cnt][
                         :text_len
                     ]
@@ -470,6 +493,7 @@ class LhotseAudioQuestionAnswerDataset(torch.utils.data.Dataset):
                     ]
                     cur_target_text[text_end_step] = self.text_processor.eos_id
                     cur_source_text[text_end_step] = self.text_processor.eos_id
+
                 elif getattr(cut, "s2s_duplex_align", False):
                     text_len_plus_eos = torch.tensor(text_end_step - text_start_step)
                     target_texts_expanded = self._expand_text_with_timestamps_and_word_lengths(
@@ -486,47 +510,49 @@ class LhotseAudioQuestionAnswerDataset(torch.utils.data.Dataset):
                     cur_target_text[text_end_step] = self.text_processor.eos_id
                     cur_source_text[text_end_step] = self.text_processor.eos_id
 
-                elif getattr(cut, "s2s_duplex_cross_attn", False):
-                    # if s2s_duplex_cross_attn get the target text on text level, ignoring the speech padding.
-                    text_len = min(text_end_step - text_start_step - 1, target_texts[cnt].shape[0])
-                    cur_target_text_on_text_level[text_start_step] = self.text_processor.bos_id
-                    cur_target_text_on_text_level[(text_start_step + 1) : (text_start_step + 1 + text_len)] = target_texts[cnt][
-                        :text_len
-                    ].clone()
-                    # add eos and maker extra padding to remove later
-                    text_end_step_no_pad = text_start_step + 1 + text_len # compute where actually the text end
-                    cur_target_text_on_text_level[text_end_step_no_pad] = self.text_processor.eos_id
-                    cur_target_text_on_text_level[text_end_step_no_pad+1: text_end_step+1] = -1
-
-                    # compute the rest normally as in s2s_duplex mode
-                    cur_target_text[(text_start_step + 1) : (text_start_step + 1 + text_len)] = target_texts[cnt][
-                        :text_len
-                    ]
-                    src_text_len = min(text_end_step - text_start_step - 1, source_texts[cnt].shape[0])
-                    cur_source_text[(text_start_step + 1) : (text_start_step + 1 + src_text_len)] = source_texts[cnt][
-                        :src_text_len
-                    ]
-                    cur_target_text[text_end_step] = self.text_processor.eos_id
-                    cur_source_text[text_end_step] = self.text_processor.eos_id
-                else:
                     raise Exception("Undefined assistant channel text format.")
 
                 cnt += 1
 
             new_target_texts.append(cur_target_text)
             new_source_texts.append(cur_source_text)
-            if getattr(cut, "s2s_duplex_cross_attn", False):
-                cur_target_text_on_text_level = cur_target_text_on_text_level[cur_target_text_on_text_level != -1]
-                # add the cur_target_text_on_text_level removing the extra padding that was there because of the speech channel
-                target_texts_on_text_level.append(cur_target_text_on_text_level)
+            cur_target_text_on_text_level = cur_target_text_on_text_level[cur_target_text_on_text_level != -1]
+            # add the cur_target_text_on_text_level removing the extra padding that was there because of the speech channel
+            target_texts_on_text_level.append(cur_target_text_on_text_level)
+
+            # remove marked audio portion and save it
+            """
+            print("input audio len:", input_audio_on_text_level.shape, metadata[i])
+            import soundfile as sf
+            sf.write(
+                "/lustre/fsw/portfolios/convai/users/ecasanova/S2S-full-duplex/scripts/input_audio.wav",
+                audio[i].clone()[:audio_lens[i]].detach().cpu().numpy(),
+                self.sample_rate,
+            )
+
+            sf.write(
+                "/lustre/fsw/portfolios/convai/users/ecasanova/S2S-full-duplex/scripts/output_audio.wav",
+                answer_audios[i].clone()[:answer_audio_lens[i]].detach().cpu().numpy(),
+                self.codec_sample_rate,
+            )"""
+
+            input_audio_on_text_level = input_audio_on_text_level[input_audio_on_text_level != -1]
+            """sf.write(
+                "/lustre/fsw/portfolios/convai/users/ecasanova/S2S-full-duplex/scripts/input_audio_text_level.wav",
+                input_audio_on_text_level.detach().cpu().numpy(),
+                self.sample_rate,
+            )"""
+            input_audios_on_text_level.append(input_audio_on_text_level)
+            # print("input audio len in text level:", input_audio_on_text_level.shape)
 
         target_texts_merge, target_text_lengths = collate_and_pad(new_target_texts)
         source_texts_merge, source_text_lengths = collate_and_pad(new_source_texts)
 
-        # s2s_duplex_cross_attn
-        target_texts_on_text_level_lengths = None
-        if getattr(cut, "s2s_duplex_cross_attn", False):
-            target_texts_on_text_level, target_texts_on_text_level_lengths = collate_and_pad(target_texts_on_text_level)
+        # text level
+        target_texts_on_text_level, target_texts_on_text_level_lengths = collate_and_pad(target_texts_on_text_level)
+
+        # input audio text level
+        input_audios_on_text_level, input_audios_on_text_level_lengths = collate_and_pad(input_audios_on_text_level)
 
         assert cnt + skipped == len(target_texts)
         assert target_texts_merge.shape[0] == len(num_turns)
@@ -557,6 +583,8 @@ class LhotseAudioQuestionAnswerDataset(torch.utils.data.Dataset):
             "speaker_ids": self.get_speaker_id(cuts),
             "target_texts_on_text_level": target_texts_on_text_level,
             "target_texts_on_text_level_lengths":target_texts_on_text_level_lengths,
+            "input_audios_on_text_level": input_audios_on_text_level,
+            "input_audios_on_text_level_lengths": input_audios_on_text_level_lengths,
         }
 
         if hasattr(cut, "include_sys"):  # assume no within batch mixing

@@ -33,6 +33,8 @@ from nemo.collections.nlp.parts.nlp_overrides import NLPSaveRestoreConnector
 from nemo.collections.nlp.parts.utils_funcs import get_last_rank
 from nemo.utils import AppState, logging, model_utils
 
+from nemo.collections.tts.modules import t5tts_transformer
+
 try:
     from megatron.core import InferenceParams, parallel_state, tensor_parallel
     from megatron.core.models.common.embeddings.language_model_embedding import LanguageModelEmbedding
@@ -132,6 +134,7 @@ class S2sMCoreGPTModel(MCoreGPTModel):
         config: TransformerConfig,
         proj_head_dims: List[int],
         proj_head_loss_weights: List[float],
+        speech_decoder_parms: DictConfig = None,
         *args,
         **kwargs,
     ) -> None:
@@ -139,6 +142,7 @@ class S2sMCoreGPTModel(MCoreGPTModel):
         self.n_proj_heads = len(proj_head_dims)
         self.proj_head_dims = proj_head_dims
         self.proj_head_loss_weights = proj_head_loss_weights
+        self.speech_decoder_parms = speech_decoder_parms
         self.output_layers = torch.nn.ModuleList(
             [
                 tensor_parallel.ColumnParallelLinear(
@@ -157,6 +161,14 @@ class S2sMCoreGPTModel(MCoreGPTModel):
                 for i in range(self.n_proj_heads)
             ]
         )
+        if self.speech_decoder_parms:
+            self.speech_decoder = t5tts_transformer.Transformer(**dict(self.speech_decoder_parms))
+            self.text_dim_to_speech_proj = nn.Linear(config.hidden_size, self.speech_decoder_parms.d_model)
+            self.speech_dim_to_text_proj = nn.Linear(self.speech_decoder_parms.d_model, config.hidden_size)
+        else:
+            self.speech_decoder = None
+            self.text_dim_to_speech_proj = None
+            self.speech_dim_to_text_proj = None
 
     # TODO rewrite setup_embeddings_and_output_layer to include self.output_layers
 
@@ -193,6 +205,7 @@ class S2sMCoreGPTModel(MCoreGPTModel):
         inference_params: InferenceParams = None,
         packed_seq_params: PackedSeqParams = None,
         extra_block_kwargs: dict = None,
+        speech_mask: Tensor = None,
     ) -> Tensor:
         """Forward function of the GPT Model This function passes the input tensors
         through the embedding layer, and then the decoeder and finally into the post
@@ -239,28 +252,30 @@ class S2sMCoreGPTModel(MCoreGPTModel):
             output_weight = self.shared_embedding_or_output_weight()
         else:
             output_weight = None
-        if input_ids is not None and input_ids.dim() == 2:  # pure text example
-            logits, _ = self.output_layer(
-                hidden_states, weight=output_weight[: self.vocab_size] if output_weight is not None else None
-            )
 
-            if labels is None:
-                # [s b h] => [b s h]
-                return logits.transpose(0, 1).contiguous()
+        if self.speech_decoder:
+            hidden_states_dec_input = hidden_states.transpose(0, 1) # from [T, B, F] to [B, T, F]
+            speech_decoder_input = self.text_dim_to_speech_proj(hidden_states_dec_input)
 
-            loss = self.compute_language_model_loss(labels, logits)
+            # workaround for inference, because during inference speech_mask will be None
+            if speech_mask is None:
+                speech_mask = torch.ones((speech_decoder_input.size(0), speech_decoder_input.size(1))).to(speech_decoder_input.device)
 
-            return loss
-        else:
+            speech_hidden_states = self.speech_decoder(x=speech_decoder_input, x_mask=speech_mask)['output']
+            speech_hidden_states = self.speech_dim_to_text_proj(speech_hidden_states).transpose(0, 1) # from [B, T, F] to [T, B, F]
+
             all_logits = []
             cur_dims = 0
-            for i in range(self.n_proj_heads):
+            for i in range(0, self.n_proj_heads):
                 cur_output_weight = (
                     output_weight[cur_dims : cur_dims + self.proj_head_dims[i]] if output_weight is not None else None
                 )
-                all_logits.append(self.output_layers[i](hidden_states, weight=cur_output_weight)[0])
+                all_logits.append(self.output_layers[i](speech_hidden_states, weight=cur_output_weight)[0])
                 cur_dims += self.proj_head_dims[i]
+
             assert self.vocab_size == self.proj_head_dims[0]
+
+            # LLM head receives llm backbone output
             all_logits[0], _ = self.output_layer(
                 hidden_states, weight=output_weight[: self.vocab_size] if output_weight is not None else None
             )
@@ -280,6 +295,48 @@ class S2sMCoreGPTModel(MCoreGPTModel):
                 / sum(self.proj_head_loss_weights)
             )
             return tokens_loss
+        else:
+            if input_ids is not None and input_ids.dim() == 2:  # pure text example
+                logits, _ = self.output_layer(
+                    hidden_states, weight=output_weight[: self.vocab_size] if output_weight is not None else None
+                )
+
+                if labels is None:
+                    # [s b h] => [b s h]
+                    return logits.transpose(0, 1).contiguous()
+
+                loss = self.compute_language_model_loss(labels, logits)
+
+                return loss
+            else:
+                all_logits = []
+                cur_dims = 0
+                for i in range(self.n_proj_heads):
+                    cur_output_weight = (
+                        output_weight[cur_dims : cur_dims + self.proj_head_dims[i]] if output_weight is not None else None
+                    )
+                    all_logits.append(self.output_layers[i](hidden_states, weight=cur_output_weight)[0])
+                    cur_dims += self.proj_head_dims[i]
+                assert self.vocab_size == self.proj_head_dims[0]
+                all_logits[0], _ = self.output_layer(
+                    hidden_states, weight=output_weight[: self.vocab_size] if output_weight is not None else None
+                )
+
+                if labels is None:
+                    # [s b h] => [b s h]
+                    return_logits = [logits.transpose(0, 1).contiguous() for logits in all_logits]
+                    return torch.cat(return_logits, dim=-1)  # cat the last dim together to make other mcore code happy
+
+                tokens_loss = torch.stack(
+                    [self.compute_language_model_loss(labels[:, :, i], all_logits[i]) for i in range(self.n_proj_heads)],
+                    axis=2,
+                )
+                tokens_loss = (
+                    tokens_loss
+                    * torch.FloatTensor(self.proj_head_loss_weights).to(tokens_loss.device)
+                    / sum(self.proj_head_loss_weights)
+                )
+                return tokens_loss
 
 
 class S2sMCoreGPTModelDepth(S2sMCoreGPTModel):
@@ -464,6 +521,7 @@ class S2sModularAudioGPTModel(ModularAudioGPTModel):
                 rotary_base=self.cfg.get('rotary_base', 10000),
                 proj_head_dims=self.proj_head_dims,
                 proj_head_loss_weights=self.proj_head_loss_weights,
+                speech_decoder_parms=self.cfg.get('speech_decoder_parms', None),
             )
 
             if self.cfg.get('scale_positional_embedding', False):
