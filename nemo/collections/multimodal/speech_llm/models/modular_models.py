@@ -424,7 +424,7 @@ class ModularAudioGPTModel(SpeechLLMAdapterMixin, MegatronGPTSFTModel):
             # in this branch, limit_max_seq_length is handled in prepare_llm_input
             encoder_input, attention_mask, labels, loss_mask, _ = self.prepare_llm_input(audio_batch)
             # use last position of loss mask as speech mask
-            speech_mask = loss_mask[:, :, -1].squeeze(-1)
+            speech_mask = loss_mask[:, :, -1].reshape(loss_mask.size(0), loss_mask.size(1))
             output = self._gpt_forward(
                 None, None, encoder_input, attention_mask, labels, checkpoint_activations_all_layers, speech_mask=speech_mask,
             )

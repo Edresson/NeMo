@@ -241,7 +241,7 @@ class Attention(torch.nn.Module):
         attn_prob = self.dropout(attn_prob)
 
         y = torch.matmul(attn_prob, v)
-        y = y.transpose(1, 2).contiguous().view(B, T, -1)
+        y = y.transpose(1, 2).contiguous().reshape(B, T, -1)
 
         return y, [attn_prob, attn_score]
 
@@ -310,7 +310,7 @@ class SelfAttention(Attention):
                 )
             self.register_buffer(
                 "causal_mask",
-                torch.tril(torch.ones(max_length_causal_mask, max_length_causal_mask)).view(
+                torch.tril(torch.ones(max_length_causal_mask, max_length_causal_mask)).reshape(
                     1, 1, max_length_causal_mask, max_length_causal_mask
                 ),
             )
