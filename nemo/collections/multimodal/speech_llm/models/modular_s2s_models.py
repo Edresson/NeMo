@@ -161,6 +161,7 @@ class S2sMCoreGPTModel(MCoreGPTModel):
                 for i in range(self.n_proj_heads)
             ]
         )
+
         if self.speech_decoder_parms:
             self.speech_decoder = t5tts_transformer.Transformer(**dict(self.speech_decoder_parms))
             self.text_dim_to_speech_proj = nn.Linear(config.hidden_size, self.speech_decoder_parms.d_model)
@@ -254,15 +255,17 @@ class S2sMCoreGPTModel(MCoreGPTModel):
             output_weight = None
 
         if self.speech_decoder:
-            hidden_states_dec_input = hidden_states.transpose(0, 1) # from [T, B, F] to [B, T, F]
+            hidden_states_dec_input = hidden_states# .transpose(0, 1) # from [T, B, F] to [B, T, F]
             speech_decoder_input = self.text_dim_to_speech_proj(hidden_states_dec_input)
 
             # workaround for inference, because during inference speech_mask will be None
             if speech_mask is None:
                 speech_mask = torch.ones((speech_decoder_input.size(0), speech_decoder_input.size(1))).to(speech_decoder_input.device)
-
+            else:
+                speech_mask = speech_mask.transpose(0, 1)
+            # print(speech_mask.shape, speech_decoder_input.shape)
             speech_hidden_states = self.speech_decoder(x=speech_decoder_input, x_mask=speech_mask)['output']
-            speech_hidden_states = self.speech_dim_to_text_proj(speech_hidden_states).transpose(0, 1) # from [B, T, F] to [T, B, F]
+            speech_hidden_states = self.speech_dim_to_text_proj(speech_hidden_states)# .transpose(0, 1) # from [B, T, F] to [T, B, F]
 
             all_logits = []
             cur_dims = 0
@@ -1707,6 +1710,16 @@ class S2sModularAudioGPTModel(ModularAudioGPTModel):
                 param.requires_grad = True
             for param in self.model.decoder.final_layernorm.parameters():
                 param.requires_grad = True
+
+            if self.speech_decoder_parms:
+                for param in self.model.speech_decoder.parameters():
+                    param.requires_grad = True
+
+                for param in self.model.text_dim_to_speech_proj.parameters():
+                    param.requires_grad = True
+
+                for param in self.model.speech_dim_to_text_proj.parameters():
+                    param.requires_grad = True
 
 
 class S2sModularAudioGPTModelDepth(S2sModularAudioGPTModel):
