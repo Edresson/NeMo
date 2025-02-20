@@ -223,6 +223,7 @@ class LhotseAudioQuestionAnswerDataset(torch.utils.data.Dataset):
             assert len(cut.system_prompt) <= 1, f"More than one system prompt in {cut}"
             cut.system_prompt = cut.system_prompt[0].text if len(cut.system_prompt) > 0 else ''
             cut.supervisions = [sup for sup in cut.supervisions if sup.duration > 0.0]  # ignore system prompt
+
         for cut in cuts:
             if np.isclose(cut.target_audio.duration, cut.recording.duration):
                 is_valid = True
