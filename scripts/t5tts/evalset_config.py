@@ -40,6 +40,18 @@ dataset_meta_info = {
         'feature_dir' : '/Data/LibriTTS',
         'tokenizer_names': ['english_phoneme'],
     },
+    'libri_unseen_edresson_bpe': {
+        'manifest_path' : '/home/ecasanova/Projects/Datasets/Eval-TTS/LibriTTS/test_clean_withContextAudioPaths.json',
+        'audio_dir' : '/home/ecasanova/Projects/Datasets/Eval-TTS/LibriTTS/',
+        'feature_dir' : '/home/ecasanova/Projects/Datasets/Eval-TTS/LibriTTS/',
+        'tokenizer_names': ['multilingual_sentencepiece'],
+    },
+    'libri_unseen_edresson_phoneme': {
+        'manifest_path' : '/home/ecasanova/Projects/Datasets/Eval-TTS/LibriTTS/test_clean_withContextAudioPaths.json',
+        'audio_dir' : '/home/ecasanova/Projects/Datasets/Eval-TTS/LibriTTS/',
+        'feature_dir' : '/home/ecasanova/Projects/Datasets/Eval-TTS/LibriTTS/',
+        'tokenizer_names': ['english_phoneme'],
+    },
     'libri_unseen_test_shehzeen_sep_char': {
         'manifest_path' : '/home/shehzeenh/Code/NewT5TTS/manifests/test_clean_withContextAudioPaths.json',
         'audio_dir' : '/Data/LibriTTS',

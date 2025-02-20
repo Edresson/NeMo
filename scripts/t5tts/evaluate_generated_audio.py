@@ -12,6 +12,7 @@ from transformers import WhisperProcessor, WhisperForConditionalGeneration
 import librosa
 import evalset_config
 from transformers import Wav2Vec2FeatureExtractor, WavLMForXVector
+from huggingface_hub import hf_hub_download
 
 def find_sample_audios(audio_dir):
     file_list = []
@@ -64,6 +65,8 @@ def transcribe_with_whisper(whisper_model, whisper_processor, audio_path, langua
     result = transcription[0]
     return result
 
+
+
 def extract_embedding(model, extractor, audio_path, device, sv_model_type):
     speech_array, sampling_rate = librosa.load(audio_path, sr=16000)
     
@@ -71,6 +74,11 @@ def extract_embedding(model, extractor, audio_path, device, sv_model_type):
         inputs = extractor(speech_array, sampling_rate=sampling_rate, return_tensors="pt").input_values.to(device)
         with torch.no_grad():
             embeddings = model(inputs).embeddings
+    elif sv_model_type == "ecapa2":
+        speech_array_tensor = torch.from_numpy(speech_array).unsqueeze(0)
+        with torch.no_grad():
+            embeddings = model(speech_array_tensor.to(device))
+            embeddings = torch.nn.functional.normalize(embeddings, p=2, dim=1)
     else:  # Titanet
         with torch.no_grad():
             embeddings = model.get_embedding(audio_path).squeeze()
@@ -97,11 +105,14 @@ def evaluate(manifest_path, audio_dir, generated_audio_dir, language="en", sv_mo
         whisper_model = whisper_model.to(device)
         whisper_model.eval()
 
+    feature_extractor = None
     if sv_model_type == "wavlm":
         feature_extractor = Wav2Vec2FeatureExtractor.from_pretrained('microsoft/wavlm-base-plus-sv')
         speaker_verification_model = WavLMForXVector.from_pretrained('microsoft/wavlm-base-plus-sv').to(device).eval()
+    elif sv_model_type == "ecapa2":
+        ecapa2_file = hf_hub_download(repo_id='Jenthe/ECAPA2', filename='ecapa2.pt', cache_dir=None)
+        speaker_verification_model = torch.jit.load(ecapa2_file, map_location='cpu').to(device)
     else:
-        feature_extractor = None
         speaker_verification_model = nemo_asr.models.EncDecSpeakerLabelModel.from_pretrained(model_name='titanet_large') 
         speaker_verification_model = speaker_verification_model.to(device)
         speaker_verification_model.eval()
@@ -235,7 +246,7 @@ def main():
     if args.evalset is not None:
         dataset_meta_info = evalset_config.dataset_meta_info
         assert args.evalset in dataset_meta_info
-        args.manifest_path = dataset_meta_info[args.evalset]['manifest_path']
+        args.manifest_path = dataset_meta_info[args.evalset]['manifest']
         args.audio_dir = dataset_meta_info[args.evalset]['audio_dir']
     
     evaluate(args.manifest_path, args.audio_dir, args.generated_audio_dir, args.whisper_language, sv_model_type="wavlm")

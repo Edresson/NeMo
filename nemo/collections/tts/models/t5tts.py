@@ -46,6 +46,7 @@ from nemo.collections.asr.metrics.wer import word_error_rate
 from nemo.collections.tts.parts.utils.tts_dataset_utils import stack_tensors
 from nemo.collections.common.tokenizers.text_to_speech.tts_tokenizers import AggregatedTTSTokenizer
 from nemo.collections.tts.data.text_to_speech_dataset_lhotse import build_lhotse_dataloader, T5TTSLhotseDataset
+import time
 
 HAVE_WANDB = True
 try:
@@ -721,7 +722,7 @@ class T5TTS_Model(ModelPT):
 
         return val_output
     
-    def infer_batch(self, batch, max_decoder_steps=500, temperature=0.7, topk=80, use_cfg=False, cfg_scale=1.0):
+    def infer_batch(self, batch, max_decoder_steps=500, temperature=0.7, topk=80, use_cfg=False, cfg_scale=1.0, return_rtf_metrics=False):
         with torch.no_grad():
             self.t5_decoder.reset_cache(use_cache=self.use_kv_cache_for_inference)
             
@@ -742,8 +743,10 @@ class T5TTS_Model(ModelPT):
                     context_tensors['additional_decoder_input'],
                     context_tensors['addtional_decoder_mask']
                 )
-            
+            infer_start_time = time.time()
+            autoregressive_step_time_list = []
             for idx in range(max_decoder_steps):
+                step_infer_start = time.time()
                 if idx % 20 == 0:
                     print(f"Decoding timestep {idx}")
                 audio_codes_embedded = self.embed_audio_tokens(audio_codes_input)
@@ -809,14 +812,26 @@ class T5TTS_Model(ModelPT):
                 if len(end_indices) == text.size(0):
                     print("All ends reached")
                     break
+                
+                autoregressive_step_time_list.append(time.time()-step_infer_start)
             
+            codec_time_start = time.time()
             predicted_codes = torch.stack(all_predictions, dim=-1) # (B, num_codebooks, T')
             predicted_lens = [end_indices.get(idx, max_decoder_steps) for idx in range(text.size(0))]
             predicted_codes_lens = torch.tensor(predicted_lens, device=text.device).long()
-
             predicted_audio, predicted_audio_lens = self.codes_to_audio(predicted_codes, predicted_codes_lens)
             
             torch.cuda.empty_cache()
+
+            if return_rtf_metrics:
+                # total audio duration divided by the sampling rate to get the value in seconds
+                total_audio_duration = predicted_audio_lens.sum() / self._codec_model.sample_rate
+                rtf = (time.time()-infer_start_time) / total_audio_duration.item()
+                avg_autoregressive_step_time = np.array(autoregressive_step_time_list).mean()
+                codec_infer_time = time.time() - codec_time_start
+                rtf_metrics = {"rtf": rtf, "avg_autoregressive_step_time": avg_autoregressive_step_time, "codec_infer_time": codec_infer_time}
+                return predicted_audio, predicted_audio_lens, predicted_codes, predicted_codes_lens, rtf_metrics
+
             return predicted_audio, predicted_audio_lens, predicted_codes, predicted_codes_lens
 
     def test_step(self, batch, batch_idx):

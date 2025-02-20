@@ -14,6 +14,8 @@ import scipy.stats as stats
 import copy
 import shutil
 from nemo.collections.asr.parts.utils.manifest_utils import read_manifest
+from nemo.core.connectors.save_restore_connector import SaveRestoreConnector
+import tempfile
 
 def compute_mean_and_confidence_interval(metrics_list, metric_keys, confidence=0.90):
     metrics = {}
@@ -26,6 +28,12 @@ def compute_mean_and_confidence_interval(metrics_list, metric_keys, confidence=0
         print(f"{key}: {mean} +/- {confidence_interval}")
         metrics[key] = "{:.4f} +/- {:.4f}".format(mean, confidence_interval)
     return metrics
+
+def dict_list_mean(dict_list):
+    mean_dict = {}
+    for key in dict_list[0].keys():
+        mean_dict[key] = sum(d[key] for d in dict_list) / len(dict_list)
+    return mean_dict
 
 def run_inference(hparams_file, checkpoint_file, datasets, out_dir, temperature, topk, codecmodel_path, use_cfg, cfg_scale, batch_size, sv_model, num_repeats=1):
     # import ipdb; ipdb.set_trace()
@@ -47,14 +55,24 @@ def run_inference(hparams_file, checkpoint_file, datasets, out_dir, temperature,
 
     # Load weights from checkpoint file
     print("Loading weights from checkpoint")
-    ckpt = torch.load(checkpoint_file)
-    model.load_state_dict(ckpt['state_dict'])
+    if ".nemo" in checkpoint_file:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            SaveRestoreConnector._unpack_nemo_file(path2file=checkpoint_file, out_folder=tmpdir)
+            state_dict_path = os.path.join(tmpdir, "model_weights.ckpt")
+            ckpt = torch.load(state_dict_path)
+            model.load_state_dict(ckpt)
+    else:
+        ckpt = torch.load(checkpoint_file)
+        model.load_state_dict(ckpt['state_dict'])
+
     print("Loaded weights.")
     model.cuda()
     model.eval()
     # import ipdb; ipdb.set_trace()
-
-    checkpoint_name = checkpoint_file.split("/")[-1].split(".ckpt")[0]
+    if ".nemo" in checkpoint_file:
+        checkpoint_name = checkpoint_file.split("/")[-1].split(".nemo")[0]
+    else:
+        checkpoint_name = checkpoint_file.split("/")[-1].split(".ckpt")[0]
     checkpoint_name = "{}_Temp{}_Topk{}_Cfg_{}_{}_svmodel_{}".format(checkpoint_name, temperature, topk, use_cfg, cfg_scale, sv_model)
     dataset_meta_info = evalset_config.dataset_meta_info
     for dataset in datasets:
@@ -76,6 +94,7 @@ def run_inference(hparams_file, checkpoint_file, datasets, out_dir, temperature,
             if context_durration_min < 5.0 and context_durration_max > 5.0:
                 context_durration_min = 5.0
                 context_durration_max = 5.0 # @pneekhara - For multiencoder models, I want fixed size contexts for fair eval. Not too important though.
+
             test_dataset = T5TTSDataset(
                 dataset_meta=dataset_meta,
                 sample_rate=model_cfg.sample_rate,
@@ -111,6 +130,7 @@ def run_inference(hparams_file, checkpoint_file, datasets, out_dir, temperature,
             )
 
             item_idx = 0
+            rtf_metrics_list = []
             for bidx, batch in enumerate(test_data_loader):
                 print("Processing batch {} out of {} of dataset {}".format(bidx, len(test_data_loader), dataset))
                 batch_cuda ={}
@@ -119,10 +139,11 @@ def run_inference(hparams_file, checkpoint_file, datasets, out_dir, temperature,
                         batch_cuda[key] = batch[key].cuda()
                     else:
                         batch_cuda[key] = batch[key]
-                
+
                 import time
                 st = time.time()
-                predicted_audio, predicted_audio_lens, _, _ = model.infer_batch(batch_cuda, max_decoder_steps=440, temperature=temperature, topk=topk, use_cfg=use_cfg, cfg_scale=cfg_scale)
+                predicted_audio, predicted_audio_lens, _, _, rtf_metrics = model.infer_batch(batch_cuda, max_decoder_steps=440, temperature=temperature, topk=topk, use_cfg=use_cfg, cfg_scale=cfg_scale, return_rtf_metrics=True)
+                rtf_metrics_list.append(rtf_metrics)
                 et = time.time()
                 print(f"Time taken for inference: {et-st}", predicted_audio.size())
                 for idx in range(predicted_audio.size(0)):
@@ -149,6 +170,14 @@ def run_inference(hparams_file, checkpoint_file, datasets, out_dir, temperature,
                 language=language,
                 sv_model_type=sv_model
             )
+
+            # add rtf_metrics
+            rtf_metrics_avg = dict_list_mean(rtf_metrics_list) # get avg over metrics from different batches
+            metrics["rtf"] = rtf_metrics_avg["rtf"]
+            metrics["avg_autoregressive_step_time"] = rtf_metrics_avg["avg_autoregressive_step_time"]
+            metrics["codec_infer_time"] = rtf_metrics_avg["codec_infer_time"]
+
+            print(metrics)
             metrics_n_repeated.append(metrics)
             with open(os.path.join(eval_dir, f"{dataset}_metrics_{repeat_idx}.json"), "w") as f:
                 json.dump(metrics, f, indent=4)
@@ -160,23 +189,24 @@ def run_inference(hparams_file, checkpoint_file, datasets, out_dir, temperature,
             all_experiment_csv = os.path.join(out_dir, "all_experiment_metrics.csv")
             if not os.path.exists(all_experiment_csv):
                 with open(all_experiment_csv, "w") as f:
-                    f.write("checkpoint_name,dataset,cer_filewise_avg,wer_filewise_avg,cer_cumulative,wer_cumulative,ssim_pred_gt_avg,ssim_pred_context_avg,ssim_gt_context_avg,ssim_pred_gt_avg_alternate,ssim_pred_context_avg_alternate,ssim_gt_context_avg_alternate,cer_gt_audio_cumulative,wer_gt_audio_cumulative\n")
+                    f.write("checkpoint_name,dataset,cer_filewise_avg,wer_filewise_avg,cer_cumulative,wer_cumulative,ssim_pred_gt_avg,ssim_pred_context_avg,ssim_gt_context_avg,ssim_pred_gt_avg_alternate,ssim_pred_context_avg_alternate,ssim_gt_context_avg_alternate,cer_gt_audio_cumulative,wer_gt_audio_cumulative,rtf,avg_autoregressive_step_time,codec_infer_time\n")
             with open(all_experiment_csv, "a") as f:
-                f.write(f"{checkpoint_name},{dataset},{metrics['cer_filewise_avg']},{metrics['wer_filewise_avg']},{metrics['cer_cumulative']},{metrics['wer_cumulative']},{metrics['ssim_pred_gt_avg']},{metrics['ssim_pred_context_avg']},{metrics['ssim_gt_context_avg']},{metrics['ssim_pred_gt_avg_alternate']},{metrics['ssim_pred_context_avg_alternate']},{metrics['ssim_gt_context_avg_alternate']},{metrics['cer_gt_audio_cumulative']},{metrics['wer_gt_audio_cumulative']}\n")
+                f.write(f"{checkpoint_name},{dataset},{metrics['cer_filewise_avg']},{metrics['wer_filewise_avg']},{metrics['cer_cumulative']},{metrics['wer_cumulative']},{metrics['ssim_pred_gt_avg']},{metrics['ssim_pred_context_avg']},{metrics['ssim_gt_context_avg']},{metrics['ssim_pred_gt_avg_alternate']},{metrics['ssim_pred_context_avg_alternate']},{metrics['ssim_gt_context_avg_alternate']},{metrics['cer_gt_audio_cumulative']},{metrics['wer_gt_audio_cumulative']}{metrics['rtf']},{metrics['avg_autoregressive_step_time']},{metrics['codec_infer_time']}\n")
                 print(f"Wrote metrics for {checkpoint_name} and {dataset} to {all_experiment_csv}")
 
         metric_keys = ['cer_filewise_avg', 'wer_filewise_avg', 'cer_cumulative', 'wer_cumulative', 
                        'ssim_pred_gt_avg', 'ssim_pred_context_avg', 'ssim_gt_context_avg', 
                        'ssim_pred_gt_avg_alternate', 'ssim_pred_context_avg_alternate', 'ssim_gt_context_avg_alternate',
-                       'cer_gt_audio_cumulative', 'wer_gt_audio_cumulative'
+                       'cer_gt_audio_cumulative', 'wer_gt_audio_cumulative', "rtf", "avg_autoregressive_step_time", "codec_infer_time",
                        ]
         metrics_mean_ci = compute_mean_and_confidence_interval(metrics_n_repeated, metric_keys)
         all_experiment_csv_with_ci = os.path.join(out_dir, "all_experiment_metrics_with_ci.csv")
+
         if not os.path.exists(all_experiment_csv_with_ci):
             with open(all_experiment_csv_with_ci, "w") as f:
-                f.write("checkpoint_name,dataset,cer_filewise_avg,wer_filewise_avg,cer_cumulative,wer_cumulative,ssim_pred_gt_avg,ssim_pred_context_avg,ssim_gt_context_avg,ssim_pred_gt_avg_alternate,ssim_pred_context_avg_alternate,ssim_gt_context_avg_alternate,cer_gt_audio_cumulative,wer_gt_audio_cumulative\n")
+                f.write("checkpoint_name,dataset,cer_filewise_avg,wer_filewise_avg,cer_cumulative,wer_cumulative,ssim_pred_gt_avg,ssim_pred_context_avg,ssim_gt_context_avg,ssim_pred_gt_avg_alternate,ssim_pred_context_avg_alternate,ssim_gt_context_avg_alternate,cer_gt_audio_cumulative,wer_gt_audio_cumulative,rtf,avg_autoregressive_step_time,codec_infer_time\n")
         with open(all_experiment_csv_with_ci, "a") as f:
-            f.write(f"{checkpoint_name},{dataset},{metrics_mean_ci['cer_filewise_avg']},{metrics_mean_ci['wer_filewise_avg']},{metrics_mean_ci['cer_cumulative']},{metrics_mean_ci['wer_cumulative']},{metrics_mean_ci['ssim_pred_gt_avg']},{metrics_mean_ci['ssim_pred_context_avg']},{metrics_mean_ci['ssim_gt_context_avg']},{metrics_mean_ci['ssim_pred_gt_avg_alternate']},{metrics_mean_ci['ssim_pred_context_avg_alternate']},{metrics_mean_ci['ssim_gt_context_avg_alternate']},{metrics_mean_ci['cer_gt_audio_cumulative']},{metrics_mean_ci['wer_gt_audio_cumulative']}\n")
+            f.write(f"{checkpoint_name},{dataset},{metrics_mean_ci['cer_filewise_avg']},{metrics_mean_ci['wer_filewise_avg']},{metrics_mean_ci['cer_cumulative']},{metrics_mean_ci['wer_cumulative']},{metrics_mean_ci['ssim_pred_gt_avg']},{metrics_mean_ci['ssim_pred_context_avg']},{metrics_mean_ci['ssim_gt_context_avg']},{metrics_mean_ci['ssim_pred_gt_avg_alternate']},{metrics_mean_ci['ssim_pred_context_avg_alternate']},{metrics_mean_ci['ssim_gt_context_avg_alternate']},{metrics_mean_ci['cer_gt_audio_cumulative']},{metrics_mean_ci['wer_gt_audio_cumulative']},{metrics_mean_ci['rtf']},{metrics_mean_ci['avg_autoregressive_step_time']},{metrics_mean_ci['codec_infer_time']}\n")
             print(f"Wrote metrics with CI for {checkpoint_name} and {dataset} to {all_experiment_csv_with_ci}")
 
 
