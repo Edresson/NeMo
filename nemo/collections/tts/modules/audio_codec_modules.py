@@ -44,6 +44,7 @@ import math
 
 from nemo.collections.tts.modules.vits_modules import WN, Flip
 from transformers import Wav2Vec2Processor, Wav2Vec2ForCTC
+from nemo.collections.tts.modules import t5tts_transformer
 
 
 
@@ -2170,6 +2171,91 @@ class CausalHiFiGANEncoder(NeuralModule):
         return encoded, encoded_len
 
 
+class TransformerEncoder(NeuralModule):
+    """
+    Transformer Audio encoder.
+
+    Args:
+        output_dim: Dimension of encoder output.
+    """
+
+    def __init__(
+        self,
+        samples_per_frame: int,
+        audio_proj_size: int = 1024, 
+        output_dim: int = 32,
+        n_layers: int = 8,
+        d_model: int = 1024,
+        d_ffn: int = 4096,
+        sa_n_heads: int = 16,
+        kernel_size: int = 1,
+        p_dropout: float = 0.1,
+        p_dropout_out: float = 0.0,
+        has_xattn: bool = False,
+        is_causal: bool = True,
+        apply_norm_to_cond: bool = False,
+        apply_norm_out: bool = True,
+        max_length_causal_mask: int = 2048,
+        use_learnable_pos_emb: bool = False,
+    ):
+        super().__init__()
+
+
+        self.samples_per_frame = samples_per_frame
+        self.audio_proj_size = audio_proj_size
+        self.output_dim = output_dim
+
+        self.layers = t5tts_transformer.Transformer(
+            n_layers=n_layers,
+            d_model=d_model,
+            d_ffn=d_ffn,
+            sa_n_heads=sa_n_heads,
+            kernel_size=kernel_size,
+            p_dropout=p_dropout,
+            p_dropout_out=p_dropout_out,
+            has_xattn=has_xattn,
+            is_causal=is_causal,
+            apply_norm_to_cond=apply_norm_to_cond,
+            apply_norm_out=apply_norm_out,
+            max_length_causal_mask=max_length_causal_mask,
+            use_learnable_pos_emb=use_learnable_pos_emb,
+        )
+
+        self.inp_projection_no_bias = nn.Linear(samples_per_frame, audio_proj_size, bias=False)
+        self.inp_projection = nn.Linear(audio_proj_size, d_model)
+        self.out_projection = nn.Linear(d_model, output_dim)
+        
+
+    @property
+    def input_types(self):
+        return {
+            "audio": NeuralType(('B', 'T_audio'), AudioSignal()),
+            "audio_len": NeuralType(tuple('B'), LengthsType()),
+        }
+
+    @property
+    def output_types(self):
+        return {
+            "encoded": NeuralType(('B', 'D', 'T_encoded'), EncodedRepresentation()),
+            "encoded_len": NeuralType(tuple('B'), LengthsType()),
+        }
+
+
+    @typecheck()
+    def forward(self, audio, audio_len):
+        encoded_len = audio_len
+        B, T = audio.size()
+        audio = audio.reshape(B, -1, self.samples_per_frame) # B, T, F, where 7 is the number of samples per frame that controls the frame rte
+        encoded_len = (audio_len/self.samples_per_frame).int()
+        out = self.inp_projection_no_bias(audio)
+        out = self.inp_projection(out)
+        speech_mask = get_mask_from_lengths(encoded_len)
+        out = self.layers(x=out, x_mask=speech_mask)['output']
+        # out projection
+        encoded = self.out_projection(out).transpose(1, 2)
+        return encoded, encoded_len
+
+
 class HiFiGANEncoder(NeuralModule):
     """
     Audio encoder created by inverting the HiFi-GAN decoder.
@@ -2615,6 +2701,90 @@ class AudioTokenPredictor(NeuralModule):
             audio_tokens = rearrange(audio_tokens, 'B T C -> B C T')
             return audio_logits, input_len
 
+
+
+class TransformerDecoder(NeuralModule):
+    """
+    Transformer Audio Decoder.
+
+    Args:
+        input_dim: Dimension of encoder output.
+    """
+
+    def __init__(
+        self,
+        samples_per_frame: int,
+        audio_proj_size: int = 1024, 
+        input_dim: int = 32,
+        n_layers: int = 8,
+        d_model: int = 1024,
+        d_ffn: int = 4096,
+        sa_n_heads: int = 16,
+        kernel_size: int = 1,
+        p_dropout: float = 0.1,
+        p_dropout_out: float = 0.0,
+        has_xattn: bool = False,
+        is_causal: bool = True,
+        apply_norm_to_cond: bool = False,
+        apply_norm_out: bool = True,
+        max_length_causal_mask: int = 2048,
+        use_learnable_pos_emb: bool = False,
+    ):
+        super().__init__()
+
+
+        self.samples_per_frame = samples_per_frame
+        self.audio_proj_size = audio_proj_size
+
+        self.layers = t5tts_transformer.Transformer(
+            n_layers=n_layers,
+            d_model=d_model,
+            d_ffn=d_ffn,
+            sa_n_heads=sa_n_heads,
+            kernel_size=kernel_size,
+            p_dropout=p_dropout,
+            p_dropout_out=p_dropout_out,
+            has_xattn=has_xattn,
+            is_causal=is_causal,
+            apply_norm_to_cond=apply_norm_to_cond,
+            apply_norm_out=apply_norm_out,
+            max_length_causal_mask=max_length_causal_mask,
+            use_learnable_pos_emb=use_learnable_pos_emb,
+        )
+
+        self.inp_projection = nn.Linear(input_dim, d_model)
+        self.out_projection = nn.Linear(d_model, audio_proj_size)
+        self.out_projection_no_bias = nn.Linear(audio_proj_size, samples_per_frame, bias=False)
+        
+
+    @property
+    def input_types(self):
+        return {
+            "inputs": NeuralType(('B', 'D', 'T_encoded'), VoidType()),
+            "input_len": NeuralType(tuple('B'), LengthsType()),
+        }
+
+    @property
+    def output_types(self):
+        return {
+            "audio": NeuralType(('B', 'T_audio'), AudioSignal()),
+            "audio_len": NeuralType(tuple('B'), LengthsType()),
+        }
+
+    @typecheck()
+    def forward(self, inputs, input_len):
+        encoded_len = input_len
+        out = self.inp_projection(inputs.transpose(1, 2))
+        speech_mask = get_mask_from_lengths(encoded_len)
+        out = self.layers(x=out, x_mask=speech_mask)['output']
+
+        out = self.out_projection(out)
+        audio = self.out_projection_no_bias(out)
+
+        # resample audio to size
+        audio = audio.reshape(inputs.size(0), -1)
+        audio_len = (input_len*self.samples_per_frame).int()
+        return audio, audio_len
 
 
 class HiFiGANDecoder(NeuralModule):
