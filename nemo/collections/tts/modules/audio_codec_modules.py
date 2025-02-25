@@ -2197,6 +2197,8 @@ class TransformerEncoder(NeuralModule):
         apply_norm_out: bool = True,
         max_length_causal_mask: int = 2048,
         use_learnable_pos_emb: bool = False,
+        use_flexattention: bool = False,
+        sliding_window_size: int = None,
     ):
         super().__init__()
 
@@ -2219,6 +2221,8 @@ class TransformerEncoder(NeuralModule):
             apply_norm_out=apply_norm_out,
             max_length_causal_mask=max_length_causal_mask,
             use_learnable_pos_emb=use_learnable_pos_emb,
+            use_flexattention=use_flexattention,
+            sliding_window_size=sliding_window_size,
         )
 
         self.inp_projection_no_bias = nn.Linear(samples_per_frame, audio_proj_size, bias=False)
@@ -2729,6 +2733,8 @@ class TransformerDecoder(NeuralModule):
         apply_norm_out: bool = True,
         max_length_causal_mask: int = 2048,
         use_learnable_pos_emb: bool = False,
+        use_flexattention: bool = False,
+        sliding_window_size: int = None,
     ):
         super().__init__()
 
@@ -2750,6 +2756,8 @@ class TransformerDecoder(NeuralModule):
             apply_norm_out=apply_norm_out,
             max_length_causal_mask=max_length_causal_mask,
             use_learnable_pos_emb=use_learnable_pos_emb,
+            use_flexattention=use_flexattention,
+            sliding_window_size=sliding_window_size,
         )
 
         self.inp_projection = nn.Linear(input_dim, d_model)
