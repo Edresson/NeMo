@@ -314,6 +314,7 @@ class SelfFlexAttention(torch.nn.Module):
         """
         super().__init__()
         assert d_model % n_heads == 0, "d_model % n_head != 0"
+        self.max_length_causal_mask = max_length_causal_mask
         self.d_head = d_model // n_heads
         self.n_heads = n_heads
         self.d_model = d_model
@@ -331,17 +332,21 @@ class SelfFlexAttention(torch.nn.Module):
             return q_idx - kv_idx <= sliding_window_size
 
         if sliding_window_size and is_causal:
-            mask_func = and_masks(*[causal_mask_flexattention, sliding_window_flexattention])
+            self.attn_mask_fn = and_masks(*[causal_mask_flexattention, sliding_window_flexattention])
         elif sliding_window_size and not is_causal:
-            mask_func = sliding_window_flexattention
+            self.attn_mask_fn = sliding_window_flexattention
         elif not sliding_window_size and is_causal:
-            mask_func = causal_mask_flexattention
+            self.attn_mask_fn = causal_mask_flexattention
         else: # not sliding window and not causal
-            block_mask = None
+            self.attn_mask_fn = None
 
-        if mask_func is not None:
-            block_mask = create_block_mask(mask_func, B=None, H=None, Q_LEN=max_length_causal_mask, KV_LEN=max_length_causal_mask)
-        self.block_mask = block_mask
+        # init as None and on forward update the mask if needed, we cant init it here because of devices issues, block_mask is not automatically converted to the right cuda device and .to(device) is not working
+        self.attn_block_mask = None
+        # create block mask if needed, first step will be slower, but after that it should be fast
+        if self.attn_mask_fn is not None:
+            block_mask = create_block_mask(self.attn_mask_fn, B=None, H=None, Q_LEN=self.max_length_causal_mask, KV_LEN=self.max_length_causal_mask)
+            self.attn_block_mask = block_mask
+
 
     @abstractmethod
     def compute_qkv_and_mask(
@@ -405,7 +410,8 @@ class SelfFlexAttention(torch.nn.Module):
         v = v.transpose(1, 2)
         B, T, _ = query.shape
 
-        y, attn_prob = flex_attention(q, k, v, block_mask=self.block_mask, return_lse=True) # (batch_size, n_heads, max_seq_len, d_head)
+        self.attn_block_mask = self.attn_block_mask.to(q.device) if self.attn_block_mask is not None else None
+        y, attn_prob = flex_attention(q, k, v, block_mask=self.attn_block_mask, return_lse=True) # (batch_size, n_heads, max_seq_len, d_head)
 
         y = y.transpose(1, 2).contiguous().view(B, T, -1)
 
@@ -435,7 +441,6 @@ class SelfFlexAttention(torch.nn.Module):
                 - attn_prob: List containing attention probabilities and scores. returned only in attn_naive.
                     [0]: Attention probabilities used for logging during validation.
         """
-
         y, attn_prob = self.attn_naive(query, query_mask, memory, memory_mask, attn_prior)
         y = self.dropout(self.o_net(y))
 
