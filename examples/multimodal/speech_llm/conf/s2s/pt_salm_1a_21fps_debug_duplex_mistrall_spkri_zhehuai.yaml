@@ -74,24 +74,6 @@ model:
   proj_head_dims: [32000, 2048, 2048, 2048, 2048, 2048, 2048, 2048, 2048]
   s2s_vocab_size: 48384 # This should be equal to the proj_head_dims[0] + decoder_reduction_factor * sum(proj_head_dims[1:])
   proj_head_loss_weights: [1, 1, 1, 1, 1, 1, 1, 1, 1]
-
-  speech_decoder_parms:
-    n_layers: 12
-    d_model: 768
-    d_ffn: 3072
-    sa_n_heads: 12
-    kernel_size: 3
-    p_dropout: 0.1
-    p_dropout_out: 0.0
-    has_xattn: false
-    xa_d_memory: 768
-    xa_n_heads: 12
-    is_causal: true
-    apply_norm_to_cond: true
-    apply_norm_out: true
-    max_length_causal_mask: 2048
-    use_learnable_pos_emb: true
-
   decoder_reduction_factor: 1
 
   seed: 1234
@@ -262,12 +244,9 @@ model:
       seed: 'trng'
       shuffle: true
       shard_seed: "trng"
-      sampler_fusion: randomized_round_robin
-      sampler_weights:
-        duplex: 1.0
-        blackwell: 0.01
-
       blackwell:
+        sampler_fusion: randomized_round_robin
+        sampler_weights : [0.01,1.0]
         input_cfg:
         - type: group
           input_cfg:
@@ -276,8 +255,11 @@ model:
             tags:
               s2s_duplex_overlap: True
               speaker_id: 1
+        shuffle: True
 
       duplex:
+        sampler_fusion: randomized_round_robin
+        sampler_weights : [0.02,1.0]
         input_cfg:
         - type: group
           weight: 2.0
@@ -4878,6 +4860,7 @@ model:
       codec_model_downsampling_factor: ${model.codec_model_downsampling_factor}
       global_batch_size: ${model.global_batch_size}
       micro_batch_size: ${model.micro_batch_size}
+      shuffle: True
       num_workers: 0
       pin_memory: True
       max_seq_length: 512

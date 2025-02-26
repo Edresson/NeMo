@@ -142,7 +142,7 @@ class S2sMCoreGPTModel(MCoreGPTModel):
         self.n_proj_heads = len(proj_head_dims)
         self.proj_head_dims = proj_head_dims
         self.proj_head_loss_weights = proj_head_loss_weights
-        self.speech_decoder_parms = speech_decoder_parms
+        self.speech_decoder_parms = dict(speech_decoder_parms) if speech_decoder_parms is not None else None
         self.output_layers = torch.nn.ModuleList(
             [
                 tensor_parallel.ColumnParallelLinear(
@@ -163,13 +163,15 @@ class S2sMCoreGPTModel(MCoreGPTModel):
         )
 
         if self.speech_decoder_parms:
-            self.speech_decoder = t5tts_transformer.Transformer(**dict(self.speech_decoder_parms))
-            self.text_dim_to_speech_proj = nn.Linear(config.hidden_size, self.speech_decoder_parms.d_model)
-            self.speech_dim_to_text_proj = nn.Linear(self.speech_decoder_parms.d_model, config.hidden_size)
+            self.b_t_f_speech_decoder_input = self.speech_decoder_parms.pop("b_t_f_input", False)
+            self.speech_decoder = t5tts_transformer.Transformer(**self.speech_decoder_parms)
+            self.text_dim_to_speech_proj = nn.Linear(config.hidden_size, self.speech_decoder_parms["d_model"])
+            self.speech_dim_to_text_proj = nn.Linear(self.speech_decoder_parms["d_model"], config.hidden_size)
         else:
             self.speech_decoder = None
             self.text_dim_to_speech_proj = None
             self.speech_dim_to_text_proj = None
+            self.b_t_f_speech_decoder_input = False
 
     # TODO rewrite setup_embeddings_and_output_layer to include self.output_layers
 
@@ -255,17 +257,28 @@ class S2sMCoreGPTModel(MCoreGPTModel):
             output_weight = None
 
         if self.speech_decoder:
-            hidden_states_dec_input = hidden_states# .transpose(0, 1) # from [T, B, F] to [B, T, F]
+            hidden_states_dec_input = hidden_states
+            if self.b_t_f_speech_decoder_input:
+                T, B, F = hidden_states_dec_input.size()
+                hidden_states_dec_input = hidden_states_dec_input.reshape(B, T, F) # .contiguous().transpose(0, 1) # from [T, B, F] to [B, T, F]
+
             speech_decoder_input = self.text_dim_to_speech_proj(hidden_states_dec_input)
 
             # workaround for inference, because during inference speech_mask will be None
             if speech_mask is None:
                 speech_mask = torch.ones((speech_decoder_input.size(0), speech_decoder_input.size(1))).to(speech_decoder_input.device)
             else:
-                speech_mask = speech_mask.transpose(0, 1)
-            # print(speech_mask.shape, speech_decoder_input.shape)
+                if not self.b_t_f_speech_decoder_input:
+                    speech_mask = speech_mask.transpose(0, 1)
+                else:
+                    if B > 1:
+                        print(speech_mask.shape, speech_decoder_input.shape)
+
             speech_hidden_states = self.speech_decoder(x=speech_decoder_input, x_mask=speech_mask)['output']
             speech_hidden_states = self.speech_dim_to_text_proj(speech_hidden_states)# .transpose(0, 1) # from [B, T, F] to [T, B, F]
+
+            if self.b_t_f_speech_decoder_input:
+                speech_hidden_states = speech_hidden_states.reshape(T, B, F)#.contiguous().transpose(0, 1) # from [B, T, F] to [T, B, F]
 
             all_logits = []
             cur_dims = 0
@@ -1317,6 +1330,7 @@ class S2sModularAudioGPTModel(ModularAudioGPTModel):
         self.extract_codec_on_the_fly = cfg.get('extract_codec_on_the_fly', False)
         self.codec_model_downsampling_factor = cfg.get('codec_model_downsampling_factor', 1023.5)
         self.codec_sample_rate = cfg.data.train_ds.get("codec_sample_rate", 22050)
+        self.speech_decoder_parms = cfg.get('speech_decoder_parms', None)
         super().__init__(cfg, trainer)
         if cfg.get('fixed_speaker_prompt', False):
             self.speaker_embeddings = nn.Embedding(16, cfg.hidden_size)

@@ -89,8 +89,9 @@ model:
     is_causal: true
     apply_norm_to_cond: true
     apply_norm_out: true
-    max_length_causal_mask: 2048
+    max_length_causal_mask: 5000
     use_learnable_pos_emb: true
+    b_t_f_input: true
 
   decoder_reduction_factor: 1
 
