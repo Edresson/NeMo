@@ -240,9 +240,16 @@ model:
     end_string: ""
     train_ds:
       multi_config: true
+      use_lhotse: True
+      seed: 'trng'
+      shuffle: true
+      shard_seed: "trng"
+      sampler_fusion: randomized_round_robin
+      sampler_weights:
+        duplex: 1.0
+        blackwell: 0.01
+
       blackwell:
-        sampler_fusion: randomized_round_robin
-        sampler_weights : [0.01,1.0]
         input_cfg:
         - type: group
           input_cfg:
@@ -251,11 +258,8 @@ model:
             tags:
               s2s_duplex_overlap: True
               speaker_id: 1
-        shuffle: True
 
       duplex:
-        sampler_fusion: randomized_round_robin
-        sampler_weights : [0.02,1.0]
         input_cfg:
         - type: group
           weight: 2.0
@@ -4856,7 +4860,6 @@ model:
       codec_model_downsampling_factor: ${model.codec_model_downsampling_factor}
       global_batch_size: ${model.global_batch_size}
       micro_batch_size: ${model.micro_batch_size}
-      shuffle: True
       num_workers: 0
       pin_memory: True
       max_seq_length: 512
@@ -4897,7 +4900,6 @@ model:
       # bucketing params
       bucketing_strategy: "fully_randomized"
       bucketing_batch_size: null
-      use_lhotse: True
       text_field : "text"
       batch_duration : 80  # 0
       quadratic_duration : 30

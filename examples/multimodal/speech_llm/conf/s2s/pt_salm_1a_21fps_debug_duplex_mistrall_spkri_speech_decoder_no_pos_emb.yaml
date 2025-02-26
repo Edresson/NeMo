@@ -74,7 +74,6 @@ model:
   proj_head_dims: [32000, 2048, 2048, 2048, 2048, 2048, 2048, 2048, 2048]
   s2s_vocab_size: 48384 # This should be equal to the proj_head_dims[0] + decoder_reduction_factor * sum(proj_head_dims[1:])
   proj_head_loss_weights: [1, 1, 1, 1, 1, 1, 1, 1, 1]
-
   speech_decoder_parms:
     n_layers: 12
     d_model: 768
@@ -90,7 +89,7 @@ model:
     apply_norm_to_cond: true
     apply_norm_out: true
     max_length_causal_mask: 2048
-    use_learnable_pos_emb: true
+    use_learnable_pos_emb: false
 
   decoder_reduction_factor: 1
 
