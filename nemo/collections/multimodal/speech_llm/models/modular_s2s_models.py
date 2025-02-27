@@ -163,6 +163,7 @@ class S2sMCoreGPTModel(MCoreGPTModel):
 
         if self.speech_decoder_parms:
             self.b_t_f_speech_decoder_input = self.speech_decoder_parms.pop("b_t_f_input", False)
+            self.speech_decoder_cfg_unconditional_prob = self.speech_decoder_parms.pop("cfg_unconditional_prob", None)
             self.speech_decoder = t5tts_transformer.Transformer(**self.speech_decoder_parms)
             self.text_dim_to_speech_proj = nn.Linear(config.hidden_size, self.speech_decoder_parms["d_model"])
             self.speech_dim_to_text_proj = nn.Linear(self.speech_decoder_parms["d_model"], config.hidden_size)
@@ -269,9 +270,12 @@ class S2sMCoreGPTModel(MCoreGPTModel):
             else:
                 if not self.b_t_f_speech_decoder_input:
                     speech_mask = speech_mask.transpose(0, 1)
-                else:
-                    if B > 1:
-                        print(speech_mask.shape, speech_decoder_input.shape)
+
+            if self.speech_decoder_cfg_unconditional_prob and self.training:
+                if torch.rand(1).item() < self.speech_decoder_cfg_unconditional_prob:
+                    # make the whole batch zeros to the unconditional model
+                    speech_decoder_input = torch.zeros_like(speech_decoder_input)
+                    speech_mask = torch.ones_like(speech_mask)
 
             speech_hidden_states = self.speech_decoder(x=speech_decoder_input, x_mask=speech_mask)['output']
             speech_hidden_states = self.speech_dim_to_text_proj(speech_hidden_states)# .transpose(0, 1) # from [B, T, F] to [T, B, F]
