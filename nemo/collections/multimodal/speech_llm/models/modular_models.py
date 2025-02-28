@@ -380,7 +380,7 @@ class ModularAudioGPTModel(SpeechLLMAdapterMixin, MegatronGPTSFTModel):
         return encoder_input, attention_mask, labels, loss_mask, encoder_length
 
     def _gpt_forward(
-        self, input_ids, position_ids, encoder_input, attention_mask, labels, checkpoint_activations_all_layers, speech_mask=None
+        self, input_ids, position_ids, encoder_input, attention_mask, labels, checkpoint_activations_all_layers
     ):
         """Forward pass of the GPT model."""
         if self.megatron_amp_O2:
@@ -392,7 +392,6 @@ class ModularAudioGPTModel(SpeechLLMAdapterMixin, MegatronGPTSFTModel):
                 decoder_input=encoder_input,
                 attention_mask=attention_mask,
                 labels=labels,
-                speech_mask=speech_mask,
             )
         else:
             output = self.model(
@@ -402,7 +401,6 @@ class ModularAudioGPTModel(SpeechLLMAdapterMixin, MegatronGPTSFTModel):
                 attention_mask=attention_mask,
                 labels=labels,
                 checkpoint_activations_all_layers=checkpoint_activations_all_layers,
-                speech_mask=speech_mask,
             )
         return output
 
@@ -423,25 +421,22 @@ class ModularAudioGPTModel(SpeechLLMAdapterMixin, MegatronGPTSFTModel):
         if 'audio_signal' in audio_batch:
             # in this branch, limit_max_seq_length is handled in prepare_llm_input
             encoder_input, attention_mask, labels, loss_mask, _ = self.prepare_llm_input(audio_batch)
-            # use last position of loss mask as speech mask
-            speech_mask = loss_mask[:, :, -1].reshape(loss_mask.size(0), loss_mask.size(1))
             output = self._gpt_forward(
-                None, None, encoder_input, attention_mask, labels, checkpoint_activations_all_layers, speech_mask=speech_mask,
+                None, None, encoder_input, attention_mask, labels, checkpoint_activations_all_layers
             )
             multimodal_output['audio_text'] = (output, loss_mask)
-
         if text_batch:
-            input_ids = text_batch["text_input_ids"]
-            labels = text_batch["text_labels_ids"]
-            loss_mask = text_batch["text_loss_masks"]
+            input_ids = text_batch["text_input_ids"][:, :-1]
+            labels = text_batch["text_input_ids"][:, 1:]
+            loss_mask = text_batch["text_masks"][:, 1:]
             limit_max_seq_length = self.cfg.get("limit_max_seq_length", None)
             if limit_max_seq_length is not None and limit_max_seq_length < labels.shape[1] and self.training:
-                # import random
-                # start = random.randint(0, labels.shape[1] - limit_max_seq_length - 1)
-                labels = labels[:, :limit_max_seq_length]
-                input_ids = input_ids[:, :limit_max_seq_length]
-                loss_mask = loss_mask[:, :limit_max_seq_length]
+                import random
 
+                start = random.randint(0, labels.shape[1] - limit_max_seq_length - 1)
+                labels = labels[:, start : start + limit_max_seq_length]
+                input_ids = input_ids[:, start : start + limit_max_seq_length]
+                loss_mask = loss_mask[:, start : start + limit_max_seq_length]
             attention_mask = self._create_attention_mask(input_ids)
             output = self._gpt_forward(
                 input_ids, None, None, attention_mask, labels, checkpoint_activations_all_layers
