@@ -257,6 +257,7 @@ class S2sMCoreGPTModel(MCoreGPTModel):
         else:
             output_weight = None
 
+        # if using speech decoder
         if self.speech_decoder:
             hidden_states_dec_input = hidden_states
             if self.b_t_f_speech_decoder_input:
@@ -286,7 +287,7 @@ class S2sMCoreGPTModel(MCoreGPTModel):
 
             all_logits = []
             cur_dims = 0
-            for i in range(0, self.n_proj_heads):
+            for i in range(self.n_proj_heads):
                 cur_output_weight = (
                     output_weight[cur_dims : cur_dims + self.proj_head_dims[i]] if output_weight is not None else None
                 )
@@ -316,6 +317,7 @@ class S2sMCoreGPTModel(MCoreGPTModel):
             )
             return tokens_loss
         else:
+            # if text batch (VTBlender)
             if input_ids is not None and input_ids.dim() == 2:  # pure text example
                 logits, _ = self.output_layer(
                     hidden_states, weight=output_weight[: self.vocab_size] if output_weight is not None else None
@@ -329,6 +331,7 @@ class S2sMCoreGPTModel(MCoreGPTModel):
 
                 return loss
             else:
+                # if speech batch without the speeech decoder
                 all_logits = []
                 cur_dims = 0
                 for i in range(self.n_proj_heads):
