@@ -130,8 +130,8 @@ class SumMultiEmbedding(LanguageModelEmbedding):
 # TODO: Move the speech decoder to a new class called S2sMCoreGPTModelSpeechDecoder.  
 # This class should include self.model (from MCoreGPTModel) as the LLM backbone and  
 # self.speech_decoder_model as the speech decoder, derived from a new class with the projection heads.  
-# For v2, disable vocab mapping and shift the agent's speech input processing from the LLM backbone  
-# to the speech decoder, further reducing the load on the LLM backbone.
+# For v2, disable the vocab mapping and move the agent speech input from LLM-backbone to the speech decoder,
+# alleviating even more the LLMbackbone.
 class S2sMCoreGPTModel(MCoreGPTModel):
     def __init__(
         self,
