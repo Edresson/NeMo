@@ -452,6 +452,7 @@ class LhotseAudioQuestionAnswerDataset(torch.utils.data.Dataset):
                 cur_source_text[text_start_step] = self.text_processor.bos_id
 
                 if getattr(cut, "s2s_duplex", False):
+                    # Note: text can be truncated
                     text_len = min(text_end_step - text_start_step - 1, target_texts[cnt].shape[0])
                     cur_target_text[(text_start_step + 1) : (text_start_step + 1 + text_len)] = target_texts[cnt][
                         :text_len
@@ -838,7 +839,7 @@ class LhotseAudioQuestionAnswerDataset(torch.utils.data.Dataset):
             return text_minibatch
 
         # full-duplex data goes here
-        if getattr(cuts[0], "s2s_duplex", False) or getattr(cuts[0], "s2s_duplex_align", False) or getattr(cuts[0], "s2s_duplex_cross_attn", False):
+        if getattr(cuts[0], "s2s_duplex", False) or getattr(cuts[0], "s2s_duplex_align", False):
             return self.__getitem__duplex_(cuts)
         if getattr(cuts[0], "s2s_duplex_overlap", False):
             return self.__getitem__duplex_overlap_(cuts)
