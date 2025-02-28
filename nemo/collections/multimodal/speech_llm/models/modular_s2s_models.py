@@ -161,7 +161,7 @@ class S2sMCoreGPTModel(MCoreGPTModel):
                 for i in range(self.n_proj_heads)
             ]
         )
-
+        # ToDo: move the speech decoder to a new class called S2sMCoreGPTModelSpeechDecoder
         if self.speech_decoder_parms:
             self.b_t_f_speech_decoder_input = self.speech_decoder_parms.pop("b_t_f_input", False)
             self.speech_decoder_cfg_unconditional_prob = self.speech_decoder_parms.pop("cfg_unconditional_prob", None)
@@ -257,7 +257,7 @@ class S2sMCoreGPTModel(MCoreGPTModel):
         else:
             output_weight = None
 
-        # if using speech decoder
+        # if using speech decoder - ToDo: move this to a new class called S2sMCoreGPTModelSpeechDecoder
         if self.speech_decoder:
             hidden_states_dec_input = hidden_states
             if self.b_t_f_speech_decoder_input:
