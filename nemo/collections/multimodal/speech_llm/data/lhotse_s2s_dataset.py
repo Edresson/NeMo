@@ -474,8 +474,11 @@ class LhotseAudioQuestionAnswerDataset(torch.utils.data.Dataset):
                     cur_target_text[(text_start_step + 1) : (text_start_step + 1 + text_len_plus_eos)] = (
                         target_texts_expanded[0]
                     )
+                else:
                     raise Exception("Undefined assistant channel text format.")
 
+                cur_target_text[text_end_step] = self.text_processor.eos_id
+                cur_source_text[text_end_step] = self.text_processor.eos_id
                 cnt += 1
 
             new_target_texts.append(cur_target_text)
@@ -510,7 +513,7 @@ class LhotseAudioQuestionAnswerDataset(torch.utils.data.Dataset):
             "answer_audio": answer_audios,
             "answer_audio_lens": answer_audio_lens,
             "num_turns": torch.Tensor(num_turns).long(),
-            "speaker_ids": self.get_speaker_id(cuts)
+            "speaker_ids": self.get_speaker_id(cuts),
         }
 
         if hasattr(cut, "include_sys"):  # assume no within batch mixing
