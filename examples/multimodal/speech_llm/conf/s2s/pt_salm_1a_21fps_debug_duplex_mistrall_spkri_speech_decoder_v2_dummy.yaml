@@ -75,7 +75,7 @@ model:
   proj_head_dims: [32000, 2048, 2048, 2048, 2048, 2048, 2048, 2048, 2048]
   s2s_vocab_size: 48384 # This should be equal to the proj_head_dims[0] + decoder_reduction_factor * sum(proj_head_dims[1:])
   proj_head_loss_weights: [1, 1, 1, 1, 1, 1, 1, 1, 1]
-  cond_llm_backbone_on_speech_tokens: true
+  cond_llm_backbone_on_speech_tokens: false
 
   speech_decoder_parms:
     n_layers: 12
