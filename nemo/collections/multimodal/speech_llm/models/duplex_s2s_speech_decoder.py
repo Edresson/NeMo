@@ -1485,13 +1485,14 @@ class S2sModularAudioGPTModelSpeechDecoder(ModularAudioGPTModel):
             input_ids = all_channels[:, :-1, 0]
         else:
             input_ids = all_channels[:, :-1]
-        
+
+        # get input audio tokens
         input_audio_tokens = all_channels[:, :-1, 1:]
-        # print("prepare_llm_input_duplex_from_multiturn, input tokens firs step/frame", input_audio_tokens[:, 0, :], "speech_unk_id", self.cfg.data.train_ds.speech_unk_id, "speech_eos_id", self.cfg.data.train_ds.speech_eos_id)
 
         encoded = encoded[:, : input_ids.shape[1]]
         encoder_length = encoded_len - 1
         labels = all_channels[:, 1:]
+
         # assert labels.shape[1] == encoded.shape[1]
         labels = labels[:, : encoded.shape[1]]
         input_ids = input_ids[:, : encoded.shape[1]]

@@ -548,6 +548,7 @@ def sample_sequence_batch(
         batch_size = context_tokens.size(0)
         is_done = torch.zeros([batch_size]).byte().cuda()
         tokens = context_tokens
+
         output_logits = None
         all_generated_indices = None  # used to track all generated indices
         # Generate enough tokens for the longest sequence

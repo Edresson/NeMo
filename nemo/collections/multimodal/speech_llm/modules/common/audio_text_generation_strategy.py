@@ -70,7 +70,6 @@ class AudioToTextGenerationStrategy(text_generation_strategy.GPTModelTextGenerat
             )
             audio_feat_lens = torch.stack([torch.sum(lens) for lens in audio_feat_lens])  # [batch,]
         else:
-            print(context_tokens.shape, )
             new_context_tokens = self.model._shift_labels_by_emb_len(
                 context_tokens, context_lengths, audio_feat_lens, encoder_max_length, pad_token=0
             )
@@ -325,7 +324,7 @@ class AudioToAudioGenerationStrategy(AudioToTextGenerationStrategy):
             # create a dummy tensor with unk id that is used during the training for pad the first step
             if getattr(self.model.cfg, 'speech_delay', False):
                 audiotokens2use = torch.ones(embeddings2use.size(0), 1, len(self.model.cfg.proj_head_dims)-1).int().to(embeddings2use.device)
-                audiotokens2use[:, :] = self.model.cfg.data.train_ds.speech_unk_id - 1
+                audiotokens2use[:, :] = self.model.cfg.data.train_ds.speech_unk_id
             else:
                 raise ValueError(f"speech_delay need to be used, otherwise the first token will not be speech_unk_id, it will be a random token!!")
         else:
