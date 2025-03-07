@@ -70,6 +70,7 @@ class AudioToTextGenerationStrategy(text_generation_strategy.GPTModelTextGenerat
             )
             audio_feat_lens = torch.stack([torch.sum(lens) for lens in audio_feat_lens])  # [batch,]
         else:
+            print(context_tokens.shape, )
             new_context_tokens = self.model._shift_labels_by_emb_len(
                 context_tokens, context_lengths, audio_feat_lens, encoder_max_length, pad_token=0
             )
@@ -324,8 +325,14 @@ class AudioToAudioGenerationStrategy(AudioToTextGenerationStrategy):
         else:
             set_inference_key_value_memory = False
             # handle positions2use and tokens2use differently
-            tokens2use = tokens[:, curr_context_length - 1].view(micro_batch_size, 1, -1)
             positions2use = self.position_ids[:, curr_context_length - 1].view(micro_batch_size, 1, -1)
+            if getattr(self.model.cfg, 'cond_llm_backbone_on_speech_tokens', True):
+                tokens2use = tokens[:, curr_context_length - 1].view(micro_batch_size, 1, -1)
+            else:
+                tokens2use = tokens[:, curr_context_length - 1].view(micro_batch_size, 1, -1)[:, :, 0]
+            
+            audiotokens2use = tokens[:, curr_context_length - 1].view(micro_batch_size, 1, -1)[:, :, 1:]
+
             # embedding offset and sum is handled inside
             embeddings2use = self.model._get_text_embeddings(tokens2use, positions2use)
             started = context_lengths <= curr_context_length
@@ -402,7 +409,8 @@ class AudioToAudioGenerationStrategy(AudioToTextGenerationStrategy):
         else:
             raise ValueError(f"duplex_method {duplex_method} not supported")
 
-        encoder_input, _, labels, _, (self.encoded, _) = self.model.prepare_llm_input_duplex_from_multiturn(batch)
+        encoder_input, _, labels, _, extra_outputs = self.model.prepare_llm_input_duplex_from_multiturn(batch)
+        self.encoded = extra_outputs[0]
         self.attention_mask = self.model._create_attention_mask(encoder_input.transpose(0, 1))
         self.position_ids = build_position_ids(encoder_input.transpose(0, 1)[:, :, 0])
         return labels, encoder_input, -context_lengths + 1
@@ -435,10 +443,11 @@ def model_inference_strategy_dispatcher(model, **args):
         ModularAudioGPTModel,
     )
     from nemo.collections.multimodal.speech_llm.models.modular_s2s_models import S2sModularAudioGPTModel
+    from nemo.collections.multimodal.speech_llm.models.duplex_s2s_speech_decoder import S2sModularAudioGPTModelSpeechDecoder
 
     if isinstance(model, CrossAttendModularAudioGPTModel):
         return CrossAttendAudioToTextGenerationStrategy(model, **args)
-    elif isinstance(model, S2sModularAudioGPTModel):
+    elif isinstance(model, S2sModularAudioGPTModel) or isinstance(model, S2sModularAudioGPTModelSpeechDecoder):
         return AudioToAudioGenerationStrategy(model, **args)
     elif isinstance(model, ModularAudioGPTModel):
         return AudioToTextGenerationStrategy(model, **args)
