@@ -30,7 +30,6 @@ trainer:
   gradient_clip_val: 1.0
   accumulate_grad_batches: 1
 
-# model_target: nemo.collections.multimodal.speech_llm.models.duplex_s2s_speech_decoder_new.S2sModularAudioGPTModelSpeechDecoder
 model_target: nemo.collections.multimodal.speech_llm.models.duplex_s2s_speech_decoder.S2sModularAudioGPTModelSpeechDecoder
 # model_target: nemo.collections.multimodal.speech_llm.models.modular_s2s_models.S2sModularAudioGPTModel
 
@@ -94,7 +93,7 @@ model:
     apply_norm_out: true
     max_length_causal_mask: 2048
     use_learnable_pos_emb: false
-    cond_on_prev_audio_tokens: false
+    cond_on_prev_audio_tokens: true
 
 
   decoder_reduction_factor: 1

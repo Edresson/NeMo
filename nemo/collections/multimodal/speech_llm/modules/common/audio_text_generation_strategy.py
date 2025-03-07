@@ -322,10 +322,17 @@ class AudioToAudioGenerationStrategy(AudioToTextGenerationStrategy):
             tokens2use = tokens[:, :curr_context_length]
             positions2use = self.position_ids[:, :curr_context_length]
             embeddings2use = input_embeddings[:curr_context_length]
+            # create a dummy tensor with unk id that is used during the training for pad the first step
+            if getattr(self.model.cfg, 'speech_delay', False):
+                audiotokens2use = torch.ones(embeddings2use.size(0), 1, len(self.model.cfg.proj_head_dims)-1).int().to(embeddings2use.device)
+                audiotokens2use[:, :] = self.model.cfg.data.train_ds.speech_unk_id - 1
+            else:
+                raise ValueError(f"speech_delay need to be used, otherwise the first token will not be speech_unk_id, it will be a random token!!")
         else:
             set_inference_key_value_memory = False
             # handle positions2use and tokens2use differently
             positions2use = self.position_ids[:, curr_context_length - 1].view(micro_batch_size, 1, -1)
+            # update it to support cond_llm_backbone_on_speech_tokens parameter 
             if getattr(self.model.cfg, 'cond_llm_backbone_on_speech_tokens', True):
                 tokens2use = tokens[:, curr_context_length - 1].view(micro_batch_size, 1, -1)
             else:
@@ -350,7 +357,7 @@ class AudioToAudioGenerationStrategy(AudioToTextGenerationStrategy):
             [set_inference_key_value_memory] * micro_batch_size, device=torch.cuda.current_device()
         )
         len_array = torch.tensor([maxlen] * micro_batch_size, device=torch.cuda.current_device())
-        batch = [tokens2use, embeddings2use, self.attention_mask, positions2use, setkey_value_array, len_array]
+        batch = [tokens2use, audiotokens2use, embeddings2use, self.attention_mask, positions2use, setkey_value_array, len_array]
         tensor_shape = [tokens2use.shape[1], micro_batch_size, self.model.cfg.hidden_size]
         return batch, tensor_shape
 
