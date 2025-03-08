@@ -91,7 +91,7 @@ model:
     is_causal: true
     apply_norm_to_cond: true
     apply_norm_out: true
-    max_length_causal_mask: 2048
+    max_length_causal_mask: 5000
     use_learnable_pos_emb: false
     cond_on_prev_audio_tokens: true
 
