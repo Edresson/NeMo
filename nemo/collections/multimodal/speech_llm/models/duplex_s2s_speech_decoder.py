@@ -138,7 +138,7 @@ class SpeechDecoder(NeuralModule):
         self.num_audio_codebooks = num_audio_codebooks
         self.num_audio_tokens_per_codebook = num_audio_tokens_per_codebook
         # optional configs
-        self.speech_decoder_cfg_unconditional_prob = self.speech_decoder_parms.pop("cfg_unconditional_prob", None)
+        self.cfg_unconditional_prob = self.speech_decoder_parms.pop("cfg_unconditional_prob", None)
         self.cond_on_prev_audio_tokens = self.speech_decoder_parms.pop("cond_on_prev_audio_tokens", False)
 
         # projection to adapt llm embeddings into the same shape of speech decoder expected input
@@ -163,7 +163,7 @@ class SpeechDecoder(NeuralModule):
     def forward(self, hidden_states, speech_mask, input_audio_tokens=None):
         # Megatron LLM parallel training returns T, B, F so reshape it
         # T, B, F = hidden_states.size()
-        hidden_states = hidden_states.transpose(0, 1).contiguous() # .reshape(B, T, F) # from [T, B, F] to [B, T, F] 
+        hidden_states = hidden_states.transpose(0, 1).contiguous() # .reshape(B, T, F) # from [T, B, F] to [B, T, F]
 
         # map hidden states to the shape of the 
         speech_decoder_input = self.input_proj(hidden_states)
@@ -172,8 +172,8 @@ class SpeechDecoder(NeuralModule):
         if speech_mask is None:
             speech_mask = torch.ones((speech_decoder_input.size(0), speech_decoder_input.size(1))).to(speech_decoder_input.device)
 
-        if self.speech_decoder_cfg_unconditional_prob and self.training:
-            if torch.rand(1).item() < self.speech_decoder_cfg_unconditional_prob:
+        if self.cfg_unconditional_prob and self.training:
+            if torch.rand(1).item() < self.cfg_unconditional_prob:
                 # make the whole batch zeros to the unconditional model
                 speech_decoder_input = torch.zeros_like(speech_decoder_input)
                 speech_mask = torch.ones_like(speech_mask)
@@ -181,7 +181,6 @@ class SpeechDecoder(NeuralModule):
         if self.cond_on_prev_audio_tokens:
             audio_tokens_embedded = self.embed_audio_tokens(input_audio_tokens.transpose(1, 2).contiguous()) # (B, T', E)
             speech_decoder_input = speech_decoder_input + audio_tokens_embedded
-
 
         decoder_out = self.t5_decoder(x=speech_decoder_input, x_mask=speech_mask)
         # get the logits of all codebooks
@@ -205,8 +204,87 @@ class SpeechDecoder(NeuralModule):
     def embed_audio_tokens(self, audio_tokens):
         # Add and average the embeddings of the audio tokens across the codebooks
         audio_embedding = None
-        for c in range(audio_tokens.size(1)):
+        for c in range(self.num_audio_codebooks):
             embedding = self.audio_embeddings[c](audio_tokens[:, c, :])
+            if audio_embedding is None:
+                audio_embedding = embedding
+            else:
+                audio_embedding = audio_embedding + embedding
+        audio_embedding = audio_embedding / audio_tokens.size(1)
+        return audio_embedding
+
+class SpeechDecoderInverted(NeuralModule):
+    def __init__(self, speech_decoder_parms: DictConfig, lantent_dim: int, num_audio_codebooks: int, num_audio_tokens_per_codebook: int):
+        super().__init__()
+        self.speech_decoder_parms = speech_decoder_parms
+        self.lantent_dim = lantent_dim
+        self.num_audio_codebooks = num_audio_codebooks
+        self.num_audio_tokens_per_codebook = num_audio_tokens_per_codebook
+        # optional configs
+        self.cfg_unconditional_prob = self.speech_decoder_parms.pop("cfg_unconditional_prob", None)
+        self.cond_on_prev_audio_tokens = self.speech_decoder_parms.pop("cond_on_prev_audio_tokens", False)
+
+        # projection to adapt llm embeddings into the same shape of speech decoder expected input
+        self.input_proj = nn.Linear(lantent_dim, self.speech_decoder_parms["d_model"])
+
+        # ToDo: replace the input projection by a modality adaptor to leverage the tts pretraining better
+
+        # instanciate T5-TTS decoder to full compatibility and potentialy load pretrained model
+        self.t5_decoder = t5tts_transformer.Transformer(**self.speech_decoder_parms)
+
+        # projection to predict audio codes
+        self.final_proj = nn.Linear(self.speech_decoder_parms["d_model"], num_audio_codebooks * num_audio_tokens_per_codebook)
+
+        # create embeddings for encode input tokens
+        if self.cond_on_prev_audio_tokens:
+            audio_embeddings = []
+            for _ in range(self.num_audio_codebooks):
+                audio_embeddings.append(nn.Embedding(num_audio_tokens_per_codebook, self.speech_decoder_parms["d_model"]))
+
+            self.audio_embeddings = nn.ModuleList(audio_embeddings)
+
+    def forward(self, hidden_states, speech_mask, input_audio_tokens=None):
+        # Megatron LLM parallel training returns T, B, F so reshape it
+        # T, B, F = hidden_states.size()
+        # map hidden states to the shape of the 
+        speech_decoder_input = self.input_proj(hidden_states)
+        # workaround for inference, because during inference speech_mask will be None
+        if speech_mask is None:
+            speech_mask = torch.ones((speech_decoder_input.size(0), speech_decoder_input.size(1))).to(speech_decoder_input.device)
+        else:
+            speech_mask = speech_mask.transpose(0, 1).contiguous()
+        if self.cfg_unconditional_prob and self.training:
+            if torch.rand(1).item() < self.cfg_unconditional_prob:
+                # make the whole batch zeros to the unconditional model
+                speech_decoder_input = torch.zeros_like(speech_decoder_input)
+                speech_mask = torch.ones_like(speech_mask)
+
+        if self.cond_on_prev_audio_tokens:
+            audio_tokens_embedded = self.embed_audio_tokens(input_audio_tokens.transpose(0, 1).contiguous()) # (B, T', E)
+            speech_decoder_input = speech_decoder_input + audio_tokens_embedded
+
+        decoder_out = self.t5_decoder(x=speech_decoder_input, x_mask=speech_mask)
+        # get the logits of all codebooks
+        all_code_logits = self.final_proj(decoder_out['output'])
+        # convert the logits from the single projection to a list with logits separated by codebook
+        all_codebook_logits = self.all_logits_to_each_codebooks_logits(all_code_logits)
+
+        return all_codebook_logits
+
+    def all_logits_to_each_codebooks_logits(self, logits):
+        all_codebook_logits = []
+        for idx in range(self.num_audio_codebooks):
+            si = idx * self.num_audio_tokens_per_codebook
+            ei = si + self.num_audio_tokens_per_codebook
+            codebook_logits = logits[:, :, si:ei] # (B, num_tokens_per_codebook)
+            all_codebook_logits.append(codebook_logits)
+        return all_codebook_logits
+
+    def embed_audio_tokens(self, audio_tokens):
+        # Add and average the embeddings of the audio tokens across the codebooks
+        audio_embedding = None
+        for c in range(self.num_audio_codebooks):
+            embedding = self.audio_embeddings[c](audio_tokens[:, :, c])
             if audio_embedding is None:
                 audio_embedding = embedding
             else:
@@ -233,12 +311,21 @@ class S2sMCoreGPTModelSpeechDecoder(MCoreGPTModel):
         
         num_audio_codebooks = len(self.proj_head_dims) - 1 # -1 to not consider the text channel
         num_audio_tokens_per_codebook = self.proj_head_dims[-1] # the first in the list is the vocab size of llm and the rest is the codec vocab, so get the last one for simplicity
-        self.speech_decoder = SpeechDecoder(
-            speech_decoder_parms=dict(speech_decoder_parms),
-            lantent_dim=config.hidden_size,
-            num_audio_codebooks=num_audio_codebooks,
-            num_audio_tokens_per_codebook=num_audio_tokens_per_codebook
-        )
+        
+        if self.speech_decoder_parms.pop("invert_batch_to_megatron", False):
+            self.speech_decoder = SpeechDecoderInverted(
+                speech_decoder_parms=dict(self.speech_decoder_parms),
+                lantent_dim=config.hidden_size,
+                num_audio_codebooks=num_audio_codebooks,
+                num_audio_tokens_per_codebook=num_audio_tokens_per_codebook
+            )
+        else:
+            self.speech_decoder = SpeechDecoder(
+                speech_decoder_parms=dict(self.speech_decoder_parms),
+                lantent_dim=config.hidden_size,
+                num_audio_codebooks=num_audio_codebooks,
+                num_audio_tokens_per_codebook=num_audio_tokens_per_codebook
+            )
 
     def extend_embedding(self, vocab_size: int, include_proj=False):
         """Extend the embedding layer with new vocab size."""
