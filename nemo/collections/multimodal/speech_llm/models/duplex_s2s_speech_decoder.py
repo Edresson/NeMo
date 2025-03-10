@@ -140,6 +140,7 @@ class SpeechDecoder(NeuralModule):
         # optional configs
         self.cfg_unconditional_prob = self.speech_decoder_parms.pop("cfg_unconditional_prob", None)
         self.cond_on_prev_audio_tokens = self.speech_decoder_parms.pop("cond_on_prev_audio_tokens", False)
+        self.detach_input = self.speech_decoder_parms.pop("detach_input", False)
 
         # projection to adapt llm embeddings into the same shape of speech decoder expected input
         self.input_proj = nn.Linear(lantent_dim, self.speech_decoder_parms["d_model"])
@@ -165,6 +166,9 @@ class SpeechDecoder(NeuralModule):
         # T, B, F = hidden_states.size()
         hidden_states = hidden_states.transpose(0, 1).contiguous() # .reshape(B, T, F) # from [T, B, F] to [B, T, F]
 
+        if self.detach_input:
+            hidden_states = hidden_states.detach()
+
         # map hidden states to the shape of the 
         speech_decoder_input = self.input_proj(hidden_states)
 
@@ -179,6 +183,9 @@ class SpeechDecoder(NeuralModule):
                 speech_mask = torch.ones_like(speech_mask)
 
         if self.cond_on_prev_audio_tokens:
+            if self.detach_input:
+                input_audio_tokens = input_audio_tokens.detach()
+
             audio_tokens_embedded = self.embed_audio_tokens(input_audio_tokens.transpose(1, 2).contiguous()) # (B, T', E)
             speech_decoder_input = speech_decoder_input + audio_tokens_embedded
 
@@ -223,6 +230,7 @@ class SpeechDecoderInverted(NeuralModule):
         # optional configs
         self.cfg_unconditional_prob = self.speech_decoder_parms.pop("cfg_unconditional_prob", None)
         self.cond_on_prev_audio_tokens = self.speech_decoder_parms.pop("cond_on_prev_audio_tokens", False)
+        self.detach_input = self.speech_decoder_parms.pop("detach_input", False)
 
         # projection to adapt llm embeddings into the same shape of speech decoder expected input
         self.input_proj = nn.Linear(lantent_dim, self.speech_decoder_parms["d_model"])
@@ -246,6 +254,9 @@ class SpeechDecoderInverted(NeuralModule):
     def forward(self, hidden_states, speech_mask, input_audio_tokens=None):
         # Megatron LLM parallel training returns T, B, F so reshape it
         # T, B, F = hidden_states.size()
+        if self.detach_input:
+            hidden_states = hidden_states.detach()
+
         # map hidden states to the shape of the 
         speech_decoder_input = self.input_proj(hidden_states)
         # workaround for inference, because during inference speech_mask will be None
@@ -260,6 +271,9 @@ class SpeechDecoderInverted(NeuralModule):
                 speech_mask = torch.ones_like(speech_mask)
 
         if self.cond_on_prev_audio_tokens:
+            if self.detach_input:
+                input_audio_tokens = input_audio_tokens.detach()
+
             audio_tokens_embedded = self.embed_audio_tokens(input_audio_tokens.transpose(0, 1).contiguous()) # (B, T', E)
             speech_decoder_input = speech_decoder_input + audio_tokens_embedded
 
