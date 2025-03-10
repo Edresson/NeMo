@@ -237,10 +237,10 @@ class SpeechDecoderInverted(NeuralModule):
 
         # create embeddings for encode input tokens
         if self.cond_on_prev_audio_tokens:
+            self.audio_embedding = nn.Embedding(num_audio_tokens_per_codebook * self.num_audio_codebooks, self.speech_decoder_parms["d_model"] * self.num_audio_codebooks)
             audio_embeddings = []
             for _ in range(self.num_audio_codebooks):
                 audio_embeddings.append(nn.Embedding(num_audio_tokens_per_codebook, self.speech_decoder_parms["d_model"]))
-
             self.audio_embeddings = nn.ModuleList(audio_embeddings)
 
     def forward(self, hidden_states, speech_mask, input_audio_tokens=None):
@@ -425,9 +425,8 @@ class S2sMCoreGPTModelSpeechDecoder(MCoreGPTModel):
         
         else:
             # if speech batch
-
             # generate speech logits
-            audio_logits = self.speech_decoder(hidden_states, speech_mask, input_audio_tokens=input_audio_tokens) # ToDo: add audio_codes here for conditioning
+            audio_logits = self.speech_decoder(hidden_states, speech_mask, input_audio_tokens=input_audio_tokens)
 
             # generate text logits
             text_logits, _ = self.output_layer(
@@ -451,6 +450,7 @@ class S2sMCoreGPTModelSpeechDecoder(MCoreGPTModel):
                 * torch.FloatTensor(self.proj_head_loss_weights).to(tokens_loss.device)
                 / sum(self.proj_head_loss_weights)
             )
+
             return tokens_loss
 
 class S2sModularAudioGPTModelSpeechDecoder(ModularAudioGPTModel):
@@ -1592,11 +1592,11 @@ class S2sModularAudioGPTModelSpeechDecoder(ModularAudioGPTModel):
             base_module = self.model.module
         else:
             base_module = self.model
+
         lm_embedding = (
             base_module.language_model.embedding if hasattr(base_module, 'language_model') else base_module.embedding
         )
         input_embeds = lm_embedding.word_embeddings(input_ids)
-
         # merge with encoded
         encoder_input = input_embeds + encoded * self.cfg.get("duplex_user_channel_weight", 0.3)
 
