@@ -245,7 +245,6 @@ class SpeechDecoderInverted(NeuralModule):
 
         # create embeddings for encode input tokens
         if self.cond_on_prev_audio_tokens:
-            self.audio_embedding = nn.Embedding(num_audio_tokens_per_codebook * self.num_audio_codebooks, self.speech_decoder_parms["d_model"] * self.num_audio_codebooks)
             audio_embeddings = []
             for _ in range(self.num_audio_codebooks):
                 audio_embeddings.append(nn.Embedding(num_audio_tokens_per_codebook, self.speech_decoder_parms["d_model"]))
@@ -1597,6 +1596,8 @@ class S2sModularAudioGPTModelSpeechDecoder(ModularAudioGPTModel):
         # assert labels.shape[1] == encoded.shape[1]
         labels = labels[:, : encoded.shape[1]]
         input_ids = input_ids[:, : encoded.shape[1]]
+        input_audio_tokens = input_audio_tokens[:, : encoded.shape[1]]
+
         loss_mask = torch.ones_like(labels)
         assert self.cfg.get(
             'duplex_loss_on_all_steps', False
