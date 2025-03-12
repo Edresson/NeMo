@@ -133,6 +133,7 @@ class SumMultiEmbedding(LanguageModelEmbedding):
 class SpeechDecoder(NeuralModule):
     def __init__(self, speech_decoder_parms: DictConfig, lantent_dim: int, num_audio_codebooks: int, num_audio_tokens_per_codebook: int):
         super().__init__()
+        self.use_cache = False # init kv cache as false and it will be enabled in inference
         self.speech_decoder_parms = speech_decoder_parms
         self.lantent_dim = lantent_dim
         self.num_audio_codebooks = num_audio_codebooks
@@ -143,9 +144,10 @@ class SpeechDecoder(NeuralModule):
         self.detach_input = self.speech_decoder_parms.pop("detach_input", False)
 
         # projection to adapt llm embeddings into the same shape of speech decoder expected input
-        self.input_proj = nn.Linear(lantent_dim, self.speech_decoder_parms["d_model"])
-
-        # ToDo: replace the input projection by a modality adaptor to leverage the tts pretraining better
+        if lantent_dim != self.speech_decoder_parms["d_model"]:
+            self.input_proj = nn.Linear(lantent_dim, self.speech_decoder_parms["d_model"])
+        else:
+            self.input_proj = None
 
         # instanciate T5-TTS decoder to full compatibility and potentialy load pretrained model
         self.t5_decoder = t5tts_transformer.Transformer(**self.speech_decoder_parms)
@@ -161,7 +163,7 @@ class SpeechDecoder(NeuralModule):
 
             self.audio_embeddings = nn.ModuleList(audio_embeddings)
 
-    def forward(self, hidden_states, speech_mask, input_audio_tokens=None):
+    def forward(self, hidden_states, speech_mask, input_audio_tokens=None, return_raw_logits=False):
         # Megatron LLM parallel training returns T, B, F so reshape it
         # T, B, F = hidden_states.size()
         hidden_states = hidden_states.transpose(0, 1).contiguous() # .reshape(B, T, F) # from [T, B, F] to [B, T, F]
@@ -169,8 +171,11 @@ class SpeechDecoder(NeuralModule):
         if self.detach_input:
             hidden_states = hidden_states.detach()
 
-        # map hidden states to the shape of the 
-        speech_decoder_input = self.input_proj(hidden_states)
+        # map hidden states to the shape of the
+        if self.input_proj is not None:
+            speech_decoder_input = self.input_proj(hidden_states)
+        else:
+            speech_decoder_input = hidden_states
 
         # workaround for inference, because during inference speech_mask will be None
         if speech_mask is None:
@@ -190,8 +195,17 @@ class SpeechDecoder(NeuralModule):
             speech_decoder_input = speech_decoder_input + audio_tokens_embedded
 
         decoder_out = self.t5_decoder(x=speech_decoder_input, x_mask=speech_mask)
+
         # get the logits of all codebooks
         all_code_logits = self.final_proj(decoder_out['output'])
+
+        # if it is true we need to return just the last autoregressive step, it is valid because for 1 frame input we produce 1 frame ouput
+        if self.use_cache and all_code_logits.size(1) != speech_decoder_input.size(1):
+            all_code_logits = all_code_logits[:, -1:, :]
+
+        if return_raw_logits:
+            return all_code_logits
+
         # convert the logits from the single projection to a list with logits separated by codebook
         all_codebook_logits = self.all_logits_to_each_codebooks_logits(all_code_logits)
 
@@ -220,6 +234,15 @@ class SpeechDecoder(NeuralModule):
         audio_embedding = audio_embedding / audio_tokens.size(1)
         return audio_embedding
 
+    def reset_kv_cache(self, use_cache):
+        if use_cache:
+            print("Enabling KV cache")
+        else:
+            print("disabling KV cache")
+
+        self.use_cache = use_cache
+        self.t5_decoder.reset_cache(use_cache=use_cache)
+
 class SpeechDecoderInverted(NeuralModule):
     def __init__(self, speech_decoder_parms: DictConfig, lantent_dim: int, num_audio_codebooks: int, num_audio_tokens_per_codebook: int):
         super().__init__()
@@ -239,6 +262,350 @@ class SpeechDecoderInverted(NeuralModule):
 
         # instanciate T5-TTS decoder to full compatibility and potentialy load pretrained model
         self.t5_decoder = t5tts_transformer.Transformer(**self.speech_decoder_parms)
+
+        # projection to predict audio codes
+        self.final_proj = nn.Linear(self.speech_decoder_parms["d_model"], num_audio_codebooks * num_audio_tokens_per_codebook)
+
+        # create embeddings for encode input tokens
+        if self.cond_on_prev_audio_tokens:
+            audio_embeddings = []
+            for _ in range(self.num_audio_codebooks):
+                audio_embeddings.append(nn.Embedding(num_audio_tokens_per_codebook, self.speech_decoder_parms["d_model"]))
+            self.audio_embeddings = nn.ModuleList(audio_embeddings)
+
+    def forward(self, hidden_states, speech_mask, input_audio_tokens=None, return_raw_logits=False):
+        # Megatron LLM parallel training returns T, B, F so reshape it
+        # T, B, F = hidden_states.size()
+        if self.detach_input:
+            hidden_states = hidden_states.detach()
+
+        # map hidden states to the shape of the 
+        speech_decoder_input = self.input_proj(hidden_states)
+        # workaround for inference, because during inference speech_mask will be None
+        if speech_mask is None:
+            speech_mask = torch.ones((speech_decoder_input.size(0), speech_decoder_input.size(1))).to(speech_decoder_input.device)
+        else:
+            speech_mask = speech_mask.transpose(0, 1).contiguous()
+
+        if self.cfg_unconditional_prob and self.training:
+            if torch.rand(1).item() < self.cfg_unconditional_prob:
+                # make the whole batch zeros to the unconditional model
+                speech_decoder_input = torch.zeros_like(speech_decoder_input)
+                speech_mask = torch.ones_like(speech_mask)
+
+        if self.cond_on_prev_audio_tokens:
+            if self.detach_input:
+                input_audio_tokens = input_audio_tokens.detach()
+            audio_tokens_embedded = self.embed_audio_tokens(input_audio_tokens.transpose(0, 1).contiguous()) # (B, T', E)
+            speech_decoder_input = speech_decoder_input + audio_tokens_embedded
+
+        decoder_out = self.t5_decoder(x=speech_decoder_input, x_mask=speech_mask)
+        # get the logits of all codebooks
+        all_code_logits = self.final_proj(decoder_out['output'])
+        if return_raw_logits:
+            return all_code_logits
+
+        # convert the logits from the single projection to a list with logits separated by codebook
+        all_codebook_logits = self.all_logits_to_each_codebooks_logits(all_code_logits)
+
+        return all_codebook_logits
+
+    def all_logits_to_each_codebooks_logits(self, logits):
+        all_codebook_logits = []
+        for idx in range(self.num_audio_codebooks):
+            si = idx * self.num_audio_tokens_per_codebook
+            ei = si + self.num_audio_tokens_per_codebook
+            codebook_logits = logits[:, :, si:ei] # (B, num_tokens_per_codebook)
+            all_codebook_logits.append(codebook_logits)
+        return all_codebook_logits
+
+    def embed_audio_tokens(self, audio_tokens):
+        # Add and average the embeddings of the audio tokens across the codebooks
+        audio_embedding = None
+        for c in range(self.num_audio_codebooks):
+            embedding = self.audio_embeddings[c](audio_tokens[:, :, c])
+            if audio_embedding is None:
+                audio_embedding = embedding
+            else:
+                audio_embedding = audio_embedding + embedding
+        audio_embedding = audio_embedding / audio_tokens.size(1)
+        return audio_embedding
+
+    def reset_kv_cache(self, use_cache):
+        self.t5_decoder.reset_cache(use_cache=use_cache)
+
+def test_SpeechDecoderInverted():
+    speech_decoder_parms = {
+        "n_layers": 12,
+        "d_model": 768,
+        "d_ffn": 3072,
+        "sa_n_heads": 12,
+        "kernel_size": 3,
+        "p_dropout": 0.1,
+        "p_dropout_out": 0.0,
+        "has_xattn": False,
+        "xa_d_memory": 768,
+        "xa_n_heads": 12,
+        "is_causal": True,
+        "apply_norm_to_cond": True,
+        "apply_norm_out": True,
+        "max_length_causal_mask": 5000,
+        "use_learnable_pos_emb": False,
+        "cond_on_prev_audio_tokens": True,
+    }
+    llm_latent_out_dim = 1024
+    test_speech_decoder_inverted = SpeechDecoderInverted(speech_decoder_parms, lantent_dim=llm_latent_out_dim, num_audio_codebooks=4, num_audio_tokens_per_codebook=4032)
+    B, T, F = 2, 14, 768
+    llm_backbone_output = torch.randn([T, B, llm_latent_out_dim])
+    speech_mask = torch.ones(B, T)
+    input_audio_tokens = torch.randint(1, 4032, (B, T, 4))
+    non_causal_output = test_speech_decoder_inverted.forward(llm_backbone_output, speech_mask, input_audio_tokens=input_audio_tokens, return_raw_logits=True)
+    causal_output_list = []
+    for i in range(0, T):
+        causal_out = test_speech_decoder_inverted.forward(llm_backbone_output[i, :, :].unsqueeze(0), speech_mask[:, i].unsqueeze(1), input_audio_tokens=input_audio_tokens[:, i, :].unsqueeze(1), return_raw_logits=True)
+        causal_output_list.append(causal_out)
+
+    
+    causal_output = torch.stack(causal_output_list).reshape(non_causal_output.size())
+    print("Is the SpeechDecoderInverted full causal?", torch.allclose(causal_output, non_causal_output))
+    print(causal_output.shape, non_causal_output.shape)
+
+def test_SpeechDecoder():
+    speech_decoder_parms = {
+        "n_layers": 12,
+        "d_model": 768,
+        "d_ffn": 3072,
+        "sa_n_heads": 12,
+        "kernel_size": 3,
+        "p_dropout": 0.1,
+        "p_dropout_out": 0.0,
+        "has_xattn": False,
+        "xa_d_memory": 768,
+        "xa_n_heads": 12,
+        "is_causal": True,
+        "apply_norm_to_cond": True,
+        "apply_norm_out": True,
+        "max_length_causal_mask": 5000,
+        "use_learnable_pos_emb": False,
+        "cond_on_prev_audio_tokens": False,
+    }
+    # define shapes
+    llm_latent_out_dim = 768
+    B, T, F = 2, 14, 768
+    speech_decoder_model = SpeechDecoder(speech_decoder_parms, lantent_dim=llm_latent_out_dim, num_audio_codebooks=4, num_audio_tokens_per_codebook=4032)
+
+    # create dummy inputs
+    llm_backbone_output = torch.randn([T, B, llm_latent_out_dim]) # llm output is [T, B, llm_latent_out_dim]
+    speech_mask = torch.ones(B, T) # mask
+    input_audio_tokens = torch.randint(1, 4032, (B, T, 4)) # audio codes are (B, T, num_audio_codebooks)
+
+    # do inference using the whole sequence
+    non_causal_output = speech_decoder_model.forward(llm_backbone_output, speech_mask, input_audio_tokens=input_audio_tokens, return_raw_logits=True)
+
+    # do causal inference
+    causal_output_list = []
+    for i in range(0, T):
+        i_llm_backbone_output = llm_backbone_output[:i, :, :].unsqueeze(0)
+        i_speech_mask = speech_mask[:, :i].unsqueeze(1)
+        i_input_audio_tokens = input_audio_tokens[:, :i, :].unsqueeze(1)
+        causal_out = speech_decoder_model.forward(i_llm_backbone_output, i_speech_mask, input_audio_tokens=i_input_audio_tokens, return_raw_logits=True)
+        # print(causal_out.shape)
+        causal_output_list.append(causal_out)
+
+    # stack causal out
+    causal_output = torch.stack(causal_output_list, dim=1)
+
+    # causal_output returned is torch.Size([B, T, 1, F']) due stack so squeeze it
+    causal_output = causal_output.squeeze(2)
+
+    print("Is the SpeechDecoder full causal?", torch.allclose(causal_output, non_causal_output))
+    print(causal_output.shape, non_causal_output.shape)
+    print("Causal:", causal_output)
+    print("NonCausal:", non_causal_output)
+
+# test_SpeechDecoderInverted()
+# test_SpeechDecoder()
+
+def test_t5tts_decoder():
+    import os
+    import random
+    import numpy as np
+    import torch
+    import transformers
+    def set_seed(random_seed=26):
+        # set deterministic inference
+        random.seed(random_seed)
+        np.random.seed(random_seed)
+        torch.manual_seed(random_seed)
+        torch.cuda.manual_seed(random_seed)
+        transformers.set_seed(random_seed)
+        torch.backends.cudnn.benchmark = False
+        # Set a fixed value for the hash seed
+        os.environ["PYTHONHASHSEED"] = str(random_seed)
+        torch.set_grad_enabled(False)
+        torch.set_num_threads(1)
+        torch.set_num_interop_threads(1)
+        torch._C._jit_set_profiling_executor(False)
+        torch._C._jit_set_profiling_mode(False)
+        torch._C._set_graph_executor_optimize(False)
+        torch.backends.cudnn.benchmark = False
+        torch.backends.cudnn.deterministic = True
+        torch.use_deterministic_algorithms(True)
+
+
+    set_seed()
+    speech_decoder_parms = {
+        "n_layers": 12,
+        "d_model": 768,
+        "d_ffn": 3072,
+        "sa_n_heads": 12,
+        "kernel_size": 3,
+        "p_dropout": 0.1,
+        "p_dropout_out": 0.0,
+        "has_xattn": False,
+        "xa_d_memory": 768,
+        "xa_n_heads": 12,
+        "is_causal": True,
+        "apply_norm_to_cond": True,
+        "apply_norm_out": True,
+        "max_length_causal_mask": 5000,
+        "use_learnable_pos_emb": False,
+    }
+    # define shapes
+    llm_latent_out_dim = 768
+    B, T, F = 2, 14, 768
+    speech_decoder_model = t5tts_transformer.Transformer(**speech_decoder_parms)
+
+    # create dummy inputs
+    llm_backbone_output = torch.randn([T, B, llm_latent_out_dim]) # llm output is [T, B, llm_latent_out_dim]
+    speech_mask = torch.ones(B, T) # mask
+    # input_audio_tokens = torch.randint(1, 4032, (B, T, 4)) # audio codes are (B, T, num_audio_codebooks)
+
+    # do inference using the whole sequence
+
+    non_causal_output = speech_decoder_model.forward(llm_backbone_output.transpose(0, 1), speech_mask)['output']
+    non_causal_output_2 = speech_decoder_model.forward(llm_backbone_output.transpose(0, 1), speech_mask)['output']
+    print("with equal input?", torch.allclose(non_causal_output_2, non_causal_output))
+
+    # do causal inference
+    causal_output_list = []
+    for i in range(1, T+1):
+        i_llm_backbone_output = llm_backbone_output[:i, :, :]
+        i_speech_mask = speech_mask[:, :i]
+        # i_input_audio_tokens = input_audio_tokens[:, :i, :]
+        print("Input shapes:", i_llm_backbone_output.shape, i_speech_mask.shape)
+        # make input B, T, F
+        i_llm_backbone_output = i_llm_backbone_output.transpose(0, 1)
+        print(i_llm_backbone_output.shape, llm_backbone_output.transpose(0, 1).shape)
+        causal_out = speech_decoder_model.forward(i_llm_backbone_output, i_speech_mask)['output']
+        causal_output_list.append(causal_out[:, -1:, :])
+        last_latent = causal_out
+    # stack causal out
+    causal_output = torch.stack(causal_output_list, dim=1)
+
+    # causal_output returned is torch.Size([B, T, 1, F']) due stack so squeeze it
+    causal_output = causal_output.squeeze(2)
+
+    print("Is the t5tts_decoder full causal?", torch.allclose(causal_output, non_causal_output))
+    print("Is the t5tts_decoder full causal? last latent", torch.allclose(last_latent, non_causal_output))
+    print("Causal:", causal_output)
+    print("NonCausal:", non_causal_output)
+
+
+
+# test_t5tts_decoder()
+# exit()
+
+def test_t5tts_decoder_TBF():
+    speech_decoder_parms = {
+        "n_layers": 12,
+        "d_model": 768,
+        "d_ffn": 3072,
+        "sa_n_heads": 12,
+        "kernel_size": 3,
+        "p_dropout": 0.1,
+        "p_dropout_out": 0.0,
+        "has_xattn": False,
+        "xa_d_memory": 768,
+        "xa_n_heads": 12,
+        "is_causal": True,
+        "apply_norm_to_cond": True,
+        "apply_norm_out": True,
+        "max_length_causal_mask": 5000,
+        "use_learnable_pos_emb": False,
+    }
+    # define shapes
+    llm_latent_out_dim = 768
+    B, T, F = 2, 14, 768
+    speech_decoder_model = t5tts_transformer.Transformer(**speech_decoder_parms)
+
+    # create dummy inputs
+    llm_backbone_output = torch.randn([T, B, llm_latent_out_dim]) # llm output is [T, B, llm_latent_out_dim]
+    speech_mask = torch.ones(B, T) # mask
+    # input_audio_tokens = torch.randint(1, 4032, (B, T, 4)) # audio codes are (B, T, num_audio_codebooks)
+
+    # do inference using the whole sequence
+
+    non_causal_output = speech_decoder_model.forward(llm_backbone_output, speech_mask.transpose(0, 1))['output']
+
+    # do causal inference
+    causal_output_list = []
+    for i in range(1, T+1):
+        i_llm_backbone_output = llm_backbone_output[:i, :, :]
+        i_speech_mask = speech_mask[:, :i].transpose(0, 1)
+        # i_input_audio_tokens = input_audio_tokens[:, :i, :]
+        # make input B, T, F
+        i_llm_backbone_output = i_llm_backbone_output
+        print("Input shapes:", i_llm_backbone_output.shape, i_speech_mask.shape)
+        causal_out = speech_decoder_model.forward(i_llm_backbone_output, i_speech_mask)['output']
+        causal_output_list.append(causal_out[-1:, :, :])
+        last_latent = causal_out
+    # stack causal out
+    causal_output = torch.stack(causal_output_list, dim=1)
+
+    # causal_output returned is torch.Size([B, T, 1, F']) due stack so squeeze it
+    causal_output = causal_output.squeeze(2)
+
+    print("Is the t5tts_decoder TBF full causal?", torch.allclose(causal_output, non_causal_output))
+    print("Is the t5tts_decoder TBF full causal? last latent", torch.allclose(last_latent, non_causal_output))
+    
+    print("Causal:", causal_output)
+    print("NonCausal:", non_causal_output)
+
+# test_t5tts_decoder_TBF()
+# exit()
+
+"""
+from megatron.core.models.gpt.gpt_model import GPTModel
+from megatron.core.transformer.transformer_config import TransformerConfig
+from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_local_spec
+
+class SpeechDecoderMegatron(NeuralModule):
+    def __init__(self, speech_decoder_parms: DictConfig, lantent_dim: int, num_audio_codebooks: int, num_audio_tokens_per_codebook: int):
+        super().__init__()
+        self.speech_decoder_parms = speech_decoder_parms
+        self.lantent_dim = lantent_dim
+        self.num_audio_codebooks = num_audio_codebooks
+        self.num_audio_tokens_per_codebook = num_audio_tokens_per_codebook
+        # optional configs
+        self.cfg_unconditional_prob = self.speech_decoder_parms.pop("cfg_unconditional_prob", None)
+        self.cond_on_prev_audio_tokens = self.speech_decoder_parms.pop("cond_on_prev_audio_tokens", False)
+        self.detach_input = self.speech_decoder_parms.pop("detach_input", False)
+
+        # projection to adapt llm embeddings into the same shape of speech decoder expected input
+        self.input_proj = nn.Linear(lantent_dim, self.speech_decoder_parms["d_model"])
+
+        # ToDo: replace the input projection by a modality adaptor to leverage the tts pretraining better
+
+        # instanciate T5-TTS decoder to full compatibility and potentialy load pretrained model
+        self.transformer_config = TransformerConfig(
+            num_layers=2,
+            hidden_size=lantent_dim,
+            num_attention_heads=4,
+            use_cpu_initialization=True,
+            pipeline_dtype=torch.float32
+        )
+        self.t5_decoder = GPTModel()
 
         # projection to predict audio codes
         self.final_proj = nn.Linear(self.speech_decoder_parms["d_model"], num_audio_codebooks * num_audio_tokens_per_codebook)
@@ -304,6 +671,7 @@ class SpeechDecoderInverted(NeuralModule):
         audio_embedding = audio_embedding / audio_tokens.size(1)
         return audio_embedding
 
+"""
 
 class S2sMCoreGPTModelSpeechDecoder(MCoreGPTModel):
     def __init__(
@@ -619,7 +987,7 @@ class S2sModularAudioGPTModelSpeechDecoder(ModularAudioGPTModel):
         # TODO: we expect only one modality in each batch of inference. In lhotse, can we specify a list of datasets which only have one modality either audio-text or text-only?
         # TODO: support text-only part of mini-batch
         # the following supports STT (audio-text) inference
-
+        
         inference_config = self.get_inference_config()
         if inference_config is not None:
             # need to overwrite some configuration, make it immutable
@@ -753,6 +1121,7 @@ class S2sModularAudioGPTModelSpeechDecoder(ModularAudioGPTModel):
         Used for validation and test steps, added postprocessing after calling self.predict_step().
         """
 
+        self.model.speech_decoder.reset_kv_cache(use_cache=True)
         # Evaluation of multimodal data follows the same pattern as training except predict_step
         batch, batch_idx, dataloader_idx = next(dataloader_iter)
         data_cfg = self.cfg.data.validation_ds if mode == 'validation' else self.cfg.data.test_ds
@@ -843,6 +1212,9 @@ class S2sModularAudioGPTModelSpeechDecoder(ModularAudioGPTModel):
         return outputs
 
     def post_inference_step(self, list_outputs, mode, data_cfg):
+        # inference is done so disable KV cache
+        self.model.speech_decoder.reset_kv_cache(use_cache=False)
+
         deduplicated_outputs = {
             'preds': [],
             'labels': [],
@@ -1025,7 +1397,7 @@ class S2sModularAudioGPTModelSpeechDecoder(ModularAudioGPTModel):
                         for pred_wav, answer_wav in zip(pred_wavs_resampled, answer_wavs_resampled)
                     ]
                 deduplicated_outputs['mos_scores'] = squim_mos_scores
-
+        
         return deduplicated_outputs
 
     def parse_decoder_outputs(
