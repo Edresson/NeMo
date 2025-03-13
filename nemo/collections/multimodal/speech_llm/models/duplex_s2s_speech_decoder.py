@@ -520,7 +520,8 @@ class S2sMCoreGPTModelSpeechDecoder(MCoreGPTModel):
         else:
             # if speech batch
             # generate speech logits
-            audio_logits, _ = self.speech_decoder(hidden_states, speech_mask, input_audio_tokens=input_audio_tokens)
+            audio_logits, audio_logits_tensor = self.speech_decoder(hidden_states, speech_mask, input_audio_tokens=input_audio_tokens)
+
             """
             # test speech decoder sampling
             audio_logits, audio_logits_tensor = self.speech_decoder(hidden_states, speech_mask, input_audio_tokens=input_audio_tokens)
@@ -560,8 +561,7 @@ class S2sMCoreGPTModelSpeechDecoder(MCoreGPTModel):
             print(audio_logits_tensor.shape, predicted_codes.shape, labels.shape)
             torch.save(predicted_codes, "/lustre/fsw/portfolios/convai/users/ecasanova/S2S-full-duplex/sampled_audio_tokens_causal_inf.pt")
             exit()
-           
-            # causal inference with kv cache
+             # causal inference with kv cache
             # hidden_states is T, B, F
             self.speech_decoder.reset_input_and_kv_cache(use_cache=True)
             all_predictions = []
@@ -571,6 +571,8 @@ class S2sMCoreGPTModelSpeechDecoder(MCoreGPTModel):
                 hidden_states_i = hidden_states[i, :, :].unsqueeze(0)
                 speech_mask_i = speech_mask[:, i].unsqueeze(1)
                 input_audio_tokens_i = input_audio_tokens[:, i].unsqueeze(1)
+       
+
                 print(hidden_states_i.shape, speech_mask_i.shape, input_audio_tokens_i.shape)
                 _, audio_logits_tensor = self.speech_decoder(hidden_states_i, speech_mask_i, input_audio_tokens=input_audio_tokens_i)
                 print(audio_logits_tensor.shape)
@@ -581,9 +583,37 @@ class S2sMCoreGPTModelSpeechDecoder(MCoreGPTModel):
 
             predicted_codes = torch.stack(all_predictions, dim=-1)
             print(audio_logits_tensor.shape, predicted_codes.shape, labels.shape)
-            torch.save(predicted_codes, "/lustre/fsw/portfolios/convai/users/ecasanova/S2S-full-duplex/sampled_audio_tokens_causal_inf_with_input_cache_and_kv.pt")
+            torch.save(predicted_codes, "/lustre/fsw/portfolios/convai/users/ecasanova/S2S-full-duplex/sampled_audio_tokens_causal_inf_with_input_cache_and_kv_new.pt")
             exit()
+            
+            # causal inference with kv cache
+            # hidden_states is T, B, F
+            self.speech_decoder.reset_input_and_kv_cache(use_cache=True)
+            all_predictions = []
+            print(speech_mask)
+            print(hidden_states.shape, speech_mask.shape, input_audio_tokens.shape)
+            input_audio_tokens_i = None
+            for i in range(0, hidden_states.size(0)):
+                hidden_states_i = hidden_states[i, :, :].unsqueeze(0)
+                speech_mask_i = speech_mask[:, i].unsqueeze(1)
+                if input_audio_tokens_i is None:
+                    input_audio_tokens_i = input_audio_tokens[:, i].unsqueeze(1)
+                    print("Start conditionining with:", input_audio_tokens_i)
+                else:
+                    input_audio_tokens_i = audio_codes_sampled.unsqueeze(1)
 
+                print(hidden_states_i.shape, speech_mask_i.shape, input_audio_tokens_i.shape)
+                _, audio_logits_tensor = self.speech_decoder(hidden_states_i, speech_mask_i, input_audio_tokens=input_audio_tokens_i)
+                print(audio_logits_tensor.shape)
+                # get always the last token
+                audio_logits_tensor_i = audio_logits_tensor[:, -1, :]
+                audio_codes_sampled = self.speech_decoder.sample_codes_from_logits(audio_logits_tensor_i)
+                all_predictions.append(audio_codes_sampled)
+
+            predicted_codes = torch.stack(all_predictions, dim=-1)
+            print(audio_logits_tensor.shape, predicted_codes.shape, labels.shape)
+            torch.save(predicted_codes, "/lustre/fsw/portfolios/convai/users/ecasanova/S2S-full-duplex/sampled_audio_tokens_causal_inf_with_input_cache_and_kv_new_cond_with_pred_token.pt")
+            exit()
             """
 
             # generate text logits

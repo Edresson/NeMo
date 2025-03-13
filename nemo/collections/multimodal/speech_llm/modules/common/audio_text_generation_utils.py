@@ -786,7 +786,9 @@ def s2s_sample_sequence_batch(
                 min_length = extra.get('min_tokens_to_generate', 0)
                 assert min_length == 0
                 # make sure it won't sample outside the vocab_size range
-                logits[:, model.cfg.s2s_vocab_size :] = -float('Inf')
+                if not hasattr(model.model, "speech_decoder"):
+                    logits[:, model.cfg.s2s_vocab_size :] = -float('Inf')
+
                 logits = model.de_concat_multiproj_logits(logits)
 
                 # started indicates whether the current token step passes the context_length, so we make sure not to overwrite the context tokens

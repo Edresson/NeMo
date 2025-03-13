@@ -338,7 +338,7 @@ class AudioToAudioGenerationStrategy(AudioToTextGenerationStrategy):
                 tokens2use = tokens[:, curr_context_length - 1].view(micro_batch_size, 1, -1)
             else:
                 tokens2use = tokens[:, curr_context_length - 1].view(micro_batch_size, 1, -1)[:, :, 0]
-            
+
             audiotokens2use = tokens[:, curr_context_length - 1].view(micro_batch_size, 1, -1)[:, :, 1:]
 
             # embedding offset and sum is handled inside
