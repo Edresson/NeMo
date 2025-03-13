@@ -687,6 +687,7 @@ class Transformer(torch.nn.Module):
                 f"Found {len(self.layers)} layers for {len(cond)} conditionals."
             )
 
+        # ToDo: Fix this for KV cache... it should not start from the input dim, but it should be kv cache size + 1
         if self.use_learnable_pos_emb:
             positions = torch.arange(x.size(1), device=x.device).unsqueeze(0)
             x = x + self.position_embeddings(positions)

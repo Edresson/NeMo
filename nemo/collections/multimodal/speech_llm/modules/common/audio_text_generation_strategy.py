@@ -319,9 +319,6 @@ class AudioToAudioGenerationStrategy(AudioToTextGenerationStrategy):
         if step == 0:
             # reset kv cache
             set_inference_key_value_memory = True
-            if hasattr(self.model.model, "speech_decoder"):
-                self.model.model.speech_decoder.reset_kv_cache(use_cache=True)
-
             tokens2use = tokens[:, :curr_context_length]
             positions2use = self.position_ids[:, :curr_context_length]
             embeddings2use = input_embeddings[:curr_context_length]
