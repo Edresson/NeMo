@@ -339,14 +339,43 @@ class SelfFlexAttention(torch.nn.Module):
             self.attn_mask_fn = causal_mask_flexattention
         else: # not sliding window and not causal
             self.attn_mask_fn = None
+        # ToDo: implements NATTEN attention https://github.com/pytorch-labs/attention-gym/blob/bf70245667249dc1051bfd6182ab2671fd056245/examples/flex_attn.ipynb#L609
+        
+        """
+        H = 882 # self.samples_per_frame
+        W = self.max_length_causal_mask  # CURRENT sliding_window_size
+        K_H = 882
+        K_W = 16
 
+        def get_x_y(idx):
+            return idx // W, idx % W
+
+
+        def natten_mask(
+            b,
+            h,
+            q_idx,
+            kv_idx,
+        ):
+            q_x, q_y = get_x_y(q_idx)
+            kv_x, kv_y = get_x_y(kv_idx)
+            # kernel nominally attempts to center itself on the query, but kernel center
+            # is clamped to a fixed distance (kernel half-length) from the canvas edge
+            kernel_x = q_x.clamp(K_W // 2, (W - 1) - K_W // 2)
+            kernel_y = q_y.clamp(K_H // 2, (H - 1) - K_H // 2)
+            hori_mask = (kernel_x - kv_x).abs() <= K_W // 2
+            vert_mask = (kernel_y - kv_y).abs() <= K_H // 2
+            return hori_mask & vert_mask
+
+        # self.attn_mask_fn = and_masks(*[causal_mask_flexattention, natten_mask])
+        self.attn_mask_fn = natten_mask
+        """
         # init as None and on forward update the mask if needed, we cant init it here because of devices issues, block_mask is not automatically converted to the right cuda device and .to(device) is not working
         self.attn_block_mask = None
         # create block mask if needed, first step will be slower, but after that it should be fast
         if self.attn_mask_fn is not None:
             block_mask = create_block_mask(self.attn_mask_fn, B=None, H=None, Q_LEN=self.max_length_causal_mask, KV_LEN=self.max_length_causal_mask)
             self.attn_block_mask = block_mask
-
 
     @abstractmethod
     def compute_qkv_and_mask(
