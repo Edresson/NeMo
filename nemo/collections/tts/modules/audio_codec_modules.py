@@ -46,6 +46,15 @@ from nemo.collections.tts.modules.vits_modules import WN, Flip
 from transformers import Wav2Vec2Processor, Wav2Vec2ForCTC
 from nemo.collections.tts.modules import t5tts_transformer
 
+from contextlib import contextmanager
+@contextmanager
+def default_precision(dtype=torch.float32):
+    default_dtype = torch.get_default_dtype()
+    torch.set_default_dtype(dtype)
+    try:
+        yield
+    finally:
+        torch.set_default_dtype(default_dtype)
 
 
 def get_padding(kernel_size: int, dilation: int = 1) -> int:
@@ -1020,7 +1029,6 @@ class CausalConv1dNorm(NeuralModule):
 
         # Effective kernel size with dilations.
         kernel_size = torch.tensor((kernel_size - 1) * dilation + 1, dtype=torch.int64)
-
         self.register_buffer("stride", stride, persistent=False)
         self.register_buffer("kernel_size", kernel_size, persistent=False)
         self.register_buffer("padding_total", torch.tensor(kernel_size - stride, dtype=torch.int64), persistent=False)
@@ -1037,12 +1045,12 @@ class CausalConv1dNorm(NeuralModule):
         hidden_states: torch.Tensor,
     ) -> torch.Tensor:
         """See `pad_for_conv1d`."""
-        length = hidden_states.shape[-1]
-        n_frames = (length - self.kernel_size + self.padding_total) / self.stride + 1
-        n_frames = torch.ceil(n_frames).to(torch.int64) - 1
-        ideal_length = n_frames * self.stride + self.kernel_size - self.padding_total
-
-        return ideal_length - length
+        with default_precision(torch.float32):
+            length = hidden_states.shape[-1]
+            n_frames = (length - self.kernel_size + self.padding_total) / self.stride + 1
+            n_frames = torch.ceil(n_frames).to(torch.int64) - 1
+            ideal_length = (n_frames * self.stride).long() + self.kernel_size - self.padding_total
+        return (ideal_length - length).long()
 
     @staticmethod
     # Copied from transformers.models.encodec.modeling_encodec.EncodecConv1d._pad1d
@@ -1066,7 +1074,6 @@ class CausalConv1dNorm(NeuralModule):
 
     def forward(self, inputs, input_len):
         extra_padding = self._get_extra_padding_for_conv1d(inputs)
-
         # Left padding for causal
         hidden_states = self._pad1d(inputs, (self.padding_total, extra_padding), mode=self.extra_pad_mode)
         hidden_states = self.conv(hidden_states)
@@ -1434,7 +1441,8 @@ class MultiBandDiscriminatorSTFT(NeuralModule):
     def forward(self, audio):
         scores_list = []
         fmap_list = []
-        spec = self.compute_stft(audio)
+        # run spec compute on fp32 and convert out to the model training type
+        spec = self.compute_stft(audio.float()).to(audio.dtype)
         for band, disc in zip(self.stft_bands, self.discriminators):
             spec_band = spec[:, :, :, band[0] : band[1]]
             score, fmap = disc(spec=spec_band)
@@ -1773,12 +1781,14 @@ class FiniteScalarQuantizer(VectorQuantizerBase):
         indices = rearrange(indices, 'D B T -> B D T')
         # convert a single index to nonnegative index per-dimension
         codes_nonnegative = (indices // self.dim_base_index) % self.num_levels
+
         # convert nonnegative codes to codes (centered around zero)
         dequantized = self.nonnegative_to_codes(codes_nonnegative)
 
         if input_len is not None:
             # apply masking
             dequantized = mask_sequence_tensor(dequantized, input_len)
+
         return dequantized
 
 
@@ -2160,8 +2170,9 @@ class CausalHiFiGANEncoder(NeuralModule):
             # [B, C, T]
             out = res_layer(inputs=out, input_len=encoded_len)
             out = act(out)
+            with default_precision(torch.float32):
+                encoded_len = (encoded_len // down_sample_rate).long()
 
-            encoded_len = encoded_len // down_sample_rate
             # [B, 2 * C, T / down_sample_rate]
             out = down_sample_conv(inputs=out, input_len=encoded_len)
 
@@ -2250,7 +2261,9 @@ class TransformerEncoder(NeuralModule):
         encoded_len = audio_len
         B, T = audio.size()
         audio = audio.reshape(B, -1, self.samples_per_frame) # B, T, F, where 7 is the number of samples per frame that controls the frame rte
-        encoded_len = (audio_len/self.samples_per_frame).int()
+        with default_precision(torch.float32):
+            encoded_len = (audio_len/self.samples_per_frame).long()
+
         out = self.inp_projection_no_bias(audio)
         out = self.inp_projection(out)
         speech_mask = get_mask_from_lengths(encoded_len)
@@ -2367,7 +2380,9 @@ class HiFiGANEncoder(NeuralModule):
             out = res_layer(inputs=out, input_len=encoded_len)
             out = act(out)
 
-            encoded_len = encoded_len // down_sample_rate
+            with default_precision(torch.float32):
+                encoded_len = (encoded_len // down_sample_rate).long()
+
             # [B, 2 * C, T / down_sample_rate]
             out = down_sample_conv(inputs=out, input_len=encoded_len)
 
@@ -2485,7 +2500,9 @@ class CausalHiFiGANDecoder(NeuralModule):
         for act, res_layer, up_sample_conv, up_sample_rate in zip(
             self.activations, self.res_layers, self.up_sample_conv_layers, self.up_sample_rates
         ):
-            audio_len = audio_len * up_sample_rate
+            with default_precision(torch.float32):
+                audio_len = (audio_len * up_sample_rate).long()
+
             out = act(out)
             # [B, C / 2, T * up_sample_rate]
             out = up_sample_conv(inputs=out, input_len=audio_len)

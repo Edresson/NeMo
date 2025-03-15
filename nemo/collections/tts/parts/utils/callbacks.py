@@ -370,7 +370,9 @@ class AudioCodecArtifactGenerator(ArtifactGenerator):
 
         with torch.no_grad():
             # [B, T]
-            audio_pred, audio_pred_len = model(audio=audio, audio_len=audio_len)
+            audio_pred, audio_pred_len = model(audio=audio.to(model.dtype), audio_len=audio_len)
+
+        audio_pred = audio_pred.float() # convert to float 32
 
         audio_artifacts = []
         # Log output audio
