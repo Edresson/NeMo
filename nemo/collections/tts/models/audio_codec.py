@@ -21,7 +21,12 @@ import torch
 import torch.nn.functional as F
 from einops import rearrange
 from hydra.utils import instantiate
-from lightning.pytorch import Trainer
+# latest pytorch versions
+try:
+    from lightning.pytorch import Trainer
+except:
+    from pytorch_lightning import Trainer
+
 from omegaconf import DictConfig, OmegaConf, open_dict
 
 from nemo.collections.tts.losses.audio_codec_loss import (
