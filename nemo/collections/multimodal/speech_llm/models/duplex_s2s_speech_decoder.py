@@ -145,6 +145,11 @@ class SpeechDecoder(NeuralModule):
         self.cfg_scale = self.speech_decoder_parms.pop("cfg_scale", 2.5)
         self.cond_on_prev_audio_tokens = self.speech_decoder_parms.pop("cond_on_prev_audio_tokens", False)
         self.detach_input = self.speech_decoder_parms.pop("detach_input", False)
+        # local transformer params
+        self.use_local_tranformer = self.speech_decoder_parms.pop("use_local_tranformer", False)
+        local_transformer_n_layers = self.speech_decoder_parms.pop("local_transformer_n_layers", 2)
+        local_transformer_n_heads = self.speech_decoder_parms.pop('local_transformer_n_heads', 1)
+        local_transformer_hidden_dim = self.speech_decoder_parms.pop('local_transformer_hidden_dim', 256)
 
         # projection to adapt llm embeddings into the same shape of speech decoder expected input
         if lantent_dim != self.speech_decoder_parms["d_model"]:
@@ -155,8 +160,30 @@ class SpeechDecoder(NeuralModule):
         # instanciate T5-TTS decoder to full compatibility and potentialy load pretrained model
         self.t5_decoder = t5tts_transformer.Transformer(**self.speech_decoder_parms)
 
-        # projection to predict audio codes
-        self.final_proj = nn.Linear(self.speech_decoder_parms["d_model"], num_audio_codebooks * num_audio_tokens_per_codebook)
+        if self.use_local_tranformer:
+            if local_transformer_hidden_dim != self.speech_decoder_parms["d_model"]:
+                self.local_transformer_in_projection = nn.Linear(self.speech_decoder_parms["d_model"], local_transformer_hidden_dim)
+            else:
+                self.local_transformer_in_projection = nn.Identity()
+
+            self.local_transformer = t5tts_transformer.Transformer(
+                n_layers=self.cfg.get('local_transformer_n_layers', 2),
+                d_model=self.speech_decoder_parms["d_model"],
+                d_ffn=self.speech_decoder_parms["d_model"]*4,
+                sa_n_heads=local_transformer_n_heads,
+                kernel_size=1,
+                is_causal=True,
+                max_length_causal_mask=self.num_audio_codebooks+2,
+                use_learnable_pos_emb=True,
+            )
+            local_transformer_out_projections = []
+            for _ in range(self.num_audio_codebooks):
+                # Have a separate projection layer for each codebook, to distinguish between them
+                local_transformer_out_projections.append(nn.Linear(self.speech_decoder_parms["d_model"], self.num_audio_tokens_per_codebook))
+            self.local_transformer_out_projections = nn.ModuleList(local_transformer_out_projections)
+        else:
+            # projection to predict audio codes
+            self.final_proj = nn.Linear(self.speech_decoder_parms["d_model"], num_audio_codebooks * num_audio_tokens_per_codebook)
 
         # create embeddings for encode input tokens
         if self.cond_on_prev_audio_tokens:
@@ -267,6 +294,76 @@ class SpeechDecoder(NeuralModule):
             codebook_preds = torch.multinomial(codebook_probs, 1) # (B, 1)
             all_preds.append(codebook_preds)
         all_preds = torch.cat(all_preds, dim=1).long() # (B, num_codebooks)
+        return all_preds
+
+    def compute_local_transformer_logits(self, dec_out, audio_codes_target):
+        """
+        Loss from the autoregrssive codebook predictor (used per frame)
+        """
+        # dec_out: (B, T', E)
+        # audio_codes: (B, C, T')
+        dec_out_all = dec_out.reshape(-1, dec_out.size(-1)) # (B*T', E)
+        local_transformer_input = [dec_out_all]
+        for codebook_num in range(audio_codes_target.size(1)):
+            codes = audio_codes_target[:, codebook_num] # (B, T')
+            codes = codes.reshape(-1) # (B*T',)
+            codebook_embedding = self.audio_embeddings[codebook_num](codes) # (B*T', E)
+            local_transformer_input.append(codebook_embedding)
+
+        local_transformer_input = torch.stack(local_transformer_input, dim=1) # (B*T', C+1, E)
+        local_transformer_input = self.local_transformer_in_projection(local_transformer_input) # (B*T', C+1, 128)
+        _mask = torch.ones(local_transformer_input.size(0), local_transformer_input.size(1), device=local_transformer_input.device)
+        local_transformer_output = self.local_transformer(local_transformer_input, _mask)['output'] # (B*T', C+1, E)
+        local_transformer_output = local_transformer_output[:, :-1, :] # (B*T', C, E)
+        all_code_logits = []
+        for codebook_num in range(audio_codes_target.size(1)):
+            # Using a separate projection layer for each codebook (to distinguish between them)
+            # Checked the time - this loop is not taking much time (compared to the local transformer forward pass)
+            codebook_logits = self.local_transformer_out_projections[codebook_num](local_transformer_output[:, codebook_num, :]) # (B*T', num_audio_tokens_per_codebook)
+            all_code_logits.append(codebook_logits)
+        all_code_logits = torch.cat(all_code_logits, dim=1) # (B*T', num_codebooks * num_audio_tokens_per_codebook)
+
+        all_code_logits = all_code_logits.view(
+            audio_codes_target.size(0), audio_codes_target.size(2), -1
+        ) # (B, T', C * num_audio_tokens_per_codebook)
+
+        return all_code_logits
+
+    def sample_codes_from_local_transformer(self, dec_output, temperature=0.7, topk=80, use_cfg=False, cfg_scale=1.0):
+        # dec_output: (B, E)
+        # import ipdb; ipdb.set_trace()
+        self.local_transformer.reset_cache(use_cache=True)
+        dec_output = dec_output.unsqueeze(1) # (B, 1, E)
+        local_transformer_input = self.local_transformer_in_projection(dec_output) # (B, 1, 128)
+        all_preds = []
+        for codebook_num in range(self.cfg.num_audio_codebooks):
+            _mask = torch.ones(local_transformer_input.size(0), local_transformer_input.size(1), device=local_transformer_input.device)
+            local_transformer_output = self.local_transformer(local_transformer_input, _mask)['output'] # (B, T, 128)
+            codebook_logits = self.local_transformer_out_projections[codebook_num](local_transformer_output[:, -1, :]) # (B, num_audio_tokens_per_codebook)
+            if use_cfg:
+                actual_batch_size = codebook_logits.size(0) // 2
+                conditional_logits = codebook_logits[:actual_batch_size]
+                unconditional_logits = codebook_logits[actual_batch_size:]
+                cfg_logits = cfg_scale * conditional_logits +  (1.0 - cfg_scale) * unconditional_logits
+                codebook_logits[:actual_batch_size] = cfg_logits
+
+            codebook_logits_topk = torch.topk(codebook_logits, topk, dim=-1)[0] # (B, topk)
+            indices_to_remove = codebook_logits < codebook_logits_topk[:, -1].unsqueeze(-1) # (B, num_tokens_per_codebook)
+            codebook_logits_rescored = codebook_logits.clone()
+            codebook_logits_rescored[indices_to_remove] = float('-inf')
+            codebook_probs = torch.softmax(codebook_logits / temperature, dim=-1) # (B, num_tokens_per_codebook)
+            codebook_preds = torch.multinomial(codebook_probs, 1) # (B, 1)
+            if use_cfg:
+                codebook_preds[actual_batch_size:] = codebook_preds[:actual_batch_size]
+            all_preds.append(codebook_preds)
+            next_local_transformer_input = self.audio_embeddings[codebook_num](codebook_preds.squeeze(-1)).unsqueeze(1) # (B, 1, 128)
+            next_local_transformer_input = self.local_transformer_in_projection(next_local_transformer_input) # (B, 1, 128)
+            local_transformer_input = torch.cat([local_transformer_input, next_local_transformer_input], dim=1) # (B, T+1, 128)
+
+        all_preds = torch.cat(all_preds, dim=1).long() # (B, num_codebooks)
+        if use_cfg:
+            all_preds = all_preds[:actual_batch_size]
+
         return all_preds
 
     def all_logits_to_each_codebooks_logits(self, logits):
