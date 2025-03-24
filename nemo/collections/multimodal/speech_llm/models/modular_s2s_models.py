@@ -1267,6 +1267,10 @@ class S2sModularAudioGPTModel(ModularAudioGPTModel):
                             if self.cfg.get('norm_val_metrics', False):
                                 pred = normalize_text(pred)
                                 label = normalize_text(label)
+
+                            # when the user interrupts the model, the speech channel has much less information because text channel are 2x shorten than speech
+                            # so we need to cut the text pred channel to match the speech channel
+                            label = label[:len(pred)]
                             _ = metric_fn(pred, label)
 
                         metric_result = metric_fn.compute()

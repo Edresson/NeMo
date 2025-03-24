@@ -202,7 +202,6 @@ class SpeechDecoder(NeuralModule):
                     self.cache["input_text_tokens"] = torch.cat([self.cache["input_text_tokens"], input_text_tokens], dim=1)
                     input_text_tokens = self.cache["input_text_tokens"]
 
-
         if self.detach_input:
             hidden_states = hidden_states.detach()
 
@@ -271,20 +270,19 @@ class SpeechDecoder(NeuralModule):
 
         return all_codebook_logits, all_code_logits
 
-    def sample_codes_from_logits(self, all_code_logits_t, temperature=0.7, topk=80):
+    def sample_codes_from_logits(self, all_code_logits_t, temperature=0.7, topk=80, greedy=True):
         # all_code_logits_t: (B, num_codebooks * num_tokens_per_codebook), logits at a given timestep
         all_preds = []
         for idx in range(self.num_audio_codebooks):
             si = idx * self.num_audio_tokens_per_codebook
             ei = si + self.num_audio_tokens_per_codebook
             codebook_logits = all_code_logits_t[:, si:ei] # (B, num_tokens_per_codebook)
-            codebook_logits_topk = torch.topk(codebook_logits, topk, dim=-1)[0] # (B, topk)
-            indices_to_remove = codebook_logits < codebook_logits_topk[:, -1].unsqueeze(-1) # (B, num_tokens_per_codebook)
-            codebook_logits_rescored = codebook_logits.clone()
-            codebook_logits_rescored[indices_to_remove] = float('-inf')
-
-            codebook_probs = torch.softmax(codebook_logits / temperature, dim=-1) # (B, num_tokens_per_codebook)
-            codebook_preds = torch.multinomial(codebook_probs, 1) # (B, 1)
+            if greedy:
+                codebook_preds = torch.argmax(codebook_logits, dim=-1).view(-1).unsqueeze(1).contiguous()
+            else:
+                codebook_logits_topk = torch.topk(codebook_logits, topk, dim=-1)[0] # (B, topk)
+                codebook_probs = torch.softmax(codebook_logits / temperature, dim=-1) # (B, num_tokens_per_codebook)
+                codebook_preds = torch.multinomial(codebook_probs, 1) # (B, 1)
             all_preds.append(codebook_preds)
         all_preds = torch.cat(all_preds, dim=1).long() # (B, num_codebooks)
         return all_preds
@@ -1336,6 +1334,10 @@ class S2sModularAudioGPTModelSpeechDecoder(ModularAudioGPTModel):
                             if self.cfg.get('norm_val_metrics', False):
                                 pred = normalize_text(pred)
                                 label = normalize_text(label)
+                            
+                            # when the user interrupts the model, the speech channel has much less information because text channel are 2x shorten than speech
+                            # so we need to cut the text pred channel to match the speech channel
+                            label = label[:len(pred)]
                             _ = metric_fn(pred, label)
 
                         metric_result = metric_fn.compute()
