@@ -146,9 +146,15 @@ class SpeechDecoder(NeuralModule):
         self.cond_on_prev_audio_tokens = self.speech_decoder_parms.pop("cond_on_prev_audio_tokens", False)
         self.detach_input = self.speech_decoder_parms.pop("detach_input", False)
         self.cond_on_text_tokens = self.speech_decoder_parms.pop("cond_on_text_tokens", False)
+        self.cond_on_llm_latent = self.speech_decoder_parms.pop("cond_on_llm_latent", True)
+
+        if not self.cond_on_llm_latent and not self.cond_on_text_tokens:
+            raise ValueError(
+                "At least one of 'cond_on_text_tokens' or 'cond_on_llm_latent' must be True for the Speech Decoder."
+            )
 
         # projection to adapt llm embeddings into the same shape of speech decoder expected input
-        if lantent_dim != self.speech_decoder_parms["d_model"]:
+        if self.cond_on_llm_latent and lantent_dim != self.speech_decoder_parms["d_model"]:
             self.input_proj = nn.Linear(lantent_dim, self.speech_decoder_parms["d_model"])
         else:
             self.input_proj = None
@@ -169,7 +175,9 @@ class SpeechDecoder(NeuralModule):
 
         if self.cond_on_text_tokens:
             self.text_embeddings = nn.Embedding(llm_vocab_size, self.speech_decoder_parms["d_model"])
-            self.text_input_projection = nn.Linear(self.speech_decoder_parms["d_model"], self.speech_decoder_parms["d_model"])
+            # if cond on llm latent create the projection to sum the embeddings
+            if self.cond_on_llm_latent:
+                self.text_input_projection = nn.Linear(self.speech_decoder_parms["d_model"], self.speech_decoder_parms["d_model"])
 
     def forward(self, hidden_states, speech_mask, input_audio_tokens=None, input_text_tokens=None, temperature=0.7, topk=80, greedy=True):
         # Megatron LLM parallel training returns T, B, F so reshape it
@@ -218,8 +226,12 @@ class SpeechDecoder(NeuralModule):
         # if cond on text tokens, sum text tokens with the llm latent
         if self.cond_on_text_tokens and input_text_tokens is not None:
             text_tokens_embedded = self.text_embeddings(input_text_tokens)
-            speech_decoder_input = self.text_input_projection(speech_decoder_input)
-            speech_decoder_input = speech_decoder_input + text_tokens_embedded
+            # if cond_on_llm_latent use a projection to sum the embeddings
+            if self.cond_on_llm_latent:
+                speech_decoder_input = self.text_input_projection(speech_decoder_input)
+                speech_decoder_input = speech_decoder_input + text_tokens_embedded
+            else:
+                speech_decoder_input = text_tokens_embedded
 
         if self.cfg_unconditional_prob:
             if self.training:
