@@ -171,7 +171,7 @@ class SpeechDecoder(NeuralModule):
             self.text_embeddings = nn.Embedding(llm_vocab_size, self.speech_decoder_parms["d_model"])
             self.text_input_projection = nn.Linear(self.speech_decoder_parms["d_model"], self.speech_decoder_parms["d_model"])
 
-    def forward(self, hidden_states, speech_mask, input_audio_tokens=None, input_text_tokens=None, return_raw_logits=False):
+    def forward(self, hidden_states, speech_mask, input_audio_tokens=None, input_text_tokens=None, temperature=0.7, topk=80, greedy=True):
         # Megatron LLM parallel training returns T, B, F so reshape it
         # T, B, F = hidden_states.size()
         hidden_states = hidden_states.transpose(0, 1).contiguous() # .reshape(B, T, F) # from [T, B, F] to [B, T, F]
@@ -262,13 +262,16 @@ class SpeechDecoder(NeuralModule):
             uncond_logits = all_code_logits[batch_size:]
             all_code_logits = (1 - self.cfg_scale) * uncond_logits + self.cfg_scale * cond_logits
 
-        if return_raw_logits:
-            return all_code_logits
-
         # convert the logits from the single projection to a list with logits separated by codebook
         all_codebook_logits = self.all_logits_to_each_codebooks_logits(all_code_logits)
 
-        return all_codebook_logits, all_code_logits
+        # sample for inference
+        if self.use_input_cache and not self.training:
+           sampled_audio_tokens = self.sample_codes_from_logits(all_code_logits, temperature=temperature, topk=topk, greedy=greedy)
+        else:
+            sampled_audio_tokens = None
+
+        return all_codebook_logits, sampled_audio_tokens
 
     def sample_codes_from_logits(self, all_code_logits_t, temperature=0.7, topk=80, greedy=True):
         # all_code_logits_t: (B, num_codebooks * num_tokens_per_codebook), logits at a given timestep
@@ -276,15 +279,17 @@ class SpeechDecoder(NeuralModule):
         for idx in range(self.num_audio_codebooks):
             si = idx * self.num_audio_tokens_per_codebook
             ei = si + self.num_audio_tokens_per_codebook
-            codebook_logits = all_code_logits_t[:, si:ei] # (B, num_tokens_per_codebook)
+            codebook_logits = all_code_logits_t[:, :, si:ei] # (B, num_tokens_per_codebook)
+            B, T = codebook_logits.size(0), codebook_logits.size(1)
             if greedy:
-                codebook_preds = torch.argmax(codebook_logits, dim=-1).view(-1).unsqueeze(1).contiguous()
+                codebook_preds = torch.argmax(codebook_logits, dim=-1)
             else:
                 codebook_logits_topk = torch.topk(codebook_logits, topk, dim=-1)[0] # (B, topk)
                 codebook_probs = torch.softmax(codebook_logits / temperature, dim=-1) # (B, num_tokens_per_codebook)
                 codebook_preds = torch.multinomial(codebook_probs, 1) # (B, 1)
-            all_preds.append(codebook_preds)
-        all_preds = torch.cat(all_preds, dim=1).long() # (B, num_codebooks)
+            all_preds.append(codebook_preds.view(B, T).contiguous().long()) # T, B to be compatible with megatron
+
+        # all_preds = torch.cat(all_preds, dim=-1).long() # (B, num_codebooks)
         return all_preds
 
     def all_logits_to_each_codebooks_logits(self, logits):
@@ -293,7 +298,6 @@ class SpeechDecoder(NeuralModule):
             si = idx * self.num_audio_tokens_per_codebook
             ei = si + self.num_audio_tokens_per_codebook
             codebook_logits = logits[:, :, si:ei] # (B, num_tokens_per_codebook)
-            # B, T, F = codebook_logits.size()
             codebook_logits = codebook_logits.transpose(0, 1).contiguous() # .reshape(T, B, F) # transpose for compatibility with megatron format
             all_codebook_logits.append(codebook_logits)
         return all_codebook_logits
@@ -394,6 +398,7 @@ class S2sMCoreGPTModelSpeechDecoder(MCoreGPTModel):
         speech_mask: Tensor = None,
         input_audio_tokens: Tensor = None,
         input_text_tokens: Tensor = None,
+        inference_config: dict = None,
     ) -> Tensor:
         """Forward function of the GPT Model This function passes the input tensors
         through the embedding layer, and then the decoeder and finally into the post
@@ -454,23 +459,48 @@ class S2sMCoreGPTModelSpeechDecoder(MCoreGPTModel):
             loss = self.compute_language_model_loss(labels, logits)
 
             return loss
-        
+
         else:
             # if speech batch
-            # generate speech logits
-            audio_logits, audio_logits_tensor = self.speech_decoder(hidden_states, speech_mask, input_audio_tokens=input_audio_tokens, input_text_tokens=input_text_tokens)
-
             # generate text logits
             text_logits, _ = self.output_layer(
                 hidden_states, weight=output_weight[: self.vocab_size] if output_weight is not None else None
             )
-            # create all logits by adding text_logits in 0 position and adding the audio logits list in the end
-            all_logits = [text_logits] + audio_logits
+
+            # ToDo: avoid double sampling
+            # ToDo: implement repetition_penalty and top_p
+            # get inference config
+            greedy = inference_config.get('greedy', True)
+            greedy_on_text = inference_config.get('greedy_on_text', False)
+            topk = inference_config.get('top_k', 80)
+            temperature = inference_config.get('temperature', 0.7)
+
+            # sample text logits to get input_text_tokens in inference time
+            if self.speech_decoder.use_input_cache and not self.training:
+                B, T = text_logits.size(1), text_logits.size(0)
+                if greedy_on_text or greedy:
+                    input_text_tokens = torch.argmax(text_logits, dim=-1).view(B, T).contiguous()
+                else:
+                    logits_topk = torch.topk(text_logits, topk, dim=-1)[0] # (B, topk)
+                    probs = torch.softmax(logits_topk / temperature, dim=-1) # (B, num_tokens_per_codebook)
+                    input_text_tokens = torch.multinomial(probs, 1) # (B, 1)
+
+                input_text_tokens = input_text_tokens.long()
+
+            # generate speech logits
+            audio_logits, sampled_audio_tokens = self.speech_decoder(hidden_states, speech_mask, input_audio_tokens=input_audio_tokens, input_text_tokens=input_text_tokens, temperature=temperature, topk=topk, greedy=greedy)
 
             if labels is None:
+                all_logits = [text_logits] + audio_logits
                 # [s b h] => [b s h]
                 return_logits = [logits.transpose(0, 1).contiguous() for logits in all_logits]
                 return torch.cat(return_logits, dim=-1)  # cat the last dim together to make other mcore code happy
+                # print(input_text_tokens.shape, sampled_audio_tokens[0].shape)
+                # return_out = torch.cat([input_text_tokens] + sampled_audio_tokens, dim=-1)
+                # return return_out
+            else:
+                # create all logits by adding text_logits in 0 position and adding the audio logits list in the end
+                all_logits = [text_logits] + audio_logits
 
             # compute loss
             tokens_loss = torch.stack(
@@ -760,6 +790,7 @@ class S2sModularAudioGPTModelSpeechDecoder(ModularAudioGPTModel):
                 decoder_input=input_embeddings,
                 attention_mask=attention_mask,
                 input_audio_tokens=audiotokens2use,
+                inference_config=self.get_inference_config() if not self.training else {},
                 **extra_arg,
             )
 
@@ -1980,6 +2011,7 @@ class S2sModularAudioGPTModelSpeechDecoder(ModularAudioGPTModel):
                 speech_mask=speech_mask,
                 input_audio_tokens=input_audio_tokens,
                 input_text_tokens=input_text_tokens,
+                inference_config=self.get_inference_config(),
             )
         else:
             output = self.model(
@@ -1992,6 +2024,7 @@ class S2sModularAudioGPTModelSpeechDecoder(ModularAudioGPTModel):
                 speech_mask=speech_mask,
                 input_audio_tokens=input_audio_tokens,
                 input_text_tokens=input_text_tokens,
+                inference_config=self.get_inference_config() if not self.training else {},
             )
         return output
 

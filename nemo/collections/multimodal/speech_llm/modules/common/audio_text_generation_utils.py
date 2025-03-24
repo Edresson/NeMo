@@ -794,6 +794,9 @@ def s2s_sample_sequence_batch(
                 # started indicates whether the current token step passes the context_length, so we make sure not to overwrite the context tokens
                 started = audio_text_context_lengths <= context_length
 
+                # if model.__class__.__name__ ==  "S2sModularAudioGPTModelSpeechDecoder": # uses __class__.__name__ to avoid circular import 
+                #     prev = logits
+                # else:
                 # sample prev for each channel and concat them together as [b, c]
                 def get_prev(logits, started, temperature, extra):
                     if extra.get('greedy', False):
@@ -820,6 +823,7 @@ def s2s_sample_sequence_batch(
                     prev[0] = get_prev(
                         logits[0], started, temperature, {'greedy': True}
                     )  # allow greedy on text and sampling on speech
+                
                 prev = torch.stack(prev, dim=1)
                 started_expand = started.unsqueeze(1).expand(-1, prev.size(1))
                 new_tokens = switch(tokens[:, context_length], prev, started_expand)
