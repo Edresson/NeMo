@@ -316,12 +316,15 @@ class AudioToAudioGenerationStrategy(AudioToTextGenerationStrategy):
         curr_context_length: int,
         compute_attention_mask: bool,
     ) -> Tuple[List[torch.Tensor], List[int]]:
+        encoded = None
         if step == 0:
             # reset kv cache
             set_inference_key_value_memory = True
             tokens2use = tokens[:, :curr_context_length]
             positions2use = self.position_ids[:, :curr_context_length]
             embeddings2use = input_embeddings[:curr_context_length]
+            encoded = self.encoded[:, :curr_context_length].view(micro_batch_size, 1, -1)
+
             # create a dummy tensor with unk id that is used during the training for pad the first step
             if getattr(self.model.cfg, 'speech_delay', False):
                 # input_embeddings.size(1) because embeddings2use initially is T, B, F and audiotokens2use need to be B, T, F
@@ -358,7 +361,7 @@ class AudioToAudioGenerationStrategy(AudioToTextGenerationStrategy):
             [set_inference_key_value_memory] * micro_batch_size, device=torch.cuda.current_device()
         )
         len_array = torch.tensor([maxlen] * micro_batch_size, device=torch.cuda.current_device())
-        batch = [tokens2use, audiotokens2use, embeddings2use, self.attention_mask, positions2use, setkey_value_array, len_array]
+        batch = [tokens2use, audiotokens2use, encoded, embeddings2use, self.attention_mask, positions2use, setkey_value_array, len_array]
         tensor_shape = [tokens2use.shape[1], micro_batch_size, self.model.cfg.hidden_size]
         return batch, tensor_shape
 

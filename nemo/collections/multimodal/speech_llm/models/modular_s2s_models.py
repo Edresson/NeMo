@@ -760,6 +760,7 @@ class S2sModularAudioGPTModel(ModularAudioGPTModel):
             (
                 tokens,
                 _, # ignore audiotokens2use
+                _, # ignore speech_encoder_emb
                 input_embeddings,
                 attention_mask,
                 position_ids,
