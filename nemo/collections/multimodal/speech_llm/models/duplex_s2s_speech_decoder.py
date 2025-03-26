@@ -148,6 +148,7 @@ class SpeechDecoder(NeuralModule):
         self.cond_on_text_tokens = self.speech_decoder_parms.pop("cond_on_text_tokens", False)
         self.cond_on_llm_latent = self.speech_decoder_parms.pop("cond_on_llm_latent", True)
         self.cond_on_speech_encoder_emb = self.speech_decoder_parms.pop("cond_on_speech_encoder_emb", False)
+        self.use_llm_text_emb = self.speech_decoder_parms.pop("use_llm_text_emb", False)
 
         if not self.cond_on_llm_latent and not self.cond_on_text_tokens:
             raise ValueError(
@@ -175,7 +176,11 @@ class SpeechDecoder(NeuralModule):
             self.audio_embeddings = nn.ModuleList(audio_embeddings)
 
         if self.cond_on_text_tokens:
-            self.text_embeddings = nn.Embedding(llm_vocab_size, self.speech_decoder_parms["d_model"])
+            if self.use_llm_text_emb:
+                self.text_emb_projection = nn.Linear(lantent_dim, self.speech_decoder_parms["d_model"])
+            else:
+                self.text_embeddings = nn.Embedding(llm_vocab_size, self.speech_decoder_parms["d_model"])
+
             # if cond on llm latent create the projection to sum the embeddings
             if self.cond_on_llm_latent:
                 self.text_input_projection = nn.Linear(self.speech_decoder_parms["d_model"], self.speech_decoder_parms["d_model"])
@@ -183,7 +188,7 @@ class SpeechDecoder(NeuralModule):
         if self.cond_on_speech_encoder_emb:
             self.speech_encoder_emb_projection = nn.Linear(lantent_dim, self.speech_decoder_parms["d_model"])
 
-    def forward(self, hidden_states, speech_mask, input_audio_tokens=None, input_text_tokens=None, speech_encoder_emb=None, temperature=0.7, topk=80, greedy=True):
+    def forward(self, hidden_states, speech_mask, input_audio_tokens=None, input_text=None, speech_encoder_emb=None, temperature=0.7, topk=80, greedy=True):
         # Megatron LLM parallel training returns T, B, F so reshape it
         # T, B, F = hidden_states.size()
         hidden_states = hidden_states.transpose(0, 1).contiguous() # .reshape(B, T, F) # from [T, B, F] to [B, T, F]
@@ -207,12 +212,12 @@ class SpeechDecoder(NeuralModule):
                 self.cache["input_audio_tokens"] = torch.cat([self.cache["input_audio_tokens"], input_audio_tokens], dim=1)
                 input_audio_tokens = self.cache["input_audio_tokens"]
 
-            if self.cache["input_text_tokens"] is None:
-                self.cache["input_text_tokens"] = input_text_tokens
+            if self.cache["input_text"] is None:
+                self.cache["input_text"] = input_text
             else:
-                if input_text_tokens is not None:
-                    self.cache["input_text_tokens"] = torch.cat([self.cache["input_text_tokens"], input_text_tokens], dim=1)
-                    input_text_tokens = self.cache["input_text_tokens"]
+                if input_text is not None:
+                    self.cache["input_text"] = torch.cat([self.cache["input_text"], input_text], dim=1)
+                    input_text = self.cache["input_text"]
 
             if self.cache["speech_encoder_emb"] is None:
                 self.cache["speech_encoder_emb"] = speech_encoder_emb
@@ -235,8 +240,12 @@ class SpeechDecoder(NeuralModule):
             speech_mask = torch.ones((speech_decoder_input.size(0), speech_decoder_input.size(1))).to(speech_decoder_input.device)
 
         # if cond on text tokens, sum text tokens with the llm latent
-        if self.cond_on_text_tokens and input_text_tokens is not None:
-            text_tokens_embedded = self.text_embeddings(input_text_tokens)
+        if self.cond_on_text_tokens and input_text is not None:
+            if self.use_llm_text_emb:
+                text_tokens_embedded = self.text_emb_projection(input_text)
+            else:
+                text_tokens_embedded = self.text_embeddings(input_text)
+
             # if cond_on_llm_latent use a projection to sum the embeddings
             if self.cond_on_llm_latent:
                 speech_decoder_input = self.text_input_projection(speech_decoder_input)
@@ -357,7 +366,7 @@ class SpeechDecoder(NeuralModule):
             'hidden_states': None,
             'speech_mask': None,
             'input_audio_tokens': None,
-            'input_text_tokens': None,
+            'input_text': None,
             'speech_encoder_emb': None,
         }
 
@@ -516,8 +525,11 @@ class S2sMCoreGPTModelSpeechDecoder(MCoreGPTModel):
 
                 input_text_tokens = input_text_tokens.long()
 
+            if self.speech_decoder.use_llm_text_emb:
+                input_text_tokens = self.embedding.word_embeddings(input_text_tokens)
+
             # generate speech logits
-            audio_logits, sampled_audio_tokens = self.speech_decoder(hidden_states, speech_mask, input_audio_tokens=input_audio_tokens, input_text_tokens=input_text_tokens, speech_encoder_emb=speech_encoder_emb, temperature=temperature, topk=topk, greedy=greedy)
+            audio_logits, sampled_audio_tokens = self.speech_decoder(hidden_states, speech_mask, input_audio_tokens=input_audio_tokens, input_text=input_text_tokens, speech_encoder_emb=speech_encoder_emb, temperature=temperature, topk=topk, greedy=greedy)
 
             if labels is None:
                 all_logits = [text_logits] + audio_logits
@@ -1781,6 +1793,7 @@ class S2sModularAudioGPTModelSpeechDecoder(ModularAudioGPTModel):
             base_module.language_model.embedding if hasattr(base_module, 'language_model') else base_module.embedding
         )
         input_embeds = lm_embedding.word_embeddings(input_ids)
+
         # merge with encoded
         encoder_input = input_embeds + encoded * self.cfg.get("duplex_user_channel_weight", 0.3)
         scale_loss_mask_by = self.cfg.get("scale_loss_mask_by", None)
