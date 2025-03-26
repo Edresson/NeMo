@@ -581,3 +581,89 @@ class AudioTokenLoss(Loss):
 
         loss /= self.num_codebooks
         return loss
+
+
+class MMDLoss(Loss):
+    """
+    Maximum mean discrepancy (MMD) loss, as defined in https://arxiv.org/abs/2406.02315
+    Args:
+        num_codebooks: Number of codebooks.
+        codebok_dim: Dimension of a single codebook code.
+        kernel_radii: List of radii for Gaussian kernels
+        loss_scale: Scaling factor to apply to output loss. The default value 0.01 scales the loss to be on the same
+            order of magnitude as other training losses.
+    """
+
+    def __init__(self, num_codebooks, codebook_dim, kernel_radii=(0.1, 1, 5, 10, 20, 50), loss_scale=0.01):
+        super().__init__()
+        self.num_codebooks = num_codebooks
+        self.codebook_dim = codebook_dim
+        self.kernel_radii = kernel_radii
+        self.loss_scale = loss_scale
+
+    @staticmethod
+    def _exp_kernel(dxx, r):
+        return torch.exp((-0.5 / r) * dxx).sum()
+
+    @staticmethod
+    def _shuffle_codebooks(x):
+        N, K, _ = x.size()
+        x_shuffled = torch.zeros_like(x)
+        for k in range(K):
+            batch_perm = torch.randperm(N, device=x.device)
+            x_shuffled[:, k, :] = x[batch_perm, k, :]
+        return x_shuffled
+
+    @property
+    def input_types(self):
+        return {
+            "codes": [NeuralType(('B', 'D', 'T'), VoidType())],
+        }
+
+    @property
+    def output_types(self):
+        return {
+            "loss": NeuralType(elements_type=LossType())
+        }
+
+    @typecheck()
+    def forward(self, codes):
+        B, D, T = codes.size()
+        N = B * T
+
+        # [B, K, C, T]
+        x = codes.reshape(B, self.num_codebooks, self.codebook_dim, T)
+        # [N, K, C]
+        x = rearrange(x, 'B K C T -> (B T) K C')
+        x_mean = x.mean(dim=(0,), keepdim=True)
+        x_stdev = torch.sqrt(x.var(dim=(0,), keepdim=True) + 1e-8)
+        x = (x - x_mean) / x_stdev
+        y = self._shuffle_codebooks(x)
+
+        # [N, D]
+        x = x.reshape([N, D])
+        y = y.reshape([N, D])
+
+        # [N, N]
+        xx = torch.mm(x, x.t())
+        yy = torch.mm(y, y.t())
+        zz = torch.mm(x, y.t())
+
+        rx = xx.diag().unsqueeze(0).expand_as(xx)
+        ry = yy.diag().unsqueeze(0).expand_as(yy)
+
+        dxx = rx.t() + rx - 2.0 * xx
+        dyy = ry.t() + ry - 2.0 * yy
+        dxy = rx.t() + ry - 2.0 * zz
+
+        loss = 0.0
+        coeff = -2.0 / B**2
+        denom = B * (B - 1)
+        for r in self.kernel_radii:
+            loss += (torch.utils.checkpoint.checkpoint(self._exp_kernel, dxx, r) - B) / denom
+            loss += coeff * torch.utils.checkpoint.checkpoint(self._exp_kernel, dxy, r)
+            loss += (torch.utils.checkpoint.checkpoint(self._exp_kernel, dyy, r) - B) / denom
+
+        loss = loss.clamp(min=0)
+        loss = self.loss_scale * loss
+        return loss
