@@ -417,40 +417,41 @@ class ResNetSpeakerEncoder(NeuralModule):
         Shapes:
             - x: :math:`(N, 1, T_{in})` or :math:`(N, D_{spec}, T_{in})`
         """
-        x.squeeze_(1)
-        # if you torch spec compute it otherwise use the mel spec computed by the AP
-        if self.use_torch_spec:
-            x = self.torch_spec(x)
+        with default_precision(torch.float32):
+            x.squeeze_(1)
+            # if you torch spec compute it otherwise use the mel spec computed by the AP
+            if self.use_torch_spec:
+                x = self.torch_spec(x)
 
-        if self.log_input:
-            x = (x + 1e-6).log()
-        x = self.instancenorm(x).unsqueeze(1)
+            if self.log_input:
+                x = (x + 1e-6).log()
+            x = self.instancenorm(x).unsqueeze(1)
 
-        x = self.conv1(x)
-        x = self.relu(x)
-        x = self.bn1(x)
+            x = self.conv1(x)
+            x = self.relu(x)
+            x = self.bn1(x)
 
-        x = self.layer1(x)
-        x = self.layer2(x)
-        x = self.layer3(x)
-        x = self.layer4(x)
+            x = self.layer1(x)
+            x = self.layer2(x)
+            x = self.layer3(x)
+            x = self.layer4(x)
 
-        x = x.reshape(x.size()[0], -1, x.size()[-1])
+            x = x.reshape(x.size()[0], -1, x.size()[-1])
 
-        w = self.attention(x)
+            w = self.attention(x)
 
-        if self.encoder_type == "SAP":
-            x = torch.sum(x * w, dim=2)
-        elif self.encoder_type == "ASP":
-            mu = torch.sum(x * w, dim=2)
-            sg = torch.sqrt((torch.sum((x**2) * w, dim=2) - mu**2).clamp(min=1e-5))
-            x = torch.cat((mu, sg), 1)
+            if self.encoder_type == "SAP":
+                x = torch.sum(x * w, dim=2)
+            elif self.encoder_type == "ASP":
+                mu = torch.sum(x * w, dim=2)
+                sg = torch.sqrt((torch.sum((x**2) * w, dim=2) - mu**2).clamp(min=1e-5))
+                x = torch.cat((mu, sg), 1)
 
-        x = x.view(x.size()[0], -1)
-        x = self.fc(x)
+            x = x.view(x.size()[0], -1)
+            x = self.fc(x)
 
-        if l2_norm:
-            x = torch.nn.functional.normalize(x, p=2, dim=1)
+            if l2_norm:
+                x = torch.nn.functional.normalize(x, p=2, dim=1)
         return x
 
     def get_torch_mel_spectrogram_class(self, audio_config):

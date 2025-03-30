@@ -415,6 +415,8 @@ class LhotseAudioQuestionAnswerDataset(torch.utils.data.Dataset):
         skipped = 0
         new_target_texts = []
         new_source_texts = []
+        answer_audios_first_turn = []
+        answer_audios_first_turn_lens = []
         for i in range(len(num_turns)):
             each_target_texts = []
             total_steps = (
@@ -456,6 +458,16 @@ class LhotseAudioQuestionAnswerDataset(torch.utils.data.Dataset):
                 cur_target_text[text_start_step] = self.text_processor.bos_id
                 cur_source_text[text_start_step] = self.text_processor.bos_id
 
+                # if first turn
+                if j == 0:
+                    audio_start_step = int(text_start_time[i][j]*self.codec_sample_rate) # multiply by sampling rate to convert seconds in frames
+                    audio_end_step = int(text_end_time[i][j]*self.codec_sample_rate)# multiply by sampling rate to convert seconds in frames
+                    answer_audio_first_turn = answer_audios[i][audio_start_step:audio_end_step].unsqueeze(0)
+                    answer_audios_first_turn.append(answer_audio_first_turn)
+                    answer_audio_len = torch.tensor(answer_audio_first_turn.shape[1]).long()
+                    answer_audios_first_turn_lens.append(answer_audio_len)
+                    
+
                 if getattr(cut, "s2s_duplex", False):
                     # Note: text can be truncated
                     text_len = min(text_end_step - text_start_step - 1, target_texts[cnt].shape[0])
@@ -493,6 +505,9 @@ class LhotseAudioQuestionAnswerDataset(torch.utils.data.Dataset):
         target_texts_merge, target_text_lengths = collate_and_pad(new_target_texts)
         source_texts_merge, source_text_lengths = collate_and_pad(new_source_texts)
 
+        answer_audios_first_turn = collate_vectors([a.squeeze(0) for a in answer_audios_first_turn], max_length=max(answer_audios_first_turn_lens), padding_value=0.0)
+        answer_audios_first_turn_lens = torch.tensor(answer_audios_first_turn_lens).long()
+
         assert cnt + skipped == len(target_texts)
         assert target_texts_merge.shape[0] == len(num_turns)
         assert cnt + skipped + skipped_source == len(source_texts)
@@ -520,6 +535,8 @@ class LhotseAudioQuestionAnswerDataset(torch.utils.data.Dataset):
             "answer_audio_lens": answer_audio_lens,
             "num_turns": torch.Tensor(num_turns).long(),
             "speaker_ids": self.get_speaker_id(cuts),
+            "answer_audios_first_turn": answer_audios_first_turn,
+            "answer_audios_first_turn_lens": answer_audios_first_turn_lens,
         }
 
         if hasattr(cut, "include_sys"):  # assume no within batch mixing
@@ -653,6 +670,8 @@ class LhotseAudioQuestionAnswerDataset(torch.utils.data.Dataset):
         num_turns = []
         new_target_texts = []
         new_source_texts = []
+        answer_audios_first_turn = []
+        answer_audios_first_turn_lens = []
         for id, cut in enumerate(cuts):
 
             def validate_time(input_time):
@@ -712,13 +731,34 @@ class LhotseAudioQuestionAnswerDataset(torch.utils.data.Dataset):
                     cur_target_text[text_end_step] = self.text_processor.eos_id
                 return cur_target_text
 
+            def get_answer_audio_first_turn_from_segments(segments, answer_audios, id):
+                # consider first segment
+                segment = segments[0]
+                text_start_time = validate_time(segment['start'])
+                text_end_time = validate_time(segment['end'])
+                audio_start_step = int(validate_time(segment['start'])*self.codec_sample_rate) # multiply by sampling rate to convert seconds in frames
+                audio_end_step = int(validate_time(segment['end'])*self.codec_sample_rate)# multiply by sampling rate to convert seconds in frames
+                answer_audio_first_turn = answer_audios[id][audio_start_step:audio_end_step].unsqueeze(0)
+                answer_audio_len = torch.tensor(answer_audio_first_turn.shape[1]).long()
+                return answer_audio_first_turn, answer_audio_len
+
             cur_target_text = get_text_from_segments(cut.agent_segments, total_steps)
             cur_source_text = get_text_from_segments(cut.user_segments, total_steps)
+
             new_target_texts.append(cur_target_text)
             new_source_texts.append(cur_source_text)
 
+            # get first turn answer audio
+            answer_audio_first_turn, answer_audio_first_turn_len = get_answer_audio_first_turn_from_segments(cut.agent_segments, answer_audios, id)
+            answer_audios_first_turn.append(answer_audio_first_turn)
+            answer_audios_first_turn_lens.append(answer_audio_first_turn_len)
+
         target_texts_merge, target_text_lengths = collate_and_pad(new_target_texts)
         source_texts_merge, source_text_lengths = collate_and_pad(new_source_texts)
+
+        answer_audios_first_turn = collate_vectors([a.squeeze(0) for a in answer_audios_first_turn], max_length=max(answer_audios_first_turn_lens), padding_value=0.0)
+        answer_audios_first_turn_lens = torch.tensor(answer_audios_first_turn_lens).long()
+
         assert target_texts_merge.shape[0] == len(num_turns)
 
         # note: the codec id in labels and contexts and others do not consider the offset e.g. speech_eos is 1002
@@ -744,6 +784,8 @@ class LhotseAudioQuestionAnswerDataset(torch.utils.data.Dataset):
             "num_turns": torch.Tensor(num_turns).long(),
             "s2s_duplex_overlap": torch.ones_like(target_text_lengths),
             "speaker_ids": self.get_speaker_id(cuts),
+            "answer_audios_first_turn": answer_audios_first_turn,
+            "answer_audios_first_turn_lens": answer_audios_first_turn_lens,
         }
 
         return return_batch
