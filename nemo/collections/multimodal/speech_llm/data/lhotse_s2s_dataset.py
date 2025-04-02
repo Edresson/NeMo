@@ -1,6 +1,7 @@
 import math
 import random
 import re
+import torchaudio
 
 import numpy as np
 import torch.utils.data
@@ -790,6 +791,185 @@ class LhotseAudioQuestionAnswerDataset(torch.utils.data.Dataset):
 
         return return_batch
 
+    def __getitem__tts_(self, cuts) -> dict[str, torch.Tensor | list[str] | dict]:
+        import re
+
+        def get_3d_empty_tensor(batch_size, length, text_fill_id, speech_fill_id):
+            return torch.cat(
+                [
+                    torch.full((batch_size, length, 1), text_fill_id),
+                    torch.full(
+                        (batch_size, length, self.n_speech_codebooks * self.decoder_reduction_factor), speech_fill_id
+                    ),
+                ],
+                axis=2,
+            )
+
+        def collate_and_pad(inputs):
+            token_lengths = [len(seq) for seq in inputs]
+            max_length = max(token_lengths)
+            assert len(inputs[0].shape) < 3
+            if len(inputs[0].shape) < 2:
+                if self.pad_to_max_length:
+                    max_length = self.max_seq_length
+                else:
+                    max_length = min(self.max_seq_length, ceil_to_nearest(max_length, 8))
+
+                tokens = collate_vectors(inputs, max_length=max_length, padding_value=text_pad_id)
+            else:
+                tokens = get_3d_empty_tensor(len(inputs), max_length, text_pad_id, self.speech_pad_id)
+                for i in range(len(tokens)):
+                    tokens[i, : token_lengths[i], :] = inputs[i]
+            return tokens, torch.LongTensor(token_lengths)
+
+        # adapted from https://github.com/blisc/NeMo/blob/magpietts_2503/nemo/collections/tts/data/text_to_speech_dataset_lhotse.py
+        cuts = cuts.sort_by_duration()
+        answer_audios = []
+        answer_audio_lens = []
+        features_lens = []
+        target_texts = []
+        target_text_lengths = []
+        answer_audios_first_turn = []
+        answer_audios_first_turn_lens = []
+        metadata = []
+        new_target_texts = []
+        new_source_texts = []
+        num_turns = []
+        text_pad_id = self.text_processor.pad_id
+        for i, cut in enumerate(cuts):
+            # load target/answer audio
+            answer_audio = torch.FloatTensor(cut.target_audio.resample(self.codec_sample_rate).load_audio())
+            # add 2-3 tokens equivalent silence and set text_start_step and text_end_step accordently
+            random_silence_tokens_left = random.randint(2, 3)
+            random_silence_tokens_right = random.randint(2, 3)
+            r_padding = torch.zeros(1, random_silence_tokens_right * self.codec_model_downsampling_factor)
+            l_padding = torch.zeros(1, random_silence_tokens_left * self.codec_model_downsampling_factor)
+            answer_audio = torch.cat([l_padding, answer_audio, r_padding], dim=1)
+
+            answer_audio_len = torch.tensor(answer_audio.shape[1]).long()
+            answer_audios.append(answer_audio)
+            answer_audio_lens.append(answer_audio_len)
+            features_lens.append(
+                math.ceil(
+                    answer_audio_len / self.codec_model_downsampling_factor / self.decoder_reduction_factor
+                )
+            )
+
+            answer_audios_first_turn.append(answer_audio)
+            answer_audios_first_turn_lens.append(answer_audio_len)
+            metadata.append({'audio_filepath': cut.id + '.wav'})
+            num_turns.append(1) # num turns for tts data is always 1
+
+            # text_start_step is random_silence_tokens_left - 1, to include the addition of bos token and extra -1 because it start on zero
+            text_start_step = random_silence_tokens_left - 2
+            # text_end_step is total audio len divided by self.codec_model_downsampling_factor / self.decoder_reduction_factor to get frame level len minus  random_silence_tokens_right - 2
+            text_end_step = int(answer_audio_len / self.codec_model_downsampling_factor / self.decoder_reduction_factor) - (random_silence_tokens_right - 2)
+
+            total_steps = (
+                torch.ceil(
+                    answer_audio_len / self.codec_model_downsampling_factor / self.decoder_reduction_factor
+                ).int()
+                + 1
+            )
+
+            cur_target_text = torch.full(
+                [total_steps],
+                (
+                    self.text_processor.tokenizer.pad_id
+                    if hasattr(self.text_processor.tokenizer, 'pad_id')
+                    and self.text_processor.tokenizer.pad_id >= 0
+                    else self.text_processor.tokenizer.unk_id
+                ),
+            )
+            # create emptly sorce text
+            cur_source_text = torch.full(
+                [total_steps],
+                (
+                    self.text_processor.tokenizer.pad_id
+                    if hasattr(self.text_processor.tokenizer, 'pad_id')
+                    and self.text_processor.tokenizer.pad_id >= 0
+                    else self.text_processor.tokenizer.unk_id
+                ),
+            )
+
+            if cut.supervisions[1].speaker == "agent":
+                output_text = cut.supervisions[1].text
+                # Extract agent text
+                pattern = r"<\|\d+\|>"
+                output_text = re.sub(pattern, "", output_text)
+                output_text = re.sub(r'\s+', ' ', output_text).strip()
+                target_text = self.text_processor._process_example(context="", output=output_text)
+                # -1 to remove the eos token added by the text processor
+                target_text, target_text_length = torch.as_tensor(target_text["answer_ids"][:-1]), torch.as_tensor(
+                    len(target_text["answer_ids"]) - 1
+                )
+                target_texts.append(target_text)
+                target_text_lengths.append(target_text_length)
+
+                if text_end_step == total_steps:
+                    text_end_step = total_steps - 1  # boundary case
+
+                cur_target_text[text_start_step] = self.text_processor.bos_id
+                # Note: text can be truncated
+                text_len = min(text_end_step - text_start_step - 1, target_text.shape[0])
+                cur_target_text[(text_start_step + 1) : (text_start_step + 1 + text_len)] = target_text[:text_len]
+                cur_target_text[text_end_step] = self.text_processor.eos_id
+
+                # for source text the begging and end are oposite, so add eos when it was bos and eos and it was bos
+                cur_source_text[max(text_end_step-1, 0)] = self.text_processor.eos_id # -1 to make sure that both eos
+                cur_source_text[min(text_end_step+1, cur_source_text.size(0)-1)] = self.text_processor.bos_id # +1 to make sure that both eos bos are in the tensor if we use both channels
+
+                new_target_texts.append(cur_target_text)
+                new_source_texts.append(cur_source_text)
+
+        # collate and pad target texts
+        target_texts_merge, target_text_lengths = collate_and_pad(new_target_texts)
+
+        # collate and pad source dummy texts
+        source_texts_merge, source_text_lengths = collate_and_pad(new_source_texts) 
+
+        # collate_vectors answer_audios
+        answer_audios= collate_vectors([a.squeeze(0) for a in answer_audios], max_length=max(answer_audio_lens), padding_value=0.0)
+        answer_audio_lens = torch.tensor(answer_audio_lens).long()
+
+        # prepare answer_audios_first_turn that will be used for speaker conditioning
+        answer_audios_first_turn = collate_vectors([a.squeeze(0) for a in answer_audios_first_turn], max_length=max(answer_audios_first_turn_lens), padding_value=0.0)
+        answer_audios_first_turn_lens = torch.tensor(answer_audios_first_turn_lens).long()
+
+        # make features_lens a tensor
+        features_lens = torch.tensor(features_lens, dtype=torch.int)
+
+        # user audio is a zero tensor as answer_audios downsampled to 16khz
+        audio = torch.zeros(answer_audios.size(), dtype=answer_audios.dtype)#.uniform_(-0.1,0.1)
+        audio = torchaudio.functional.resample(audio, self.codec_sample_rate, self.sample_rate)
+        audio_lens = (answer_audio_lens * (self.sample_rate / self.codec_sample_rate)).long()
+
+        return_batch = {
+            "sample_ids": list(cuts.ids),
+            "audio_signal": audio, # audio signal is a zero like
+            "audio_signal_length": audio_lens,
+            "metadata": metadata,
+            # For forward
+            "instructions": None,
+            "tokens": target_texts_merge,  # used in _reconfigure_and_process_inference_batch
+            "target_texts_merge": target_texts_merge,  # used in prepare_llm_input
+            "source_texts_merge": source_texts_merge,  # used in prepare_llm_input
+            "contexts": target_texts_merge[:, :1],  # used in inference
+            "context_lengths": torch.ones_like(target_text_lengths),
+            "target_texts": target_texts_merge,
+            "target_text_lengths": target_text_lengths,
+            "source_text_lengths": source_text_lengths,
+            "answers": target_texts_merge,
+            "answer_audio": answer_audios,
+            "answer_audio_lens": answer_audio_lens,
+            "num_turns": torch.Tensor(num_turns).long(),
+            "speaker_ids": self.get_speaker_id(cuts),
+            "answer_audios_first_turn": answer_audios_first_turn,
+            "answer_audios_first_turn_lens": answer_audios_first_turn_lens,
+        }
+
+        return return_batch
+
     def __getitem__(self, cuts) -> dict[str, torch.Tensor | list[str] | dict]:
         import re
 
@@ -906,6 +1086,8 @@ class LhotseAudioQuestionAnswerDataset(torch.utils.data.Dataset):
             return self.__getitem__duplex_(cuts)
         if getattr(cuts[0], "s2s_duplex_overlap", False):
             return self.__getitem__duplex_overlap_(cuts)
+        if getattr(cuts[0], "tts", False):
+            return self.__getitem__tts_(cuts)
 
         '''
         # half-duplex single turn s2s data and multi turn s2s data go here
