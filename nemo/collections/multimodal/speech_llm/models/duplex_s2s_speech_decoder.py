@@ -944,6 +944,11 @@ class S2sModularAudioGPTModelSpeechDecoder(ModularAudioGPTModel):
         # make sure that the model is in eval mode
         self.eval()
 
+        # update speaker embedding to reflect the one in the prompt during inference
+        # ToDo: On real inference do not re-extract speaker embedding
+        if self.model.speech_decoder.inference_speaker_reference:
+            self.model.speech_decoder.update_inference_speaker_embedding(self.model.speech_decoder.inference_speaker_reference)
+
         # We need _inference_config to get generation params
         # add_BOS and tokens_to_generate are set in dataset
         if self.get_inference_config() is None:
