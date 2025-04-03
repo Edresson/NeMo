@@ -222,7 +222,7 @@ class SpeechDecoder(NeuralModule):
         audio, sr = torchaudio.load(audio_path)
         audio_len = torch.tensor([audio.size(1)]).long()
         speaker_emb = self.get_speaker_embedding(audio.to(self.device), audio_len.to(self.device), sr)
-        self.inference_speaker_embedding = speaker_emb
+        self.inference_speaker_embedding = speaker_emb.to(self.inference_speaker_embedding.dtype)
 
     def get_speaker_embedding(self, audio, audio_len, sr):
         # limit max audio len to avoid memory waste
@@ -1043,15 +1043,17 @@ class S2sModularAudioGPTModelSpeechDecoder(ModularAudioGPTModel):
             'speech_answers': [],
             'text_answers': [],
             'batch_idx': [],
+            'user_input': [],
         }
         for outputs in list_outputs:
-            for answer, pred, input, metadata, labels_text, pred_context_length in zip(
+            for answer, pred, input, metadata, labels_text, pred_context_length, user_input in zip(
                 outputs['labels'],
                 outputs['preds'],
                 outputs['inputs'],
                 outputs['metadata'],
                 outputs['labels_text'],
                 outputs['context_lengths'],
+                outputs['audio_signal'],
             ):
                 context_length = 0
                 batch_idx = outputs['batch_idx']
@@ -1089,6 +1091,7 @@ class S2sModularAudioGPTModelSpeechDecoder(ModularAudioGPTModel):
                 deduplicated_outputs['inputs'].append(input)
                 deduplicated_outputs['metadata'].append(metadata)
                 deduplicated_outputs['batch_idx'].append(batch_idx)
+                deduplicated_outputs['user_input'].append(user_input)
 
         # Compute metric score
         metric_name = self.val_metric_name if mode == 'validation' else self.test_metric_name
@@ -1120,6 +1123,14 @@ class S2sModularAudioGPTModelSpeechDecoder(ModularAudioGPTModel):
                     deduplicated_outputs['speech_answers'],
                     os.path.join(output_dir, "wav", "answer"),
                     deduplicated_outputs['metadata'],
+                )
+                # combined wavs
+                _, _ = self.decode_and_save_wavs(
+                    codec_model,
+                    deduplicated_outputs['speech_preds'],
+                    os.path.join(output_dir, "wav", "input_and_pred"),
+                    deduplicated_outputs['metadata'],
+                    deduplicated_outputs['user_input'],
                 )
 
         if run_asr:
@@ -1267,12 +1278,15 @@ class S2sModularAudioGPTModelSpeechDecoder(ModularAudioGPTModel):
             speech_tokens = torch.zeros([1, new_shape[1]]).long().cuda()
         return text_tokens.long(), speech_tokens.long()
 
-    def decode_and_save_wavs(self, codec_model, codes_list, wav_dir, metadata_list):
+    def decode_and_save_wavs(self, codec_model, codes_list, wav_dir, metadata_list, user_inputs=None):
+        if user_inputs is None:
+            user_inputs = [None for _ in metadata_list]
+
         sample_rate = self.codec_sample_rate
         os.makedirs(wav_dir, exist_ok=True)
         wavs = []
         start_end_time = []
-        for codes, metadata in zip(codes_list, metadata_list):
+        for codes, metadata, user_input in zip(codes_list, metadata_list, user_inputs):
             codes = torch.tensor(codes).to(codec_model.device).T
             codec_len = torch.Tensor([codes.shape[1]]).long().to(codec_model.device)
 
@@ -1313,13 +1327,25 @@ class S2sModularAudioGPTModelSpeechDecoder(ModularAudioGPTModel):
                 wav, _ = codec_model.decode(tokens=codes.unsqueeze(0), tokens_len=codec_len)
             wav = wav[0].float()
             wavs.append(wav)
-            sf.write(
-                os.path.join(
-                    wav_dir, re.sub("_repeat\d*", "", metadata['audio_filepath'].split('.wav')[0]) + ".gen.wav"
-                ),
-                wav.detach().cpu().numpy(),
-                sample_rate,
+
+            out_audio_path = os.path.join(
+                wav_dir, re.sub("_repeat\d*", "", metadata['audio_filepath'].split('.wav')[0]) + ".gen.wav"
             )
+            if user_input is not None:
+                # prepare user_input, making sure thart it is in the same shape of agent output
+                user_input = torchaudio.functional.resample(user_input, self.input_sample_rate, sample_rate)
+                max_len = max(len(wav), len(user_input))
+                wav_padded = torch.cat([wav, torch.zeros(max_len - len(wav)).to(wav.device)])
+                user_input_padded = torch.cat([user_input, torch.zeros(max_len - len(user_input)).to(user_input.device)])
+                # combine wavs one in each channel
+                combined_wav = torch.cat([user_input_padded.squeeze().unsqueeze(0).detach().cpu(), wav_padded.squeeze().unsqueeze(0).detach().cpu()], dim=0)
+                torchaudio.save(out_audio_path, combined_wav.squeeze(), sample_rate)
+            else:
+                sf.write(
+                    out_audio_path,
+                    wav.detach().cpu().numpy(),
+                    sample_rate,
+                )
 
         return wavs, start_end_time
 
@@ -1702,6 +1728,7 @@ class S2sModularAudioGPTModelSpeechDecoder(ModularAudioGPTModel):
         self.extract_codec_on_the_fly = cfg.get('extract_codec_on_the_fly', False)
         self.codec_model_downsampling_factor = cfg.get('codec_model_downsampling_factor', 1023.5)
         self.codec_sample_rate = cfg.data.train_ds.get("codec_sample_rate", 22050)
+        self.input_sample_rate = cfg.data.train_ds.get("sample_rate", 16000)
         self.speech_decoder_parms = cfg.get('speech_decoder_parms', None)
         super().__init__(cfg, trainer)
         if cfg.get('fixed_speaker_prompt', False):
