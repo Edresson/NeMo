@@ -267,8 +267,9 @@ model:
       shard_seed: "trng"
       sampler_fusion: randomized_round_robin
       sampler_weights:
-        duplex: 1.0
-        blackwell: 0.01
+        duplex: 0.55
+        blackwell: 0.05
+        ttsrepeat: 0.4
 
       blackwell:
         input_cfg:
@@ -280,6 +281,31 @@ model:
               s2s_duplex_overlap: True
               speaker_id: 1
 
+      ttsrepeat:
+        input_cfg:
+        - type: group
+          input_cfg:
+            - type: lhotse_shar
+              shar_path: /lustre/fsw/portfolios/llmservice/projects/llmservice_nemo_speechlm/data/TTS/tts_lhotse_datasets/hifitts_v0
+              tags:
+                tts_repeat_after_me: True
+            - type: lhotse_shar
+              shar_path: /lustre/fsw/portfolios/llmservice/projects/llmservice_nemo_speechlm/data/TTS/tts_lhotse_datasets/libri100
+              tags:
+                tts_repeat_after_me: True
+            - type: lhotse_shar
+              shar_path: /lustre/fsw/portfolios/llmservice/projects/llmservice_nemo_speechlm/data/TTS/tts_lhotse_datasets/libri100
+              tags:
+                tts_repeat_after_me: True
+            - type: lhotse_shar
+              shar_path: /lustre/fsw/portfolios/llmservice/projects/llmservice_nemo_speechlm/data/TTS/tts_lhotse_datasets/rivaLindyRodney
+              tags:
+                tts_repeat_after_me: True
+            - type: lhotse_shar
+              shar_path: /lustre/fsw/portfolios/llmservice/projects/llmservice_nemo_speechlm/data/TTS/tts_lhotse_datasets/InternalMLSEnglish17k
+              tags:
+                tts_repeat_after_me: True
+  
       duplex:
         input_cfg:
         - type: group
