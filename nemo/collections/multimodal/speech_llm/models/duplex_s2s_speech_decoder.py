@@ -239,7 +239,12 @@ class SpeechDecoder(NeuralModule):
     def forward(self, hidden_states, speech_mask, input_audio_tokens=None, input_text=None, speech_encoder_emb=None, speaker_encoder_emb=None, temperature=0.7, topk=80, greedy=True):
         # Megatron LLM parallel training returns T, B, F so reshape it
         # T, B, F = hidden_states.size()
-        hidden_states = hidden_states.transpose(0, 1).contiguous() # .reshape(B, T, F) # from [T, B, F] to [B, T, F]
+        if hidden_states is not None:
+            hidden_states = hidden_states.transpose(0, 1).contiguous() # .reshape(B, T, F) # from [T, B, F] to [B, T, F]
+    
+            if self.detach_input:
+                hidden_states = hidden_states.detach()
+
         # input cache needed due our transformer kv cache implementation expect the whole left context
         if self.use_input_cache:
             if self.cache["hidden_states"] is None:
@@ -274,11 +279,9 @@ class SpeechDecoder(NeuralModule):
                     self.cache["speech_encoder_emb"] = torch.cat([self.cache["speech_encoder_emb"], speech_encoder_emb], dim=1)
                     speech_encoder_emb = self.cache["speech_encoder_emb"]
 
-        if self.detach_input:
-            hidden_states = hidden_states.detach()
 
         # map hidden states to the shape of the
-        if self.input_proj is not None:
+        if hidden_states is not None and self.input_proj is not None:
             speech_decoder_input = self.input_proj(hidden_states)
         else:
             speech_decoder_input = hidden_states
@@ -302,6 +305,8 @@ class SpeechDecoder(NeuralModule):
                 speech_decoder_input = text_tokens_embedded
 
         if self.cond_on_speech_encoder_emb:
+            if self.detach_input:
+                speech_encoder_emb = speech_encoder_emb.detach()
             speech_encoder_emb = self.speech_encoder_emb_projection(speech_encoder_emb)
             speech_decoder_input = speech_decoder_input + speech_encoder_emb
 
@@ -450,7 +455,9 @@ class S2sMCoreGPTModelSpeechDecoder(MCoreGPTModel):
         self.proj_head_dims = proj_head_dims
         self.proj_head_loss_weights = proj_head_loss_weights
         self.speech_decoder_parms = dict(speech_decoder_parms) if speech_decoder_parms is not None else None
-        
+        self.train_only_speech_decoder = self.speech_decoder_parms.pop('train_only_speech_decoder', False)
+        self.detach_llm_backbone_output = self.speech_decoder_parms.pop('detach_llm_backbone_output', False)
+
         num_audio_codebooks = len(self.proj_head_dims) - 1 # -1 to not consider the text channel
         num_audio_tokens_per_codebook = self.proj_head_dims[-1] # the first in the list is the vocab size of llm and the rest is the codec vocab, so get the last one for simplicity
 
@@ -508,9 +515,32 @@ class S2sMCoreGPTModelSpeechDecoder(MCoreGPTModel):
 
         It either returns the Loss values if labels are given  or the final hidden units
         """
+        
+        # get inference config
+        greedy = inference_config.get('greedy', True)
+        greedy_on_text = inference_config.get('greedy_on_text', False)
+        topk = inference_config.get('top_k', 80)
+        temperature = inference_config.get('temperature', 0.7)
+
+        if self.train_only_speech_decoder and self.training:
+            audio_logits, sampled_audio_tokens = self.speech_decoder(None, speech_mask, input_audio_tokens=input_audio_tokens, input_text=input_text_tokens, speech_encoder_emb=speech_encoder_emb, speaker_encoder_emb=speaker_encoder_emb, temperature=temperature, topk=topk, greedy=greedy)
+            all_logits = audio_logits
+            # remove text labels
+            labels = labels[:, :, 1:]
+            # compute loss
+            tokens_loss = torch.stack(
+                [self.compute_language_model_loss(labels[:, :, i], all_logits[i]) for i in range(self.n_proj_heads-1)],
+                axis=2,
+            )
+            tokens_loss = (
+                tokens_loss
+                * torch.FloatTensor(self.proj_head_loss_weights[1:]).to(tokens_loss.device)
+                / sum(self.proj_head_loss_weights[1:])
+            )
+            return tokens_loss
+        
         # If decoder_input is provided (not None), then input_ids and position_ids are ignored.
         # Otherwise, apply embedding layer on input_ids and position_ids to get decoder_input.
-
         # Decoder embedding.
         if decoder_input is not None:
             pass
@@ -538,6 +568,9 @@ class S2sMCoreGPTModelSpeechDecoder(MCoreGPTModel):
             packed_seq_params=packed_seq_params,
             **(extra_block_kwargs or {}),
         )
+
+        if self.detach_llm_backbone_output:
+            hidden_states = hidden_states.detach()
 
         if not self.post_process:
             return hidden_states
@@ -571,11 +604,6 @@ class S2sMCoreGPTModelSpeechDecoder(MCoreGPTModel):
 
             # ToDo: avoid double sampling
             # ToDo: implement repetition_penalty and top_p
-            # get inference config
-            greedy = inference_config.get('greedy', True)
-            greedy_on_text = inference_config.get('greedy_on_text', False)
-            topk = inference_config.get('top_k', 80)
-            temperature = inference_config.get('temperature', 0.7)
 
             # sample text logits to get input_text_tokens in inference time
             if self.speech_decoder.use_input_cache and not self.training:
@@ -1804,13 +1832,19 @@ class S2sModularAudioGPTModelSpeechDecoder(ModularAudioGPTModel):
         duplex_method = self.cfg.duplex_method
         assert duplex_method == "from_duplex"
 
-        # [b, t, c]
-        encoded, encoded_len = self.perception(
-            input_signal=new_user_signal,
-            input_signal_length=new_user_signal_length,
-            processed_signal=None,
-            processed_signal_length=None,
-        )
+        if self.model.train_only_speech_decoder and self.training:
+            # ToDo: add 2048 as a parameter extracted from llm config or perception config
+            codec_compress_factor = self.codec_model_downsampling_factor / self.cfg.get("decoder_reduction_factor", 1)
+            encoded = torch.zeros(new_agent_signal.size(0), int(new_agent_signal.size(1)/codec_compress_factor), 2048).to(new_agent_signal.device)
+            encoded_len = (new_agent_signal_length/codec_compress_factor).long()
+        else:
+            # [b, t, c]
+            encoded, encoded_len = self.perception(
+                input_signal=new_user_signal,
+                input_signal_length=new_user_signal_length,
+                processed_signal=None,
+                processed_signal_length=None,
+            )
 
         # if inference return speaker embedding None and it will uses the cached speaker embedding
         if self.model.speech_decoder.use_input_cache:
@@ -1829,9 +1863,11 @@ class S2sModularAudioGPTModelSpeechDecoder(ModularAudioGPTModel):
         )  # list, list
 
         answer_codecs_lens = torch.Tensor(answer_codecs_lens).long().cuda()
+
         assert all(
             torch.isclose(answer_codecs_lens, encoded_len, atol=7)
         ), f"answer_codecs_lens: {answer_codecs_lens}, encoded_len: {encoded_len}, {new_agent_signal_length} {new_user_signal_length} {audio_batch['target_texts_merge']}"
+
         encoded_len = torch.minimum(answer_codecs_lens, encoded_len)
         answer_codecs_lens = encoded_len
         all_channels = []
@@ -2217,8 +2253,8 @@ class S2sModularAudioGPTModelSpeechDecoder(ModularAudioGPTModel):
             speech_encoder_emb = extra_inputs[0]
             speaker_encoder_emb = extra_inputs[4]
 
-            # if train only the speech encoder detach the speech decoder input
-            if self.cfg.get('freeze_all_except_speech_decoder', False):
+            # make sure that the input is detached
+            if self.cfg.get('freeze_all_except_speech_decoder', False) or self.model.train_only_speech_decoder:
                 self.model.speech_decoder.detach_input = True
 
             # use last position of loss mask as speech mask
@@ -2228,9 +2264,12 @@ class S2sModularAudioGPTModelSpeechDecoder(ModularAudioGPTModel):
             )
 
             # remove text loss
-            if self.cfg.get('freeze_all_except_speech_decoder', False):
-                output = output[:, :, 1:]
-                loss_mask = loss_mask[:, :, 1:]
+            if self.cfg.get('freeze_all_except_speech_decoder', False) and self.training:
+                if self.model.train_only_speech_decoder:
+                    loss_mask = loss_mask[:, :, 1:]
+                else:
+                    output = output[:, :, 1:]
+                    loss_mask = loss_mask[:, :, 1:]
 
             multimodal_output['audio_text'] = (output, loss_mask)
 
@@ -2307,13 +2346,13 @@ class S2sModularAudioGPTModelSpeechDecoder(ModularAudioGPTModel):
     def setup_optimizer_param_groups(self):
         known_groups = []
         opt_params = []
+
         self.unfreeze()
-        if self.cfg.get('freeze_all_except_speech_decoder', False):
-            for n, _ in self.named_parameters():
-                if n and ".speech_decoder" not in n:
-                    known_groups.append(".".join(n.split(".")[:2]))
-            # remove duplicated items
-            known_groups = list(set(known_groups))
+
+        if self.model.train_only_speech_decoder or self.cfg.get('freeze_all_except_speech_decoder', False):
+            self._optimizer_param_groups = self.model.speech_decoder.parameters()
+            if self.cfg.get('freeze_all_except_speech_decoder', False):
+                self.freeze_all_except_speech_decoder()
         else:
             freeze_llm = self.cfg.get('freeze_llm', True)
             if freeze_llm:
@@ -2352,57 +2391,56 @@ class S2sModularAudioGPTModelSpeechDecoder(ModularAudioGPTModel):
                     module.unfreeze_enabled_adapters()  # selectively unfreeze the adapter modules.
                     opt_params += [p for p in module.parameters()]
 
-        # add param groups with specified args, if any
-        param_groups = []
-        if "optim_param_groups" in self.cfg:
-            param_groups_cfg = self.cfg.optim_param_groups
-            for group, group_cfg in param_groups_cfg.items():
-                module = getattr(self, group, None)
-                if module is None:
-                    raise ValueError(f"{group} not found in model.")
-                elif hasattr(module, "parameters"):
-                    known_groups.append(f"{group}.")
-                    new_group = {"params": module.parameters()}
-                    for k, v in group_cfg.items():
-                        new_group[k] = v
-                    param_groups.append(new_group)
-                else:
-                    raise ValueError(f"{group} does not have parameters.")
+            # add param groups with specified args, if any
+            param_groups = []
+            if "optim_param_groups" in self.cfg:
+                param_groups_cfg = self.cfg.optim_param_groups
+                for group, group_cfg in param_groups_cfg.items():
+                    module = getattr(self, group, None)
+                    if module is None:
+                        raise ValueError(f"{group} not found in model.")
+                    elif hasattr(module, "parameters"):
+                        known_groups.append(f"{group}.")
+                        new_group = {"params": module.parameters()}
+                        for k, v in group_cfg.items():
+                            new_group[k] = v
+                        param_groups.append(new_group)
+                    else:
+                        raise ValueError(f"{group} does not have parameters.")
 
-        # add other trainable params
-        for n, p in self.named_parameters():
-            is_unknown = True
-            for group in known_groups:
-                if n.startswith(group):
-                    is_unknown = False
-            if is_unknown:
-                opt_params.append(p)
+            # add other trainable params
+            for n, p in self.named_parameters():
+                is_unknown = True
+                for group in known_groups:
+                    if n.startswith(group):
+                        is_unknown = False
+                if is_unknown:
+                    opt_params.append(p)
 
-        param_groups = [{"params": opt_params}] + param_groups
+            param_groups = [{"params": opt_params}] + param_groups
 
-        self._optimizer_param_groups = param_groups
-        logging.info(f"Optimizer groups set:\n{self.summarize(max_depth=2)}")
+            self._optimizer_param_groups = param_groups
+            logging.info(f"Optimizer groups set:\n{self.summarize(max_depth=2)}")
 
-        if self.cfg.get('freeze_llm', True):
-            # needs to be updated since vocab is changed
-            if getattr(self.cfg, 'cond_llm_backbone_on_speech_tokens', True):
-                for param in self.model.embedding.parameters():
-                    param.requires_grad = True
-                for param in self.model.output_layer.parameters():
-                    param.requires_grad = True
-                for param in self.model.decoder.final_layernorm.parameters():
-                    param.requires_grad = True
+            if self.cfg.get('freeze_llm', True):
+                # needs to be updated since vocab is changed
+                if getattr(self.cfg, 'cond_llm_backbone_on_speech_tokens', True):
+                    for param in self.model.embedding.parameters():
+                        param.requires_grad = True
+                    for param in self.model.output_layer.parameters():
+                        param.requires_grad = True
+                    for param in self.model.decoder.final_layernorm.parameters():
+                        param.requires_grad = True
 
-            # need to unfreeze speech decoder because speech decoder is part of self.model
-            if not self.cfg.get('freeze_speech_decoder', False):
-                for param in self.model.speech_decoder.parameters():
-                    param.requires_grad = True
+                # need to unfreeze speech decoder because speech decoder is part of self.model
+                if not self.cfg.get('freeze_speech_decoder', False):
+                    for param in self.model.speech_decoder.parameters():
+                        param.requires_grad = True
 
-        # freeze all modules except speech decoder
-        if self.cfg.get('freeze_all_except_speech_decoder', False):
-            self.freeze_all_except_speech_decoder()
+            # freeze all modules except speech decoder
+            if self.cfg.get('freeze_all_except_speech_decoder', False):
+                self.freeze_all_except_speech_decoder()
 
-       
 
             
             

@@ -270,7 +270,7 @@ model:
       sampler_fusion: randomized_round_robin
       sampler_weights:
         duplex: 1.0
-        blackwell: 0.001
+        blackwell: 0.05
 
       blackwell:
         input_cfg:
@@ -301,6 +301,10 @@ model:
                 tts: True
             - type: lhotse_shar
               shar_path: /lustre/fsw/portfolios/llmservice/projects/llmservice_nemo_speechlm/data/TTS/tts_lhotse_datasets/rivaLindyRodney
+              tags:
+                tts: True
+            - type: lhotse_shar
+              shar_path: /lustre/fsw/portfolios/llmservice/projects/llmservice_nemo_speechlm/data/TTS/tts_lhotse_datasets/InternalMLSEnglish17k
               tags:
                 tts: True
 
