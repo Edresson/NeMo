@@ -515,7 +515,7 @@ class S2sMCoreGPTModelSpeechDecoder(MCoreGPTModel):
 
         It either returns the Loss values if labels are given  or the final hidden units
         """
-        
+
         # get inference config
         greedy = inference_config.get('greedy', True)
         greedy_on_text = inference_config.get('greedy_on_text', False)
@@ -742,8 +742,39 @@ class S2sModularAudioGPTModelSpeechDecoder(ModularAudioGPTModel):
                 model.load_state_dict(torch_state_dict, strict=False)
                 logging.info(f"loading from {ckpt_path}: {torch_state_dict.keys()}")
 
+        def overwrite_speech_decoder_state_dict_with_tts_ckpt_path(ckpt_path, nemo_path='model_weights.ckpt'):
+            if ckpt_path is not None:
+                if '.nemo' in ckpt_path:
+                        with tempfile.TemporaryDirectory() as tmpdir:
+                            NLPSaveRestoreConnector._unpack_nemo_file(ckpt_path, tmpdir)
+                            ckpt_path = f"{tmpdir}/{nemo_path}"
+                            checkpoint_state = torch.load(ckpt_path)
+                else:
+                    checkpoint_state = torch.load(ckpt_path)['state_dict']
+
+                model_dict = model.model.speech_decoder.state_dict()
+                # Partial initialization: if there is a mismatch with new and old layer, it is skipped.
+                for k, v in checkpoint_state.items():
+                    if k not in model_dict:
+                        print(" | > Layer missing in the model definition: {}".format(k))
+                # 1. filter out unnecessary keys
+                pretrained_dict = {k: v for k, v in checkpoint_state.items() if k in model_dict}
+
+                # 2. filter out different size layers
+                for k, v in list(pretrained_dict.items()):
+                    if v.numel() != model_dict[k].numel():
+                        del pretrained_dict[k]
+                        print(" | > Layer with shape mismatach in the model definition: {}".format(k))
+
+                # 4. overwrite entries in the existing state dict
+                model_dict.update(pretrained_dict)
+                print(" | > {} / {} layers are restored.".format(len(pretrained_dict), len(model_dict)))
+
+                model.model.speech_decoder.load_state_dict(model_dict, strict=False)
+
         overwrite_state_dict_with_ckpt_path(cfg.model.get('salm_model_path'))
         overwrite_state_dict_with_ckpt_path(cfg.model.get('s2s_salm_model_path'), ignore=['model.'])
+        overwrite_speech_decoder_state_dict_with_tts_ckpt_path(cfg.model.get('tts_model_path', None))
 
         model.padded_vocab_size = cfg.model.s2s_vocab_size
 
