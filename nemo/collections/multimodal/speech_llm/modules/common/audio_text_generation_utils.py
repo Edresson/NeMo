@@ -798,6 +798,7 @@ def s2s_sample_sequence_batch(
                 #     prev = logits
                 # else:
                 # sample prev for each channel and concat them together as [b, c]
+                # sample prev for each channel and concat them together as [b, c]
                 def get_prev(logits, started, temperature, extra):
                     if extra.get('greedy', False):
                         prev = torch.argmax(logits, dim=-1).view(-1)
@@ -818,12 +819,17 @@ def s2s_sample_sequence_batch(
 
                 # import pdb; pdb.set_trace()
 
+                if inference_strategy.model.get_inference_config().get('unk_boost', None):
+                    logits[0][:, 0] += inference_strategy.model.get_inference_config().get('unk_boost', None)
+                if inference_strategy.model.get_inference_config().get('bos_boost', None):
+                    logits[0][:, 1] += inference_strategy.model.get_inference_config().get('bos_boost', None)
+                if inference_strategy.model.get_inference_config().get('eos_boost', None):
+                    logits[0][:, 2] += inference_strategy.model.get_inference_config().get('eos_boost', None)
                 prev = [get_prev(logits_i, started, temperature, extra) for logits_i in logits]
-                if extra.get('greedy_on_text', False):
+                if inference_strategy.model.get_inference_config().get('greedy_on_text', False):
                     prev[0] = get_prev(
                         logits[0], started, temperature, {'greedy': True}
                     )  # allow greedy on text and sampling on speech
-                
                 prev = torch.stack(prev, dim=1)
                 started_expand = started.unsqueeze(1).expand(-1, prev.size(1))
                 new_tokens = switch(tokens[:, context_length], prev, started_expand)

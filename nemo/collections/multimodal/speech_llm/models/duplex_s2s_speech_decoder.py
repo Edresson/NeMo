@@ -1852,8 +1852,15 @@ class S2sModularAudioGPTModelSpeechDecoder(ModularAudioGPTModel):
         return torch.ceil(audio_len / self.codec_model_downsampling_factor / decoder_reduction_factor).int() - 1
 
     def prepare_llm_input_duplex_from_multiturn(self, audio_batch):
-        if self.cfg.get('noise_prob', 0.0) and random.random() < self.cfg.get('noise_prob', 0.0):
-            self.add_noise_to_batch(audio_batch, os.path.join(self.cfg.noise_path, 'train'), random.randint(10, 40))
+        if not (
+                self.cfg.get("exclude_noise_on_s2s_duplex_overlap", False) and 's2s_duplex_overlap' in audio_batch
+            ):
+                self.add_noise_to_batch(
+                    audio_batch,
+                    os.path.join(self.cfg.noise_path, self.cfg.get('noise_path_name', 'train')),
+                    random.randint(self.cfg.get('noise_min_snr', 10), self.cfg.get('noise_max_snr', 40)),
+                )
+
         # real duplex data read from dataloader
         new_user_signal = audio_batch['audio_signal']
         new_user_signal_length = audio_batch['audio_signal_length']
@@ -1990,8 +1997,8 @@ class S2sModularAudioGPTModelSpeechDecoder(ModularAudioGPTModel):
                 if 'target_texts_merge' in audio_batch:
                     text_channel = audio_batch['target_texts_merge'][i]
                     sliced_text_channel = text_channel[: loss_mask.shape[1]].unsqueeze(-1)
-                    loss_mask = torch.where(sliced_text_channel == self.tokenizer.bos_id, 2.0, loss_mask)
-                    loss_mask = torch.where(sliced_text_channel == self.tokenizer.eos_id, 2.0, loss_mask)
+                    loss_mask = torch.where(sliced_text_channel == self.tokenizer.bos_id, 4.0, loss_mask)
+                    loss_mask = torch.where(sliced_text_channel == self.tokenizer.eos_id, 4.0, loss_mask)
                 else:
                     raise ValueError("scale_loss_mask_by=bos_eos is only supported for target_texts_merge")
         elif scale_loss_mask_by == 'non_sil':
@@ -1999,13 +2006,26 @@ class S2sModularAudioGPTModelSpeechDecoder(ModularAudioGPTModel):
                 if 'target_texts_merge' in audio_batch:
                     text_channel = audio_batch['target_texts_merge'][i]
                     sliced_text_channel = text_channel[: loss_mask.shape[1]].unsqueeze(-1)
-                    loss_mask = torch.where(labels[:, :, :] != labels[:, :1, :], 2.0, loss_mask)
+                    loss_mask = torch.where(labels[:, :, :] != labels[:, :1, :], 4.0, loss_mask)
                 else:
                     raise ValueError("scale_loss_mask_by=bos_eos is only supported for target_texts_merge")
+        elif scale_loss_mask_by == 'non_sil_st':
+            if 'target_texts_merge' in audio_batch:
+                loss_mask = torch.where(labels[:, :, :1] != labels[i, :1, :1], 4.0, loss_mask)
+            else:
+                raise ValueError("scale_loss_mask_by=bos_eos is only supported for target_texts_merge")
+        elif scale_loss_mask_by == 'non_sil_t':
+            if 'target_texts_merge' in audio_batch:
+                loss_mask[:, :, :1] = torch.where(labels[:, :, :1] != labels[i, :1, :1], 4.0, loss_mask[:, :, :1])
+            else:
+                raise ValueError("scale_loss_mask_by=bos_eos is only supported for target_texts_merge")
+
         elif scale_loss_mask_by == None:
             pass
         else:
             raise ValueError(f"Unknown scale_loss_mask_by: {scale_loss_mask_by}")
+        if self.cfg.get("exclude_speech_loss_on_s2s_duplex_overlap", False) and 's2s_duplex_overlap' in audio_batch:
+            loss_mask[:, :, 1:] = 0.0
         limit_max_seq_length = self.cfg.get("limit_max_seq_length", None)
         if limit_max_seq_length is not None and limit_max_seq_length < labels.shape[1] and self.training:
             start = random.randint(0, labels.shape[1] - limit_max_seq_length - 1)
@@ -2067,19 +2087,29 @@ class S2sModularAudioGPTModelSpeechDecoder(ModularAudioGPTModel):
             encoded = torch.cat([embeddings2use.transpose(1, 0), encoded], dim=1)
         return encoder_input, labels, loss_mask, encoded, encoder_length
 
-    # TODO: move the following to dataloader
     def add_noise_to_batch(self, batch, noise_folder, snr_db=20):
-        batch_audio = batch['audio_signal']  #  torch tensor，Shape: (batch_size, length)
+        if self.cfg.get('debug_noise_audio', False):
+            self.write_wave(
+                batch['audio_signal'][0],
+                "/lustre/fsw/portfolios/llmservice/users/zhehuaic/works/mod_speech_llm/tmp/dbg0.wav",
+            )
+
+        batch_audio = batch['audio_signal'][:]  #  torch tensor，Shape: (batch_size, length)
         batch_size, audio_length = batch_audio.shape
 
-        noise_files = [f for f in os.listdir(noise_folder) if f.endswith('.wav')]
+        import glob
+
+        noise_files = [f for f in glob.glob(noise_folder + "/*.wav")]
         if not noise_files:
             raise ValueError(f"No noise files found in {noise_folder}")
 
         for i in range(batch_size):
 
-            noise_path = os.path.join(noise_folder, random.choice(noise_files))
+            noise_path = random.choice(noise_files)
             noise, sr = sf.read(noise_path, dtype='float32')
+            # resample noise from sr to self.cfg.data.train_ds.sample_rate
+            if self.cfg.get('noise_resample', False) and sr != self.cfg.data.train_ds.sample_rate:
+                noise = librosa.resample(noise, orig_sr=sr, target_sr=self.cfg.data.train_ds.sample_rate)
 
             if len(noise.shape) > 1:
                 noise = np.mean(noise, axis=1)
@@ -2104,7 +2134,21 @@ class S2sModularAudioGPTModelSpeechDecoder(ModularAudioGPTModel):
 
             batch_audio[i] = batch_audio[i] + noise_tensor
 
+        if self.cfg.get('debug_noise_audio', False):
+            self.write_wave(
+                batch_audio[0], "/lustre/fsw/portfolios/llmservice/users/zhehuaic/works/mod_speech_llm/tmp/dbg1.wav"
+            )
+            self.write_wave(
+                noise_tensor, "/lustre/fsw/portfolios/llmservice/users/zhehuaic/works/mod_speech_llm/tmp/dbg2.wav"
+            )
         batch['audio_signal'] = batch_audio
+
+    def write_wave(self, one_audio_signal, file_name):
+        one_audio_signal = one_audio_signal.cpu().numpy()
+        one_audio_signal = one_audio_signal.astype(np.float32)
+        # one_audio_signal = np.clip(one_audio_signal, -1.0, 1.0)
+        sf.write(file_name, one_audio_signal, self.cfg.data.train_ds.sample_rate)
+
 
     def prepare_llm_input(self, audio_batch):
         # handle duplex and singleturn s2s
