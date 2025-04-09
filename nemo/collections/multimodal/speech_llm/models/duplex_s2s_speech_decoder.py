@@ -16,6 +16,7 @@ import soundfile as sf
 import string
 import torch
 import torchaudio
+import librosa
 from omegaconf import DictConfig, OmegaConf
 from omegaconf.omegaconf import OmegaConf, open_dict
 from pytorch_lightning.trainer.trainer import Trainer
