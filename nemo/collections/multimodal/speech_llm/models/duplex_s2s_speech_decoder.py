@@ -1853,7 +1853,7 @@ class S2sModularAudioGPTModelSpeechDecoder(ModularAudioGPTModel):
         return torch.ceil(audio_len / self.codec_model_downsampling_factor / decoder_reduction_factor).int() - 1
 
     def prepare_llm_input_duplex_from_multiturn(self, audio_batch):
-        if not (
+        if self.cfg.get("noise_path", False) and not (
                 self.cfg.get("exclude_noise_on_s2s_duplex_overlap", False) and 's2s_duplex_overlap' in audio_batch
             ):
                 self.add_noise_to_batch(
