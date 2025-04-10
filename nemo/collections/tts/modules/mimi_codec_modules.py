@@ -8,7 +8,7 @@ from nemo.core.classes.module import NeuralModule
 
 
 class MimiAudioEncoder(NeuralModule):
-    def __init__(self, out_size=32, sampling_rate=24000, upsampling_ratios=[8, 6, 5, 4], frame_rate=12.5, is_causal=True, hidden_size=512):
+    def __init__(self, out_size=32, sampling_rate=24000, upsampling_ratios=[8, 6, 5, 4], frame_rate=12.5, is_causal=True, hidden_size=512, sliding_window=250):
         super().__init__()
         # get Mimi default config
         self.config = MimiConfig()
@@ -19,6 +19,7 @@ class MimiAudioEncoder(NeuralModule):
         self.config.upsampling_ratios = upsampling_ratios
         self.config.use_causal_conv = is_causal
         self.config.hidden_size = hidden_size
+        self.config.sliding_window = sliding_window
 
         # define upsampling rate
         self.downsampling_rate = self.config.sampling_rate / self.config.frame_rate
@@ -67,7 +68,7 @@ class MimiAudioEncoder(NeuralModule):
 
 
 class MimiAudioDecoder(NeuralModule):
-    def __init__(self, input_size=32, sampling_rate=24000, upsampling_ratios=[8, 6, 5, 4], frame_rate=12.5, is_causal=True, hidden_size=512):
+    def __init__(self, input_size=32, sampling_rate=24000, upsampling_ratios=[8, 6, 5, 4], frame_rate=12.5, is_causal=True, hidden_size=512, sliding_window=250):
         super().__init__()
         # get Mimi default config
         self.config = MimiConfig()
@@ -78,6 +79,8 @@ class MimiAudioDecoder(NeuralModule):
         self.config.upsampling_ratios = upsampling_ratios
         self.config.use_causal_conv = is_causal
         self.config.hidden_size = hidden_size
+        self.config.sliding_window = sliding_window
+
         # define upsampling rate
         self.upsampling_rate = self.config.sampling_rate / self.config.frame_rate
 
