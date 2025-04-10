@@ -20,6 +20,9 @@ class MimiAudioEncoder(NeuralModule):
         self.config.use_causal_conv = is_causal
         self.config.hidden_size = hidden_size
 
+        # define upsampling rate
+        self.downsampling_rate = self.config.sampling_rate / self.config.frame_rate
+
         self.encoder = MimiEncoder(self.config)
         self.encoder_transformer = MimiTransformerModel(self.config)
 
@@ -49,16 +52,18 @@ class MimiAudioEncoder(NeuralModule):
         hop_length = np.prod(self.config.upsampling_ratios)
         return math.ceil(self.config.sampling_rate / hop_length)
 
-    def forward(self, input_values):
-        input_values = input_values.unsqueeze(1)
-        embeddings = self.encoder(input_values)
-        # ToDo: added past_key_values to the encoder_transformer to speedup inference
+    def forward(self, audio, audio_len):
+        audio = audio.unsqueeze(1)
+        embeddings = self.encoder(audio)
         embeddings = self.encoder_transformer(
             embeddings.transpose(1, 2)
         )[0].transpose(1, 2)
         embeddings = self.downsample(embeddings)
         embeddings = self.out_projection(embeddings)
-        return embeddings
+
+        # compute output_len based on downsampling rate
+        output_len = (audio_len / self.downsampling_rate).long()
+        return embeddings, output_len
 
 
 class MimiAudioDecoder(NeuralModule):
@@ -73,6 +78,8 @@ class MimiAudioDecoder(NeuralModule):
         self.config.upsampling_ratios = upsampling_ratios
         self.config.use_causal_conv = is_causal
         self.config.hidden_size = hidden_size
+        # define upsampling rate
+        self.upsampling_rate = self.config.sampling_rate / self.config.frame_rate
 
         self.decoder_transformer = MimiTransformerModel(self.config)
         self.decoder = MimiDecoder(self.config)
@@ -103,8 +110,8 @@ class MimiAudioDecoder(NeuralModule):
         hop_length = np.prod(self.config.upsampling_ratios)
         return math.ceil(self.config.sampling_rate / hop_length)
 
-    def forward(self, input_values, past_key_values=None, return_dict=None, return_past_key_values=False):
-        embeddings = self.in_projection(input_values)
+    def forward(self, inputs, input_len, past_key_values=None, return_dict=None, return_past_key_values=False):
+        embeddings = self.in_projection(inputs)
 
         embeddings = self.upsample(embeddings)
         decoder_outputs = self.decoder_transformer(
@@ -113,21 +120,45 @@ class MimiAudioDecoder(NeuralModule):
 
         embeddings = decoder_outputs[0].transpose(1, 2)
         outputs = self.decoder(embeddings).squeeze(1)
-
+        # compute output len based on the upsampling rate
+        output_len = (input_len * self.upsampling_rate).long()
         if return_past_key_values:
             if return_dict:
                 past_key_values = decoder_outputs.get("past_key_values")
             elif len(decoder_outputs) > 1:
                 past_key_values = decoder_outputs[1]
             return outputs, past_key_values
-
-        return outputs
+        return outputs, output_len
 
 # Debug
 # mimiencoder = MimiAudioEncoder()
 # audio = torch.ones([2, 48000])
-# unquantized_latent = mimiencoder(audio)
-# print("unquantized_latent:", unquantized_latent.shape)
+# audio_len = torch.zeros(audio.size(0))
+# audio_len = audio_len + audio.size(1)
+# unquantized_latent, unquantized_latent_len = mimiencoder(audio, audio_len)
+# print("unquantized_latent:", unquantized_latent.shape, unquantized_latent_len)
 # mimidecoder = MimiAudioDecoder()
-# print("Audio output", mimidecoder(unquantized_latent).shape)
+# audio_out = mimidecoder(unquantized_latent, unquantized_latent_len)
+# print("Audio output", audio_out[0].shape, audio_out[1])
+# convert checkpoint
+"""
+import torch
+from transformers import MimiModel
+model = MimiModel.from_pretrained("kyutai/mimi")
+state_dict = model.state_dict()
+for key in list(state_dict.keys()):
+    if "encoder." in key or "encoder_transformer." in key or "downsample." in key:
+        state_dict["audio_encoder."+key] = state_dict[key]
+        del state_dict[key]
+    elif "decoder." in key or "decoder_transformer." in key or "upsample." in key:
+        state_dict["audio_decoder."+key] = state_dict[key]
+        del state_dict[key]
+    elif "quantizer." in key:
+        del state_dict[key]
+    else:
+        print("Key not converted!", key)
 
+print(state_dict.keys())
+state_dict_new = {'state_dict':state_dict} 
+torch.save(state_dict, "/home/ecasanova/Projects/Checkpoints/MimiCodec/mimi_converted_to_nemo.ckpt")
+"""
