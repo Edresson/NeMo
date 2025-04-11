@@ -740,6 +740,18 @@ class S2sModularAudioGPTModelSpeechDecoder(ModularAudioGPTModel):
                 else:
                     torch_state_dict = torch.load(salm_model_path)['state_dict']
                 torch_state_dict = {k: v for k, v in torch_state_dict.items() if not any([i in k for i in ignore])}
+                
+                # remove layers with shape mismatch
+                model_dict = model.state_dict()
+                for k, v in list(torch_state_dict.items()):
+                    # ignore speaker encoder during loading, because speaker encoder is frozen and we want to be able to change the speaker encoder and continue training
+                    if ".speaker_encoder." in k:
+                        del torch_state_dict[k]
+                        print(" | > Layer from the speaker encoder ignored in the checkpoint loading: {}".format(k))
+                    elif k in model_dict and hasattr(model_dict[k], "numel") and v.numel() != model_dict[k].numel():
+                        del torch_state_dict[k]
+                        print(" | > Layer with shape mismatach in the model definition: {}".format(k))
+
                 model.setup_complete = False
                 model.load_state_dict(torch_state_dict, strict=False)
                 logging.info(f"loading from {ckpt_path}: {torch_state_dict.keys()}")
@@ -764,7 +776,11 @@ class S2sModularAudioGPTModelSpeechDecoder(ModularAudioGPTModel):
 
                 # 2. filter out different size layers
                 for k, v in list(pretrained_dict.items()):
-                    if v.numel() != model_dict[k].numel():
+                    # ignore speaker encoder during loading, because speaker encoder is frozen and we want to be able to change the speaker encoder and continue training
+                    if ".speaker_encoder." in k:
+                        del torch_state_dict[k]
+                        print(" | > Layer from the speaker encoder ignored in the checkpoint loading: {}".format(k))
+                    elif v.numel() != model_dict[k].numel():
                         del pretrained_dict[k]
                         print(" | > Layer with shape mismatach in the model definition: {}".format(k))
 
