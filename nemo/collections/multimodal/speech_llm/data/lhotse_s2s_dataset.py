@@ -1009,6 +1009,8 @@ class LhotseAudioQuestionAnswerDataset(torch.utils.data.Dataset):
 
         # adapted from https://github.com/blisc/NeMo/blob/magpietts_2503/nemo/collections/tts/data/text_to_speech_dataset_lhotse.py
         cuts = cuts.sort_by_duration()
+        user_audios = []
+        user_audios_lens = []
         answer_audios = []
         answer_audio_lens = []
         features_lens = []
@@ -1024,6 +1026,7 @@ class LhotseAudioQuestionAnswerDataset(torch.utils.data.Dataset):
         for i, cut in enumerate(cuts):
             # load target/answer audio
             cur_answer_audio = torch.FloatTensor(cut.target_audio.resample(self.codec_sample_rate).load_audio())
+            # convert answer to the input sr
             cur_answer_audio_input_sr = torchaudio.functional.resample(cur_answer_audio, self.codec_sample_rate, self.sample_rate)
 
             # define silences between turns
@@ -1036,12 +1039,20 @@ class LhotseAudioQuestionAnswerDataset(torch.utils.data.Dataset):
             # generates user audio with prompt and padding
             user_audio_with_prompt_and_padding = torch.cat([self.prompt_audio, silence_padding_input, cur_answer_audio_input_sr, silence_padding_input], dim=1)
 
-            # make the final user and answer audios
-            user_audio = torch.cat([user_audio_with_prompt_and_padding, torch.zeros_like(cur_answer_audio_with_padding)], dim=1)
-            answer_audio = torch.cat([torch.zeros_like(user_audio_with_prompt_and_padding), cur_answer_audio_with_padding], dim=1)
+            # downsample it to the input/output sr
+            cur_answer_audio_with_padding_input_sr = torchaudio.functional.resample(cur_answer_audio_with_padding, self.codec_sample_rate, self.sample_rate)
+            user_audio_with_prompt_and_padding_output_sr = torchaudio.functional.resample(user_audio_with_prompt_and_padding, self.sample_rate, self.codec_sample_rate)
 
-            answer_audio_len = torch.tensor(answer_audio.shape[1]).long()
+            # make the final user and answer audios
+            user_audio = torch.cat([user_audio_with_prompt_and_padding, torch.zeros_like(cur_answer_audio_with_padding_input_sr)], dim=1)
+            answer_audio = torch.cat([torch.zeros_like(user_audio_with_prompt_and_padding_output_sr), cur_answer_audio_with_padding], dim=1)
+
+            # add user and answer audios to the lists
+            user_audios.append(user_audio)
+            user_audio_len = torch.tensor(user_audio.shape[1]).long()
+            user_audios_lens.append(user_audio_len)
             answer_audios.append(answer_audio)
+            answer_audio_len = torch.tensor(answer_audio.shape[1]).long()
             answer_audio_lens.append(answer_audio_len)
             features_lens.append(
                 math.ceil(
@@ -1123,7 +1134,7 @@ class LhotseAudioQuestionAnswerDataset(torch.utils.data.Dataset):
                 cur_source_text[source_text_start_step] = self.text_processor.bos_id
                 cur_source_text[source_text_end_step] = self.text_processor.eos_id
                 text_len = min(source_text_end_step - source_text_start_step - 1, source_text.shape[0])
-                cur_target_text[(source_text_start_step + 1) : (source_text_start_step + 1 + text_len)] = source_text[:text_len]
+                cur_source_text[(source_text_start_step + 1) : (source_text_start_step + 1 + text_len)] = source_text[:text_len]
 
                 new_target_texts.append(cur_target_text)
                 new_source_texts.append(cur_source_text)
@@ -1135,8 +1146,12 @@ class LhotseAudioQuestionAnswerDataset(torch.utils.data.Dataset):
         source_texts_merge, source_text_lengths = collate_and_pad(new_source_texts) 
 
         # collate_vectors answer_audios
-        answer_audios= collate_vectors([a.squeeze(0) for a in answer_audios], max_length=max(answer_audio_lens), padding_value=0.0)
+        answer_audios = collate_vectors([a.squeeze(0) for a in answer_audios], max_length=max(answer_audio_lens), padding_value=0.0)
         answer_audio_lens = torch.tensor(answer_audio_lens).long()
+        
+        # collate_vectors user_audios
+        audio = collate_vectors([a.squeeze(0) for a in user_audios], max_length=max(user_audios_lens), padding_value=0.0)
+        audio_lens = torch.tensor(user_audios_lens).long()
 
         # prepare answer_audios_first_turn that will be used for speaker conditioning
         answer_audios_first_turn = collate_vectors([a.squeeze(0) for a in answer_audios_first_turn], max_length=max(answer_audios_first_turn_lens), padding_value=0.0)
@@ -1144,11 +1159,6 @@ class LhotseAudioQuestionAnswerDataset(torch.utils.data.Dataset):
 
         # make features_lens a tensor
         features_lens = torch.tensor(features_lens, dtype=torch.int)
-
-        # user audio is a zero tensor as answer_audios downsampled to 16khz
-        audio = torch.zeros(answer_audios.size(), dtype=answer_audios.dtype)#.uniform_(-0.1,0.1)
-        audio = torchaudio.functional.resample(audio, self.codec_sample_rate, self.sample_rate)
-        audio_lens = (answer_audio_lens * (self.sample_rate / self.codec_sample_rate)).long()
 
         return_batch = {
             "sample_ids": list(cuts.ids),

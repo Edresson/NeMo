@@ -158,10 +158,11 @@ class SpeechDecoder(NeuralModule):
         self.speaker_embedding_dim = self.speech_decoder_parms.pop("speaker_embedding_dim", 192)
         self.inference_speaker_reference = self.speech_decoder_parms.pop("inference_speaker_reference", None)
         self.max_speaker_reference_len = self.speech_decoder_parms.pop("max_speaker_reference_len", 5)
+        self.speaker_encoder_model_name = self.speech_decoder_parms.pop("speaker_encoder_model_name", 'titanet_large')
 
         if self.use_speaker_encoder:
-            # Titanet Speaker encoder
-            self.speaker_encoder = nemo_asr.models.EncDecSpeakerLabelModel.from_pretrained(model_name='titanet_large')
+            # NeMo Speaker encoder
+            self.speaker_encoder = nemo_asr.models.EncDecSpeakerLabelModel.from_pretrained(model_name=self.speaker_encoder_model_name)
 
             # freeze the pretrained speaker encoder
             self.speaker_encoder.eval()
@@ -2144,11 +2145,13 @@ class S2sModularAudioGPTModelSpeechDecoder(ModularAudioGPTModel):
             )
         batch['audio_signal'] = batch_audio
 
-    def write_wave(self, one_audio_signal, file_name):
+    def write_wave(self, one_audio_signal, file_name, sr=None):
         one_audio_signal = one_audio_signal.cpu().numpy()
         one_audio_signal = one_audio_signal.astype(np.float32)
+        if sr is None:
+            sr = self.cfg.data.train_ds.sample_rate
         # one_audio_signal = np.clip(one_audio_signal, -1.0, 1.0)
-        sf.write(file_name, one_audio_signal, self.cfg.data.train_ds.sample_rate)
+        sf.write(file_name, one_audio_signal, sr)
 
 
     def prepare_llm_input(self, audio_batch):
