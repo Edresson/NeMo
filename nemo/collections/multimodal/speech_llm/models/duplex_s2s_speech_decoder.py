@@ -137,8 +137,87 @@ class SumMultiEmbedding(LanguageModelEmbedding):
         )
 
 
+def build_vocabs(subword_vocab_items):
+    # tokenizer = AutoTokenizer.from_pretrained(pretrained_tokenizer_name)
+    # subword_vocab_items = tokenizer.vocab.items()
+    org_char_vocab = {subword: subword_id for subword, subword_id in subword_vocab_items if len(subword) == 1}
+    sorted_char_vocab = dict(sorted(org_char_vocab.items(), key=lambda x: x[1]))
+    char_vocab = {k: i for i, (k, _) in enumerate(sorted_char_vocab.items())}
+    assert sorted(char_vocab.values()) == list(range(len(char_vocab)))
+    subword_id_to_char_ids = {
+        subword_id: tuple(char_vocab[char] for char in subword) for subword, subword_id in subword_vocab_items
+    }
+
+    assert max(subword_id_to_char_ids) == len(subword_id_to_char_ids) - 1
+    # add padding_idx
+    subword_padding_idx = len(subword_id_to_char_ids)
+    subword_id_to_char_ids[subword_padding_idx] = (len(char_vocab),)
+
+    return subword_id_to_char_ids, char_vocab, subword_padding_idx
+
+
+def sequence_mask(lengths: Tensor, max_length: int | None = None) -> Tensor:
+    if max_length is None:
+        max_length = int(lengths.max().item())
+    x = torch.arange(max_length, dtype=lengths.dtype, device=lengths.device)
+    return x.unsqueeze(0) < lengths.unsqueeze(1)
+
+
+class CharAwareSubwordEncoder(NeuralModule):
+    def __init__(self, params: DictConfig, llm_tokenizer_vocab_items: dict = None):
+        super().__init__()
+        self.subword_id_to_char_ids, self.char_vocab, self.subword_padding_idx = build_vocabs(llm_tokenizer_vocab_items)
+        self.embed_tokens = nn.Embedding(self.vocab_size + 1, params["d_model"], padding_idx=self.vocab_size)
+        self.encoder = t5tts_transformer.Transformer(**params)
+
+    @property
+    def vocab_size(self):
+        return len(self.char_vocab)
+
+    def prepare_inputs(self, subword_ids: Tensor, padding_mask: Tensor) -> tuple[Tensor, Tensor]:
+        device = subword_ids.device
+
+        subword_id_list = torch.masked_select(subword_ids, padding_mask).cpu().tolist()
+        char_id_list = [list(self.subword_id_to_char_ids[x]) for x in subword_id_list]
+
+        char_lengths = torch.tensor([len(x) for x in char_id_list], dtype=torch.long, device=device)
+        batch_size = char_lengths.size(0)
+
+        char_ids = torch.full((batch_size, int(char_lengths.max().item())), self.vocab_size, dtype=torch.long)
+        for i in range(batch_size):
+            char_ids[i, : char_lengths[i]] = torch.tensor(char_id_list[i])
+        char_ids = char_ids.to(device=device)
+        return char_ids, char_lengths
+
+    def forward(self, subword_ids: Tensor, subword_mask: Tensor | None = None) -> Tensor:
+        device = subword_ids.device
+        if subword_mask is None:
+            subword_mask = torch.ones_like(subword_ids).bool()
+        else:
+            subword_mask = subword_mask.bool()
+
+        if subword_mask.ndim == 3:
+            subword_mask = subword_mask.squeeze(-1)
+
+        char_ids, char_lengths = self.prepare_inputs(subword_ids, subword_mask)
+        char_mask = sequence_mask(char_lengths).squeeze(-1)
+        char_emb = self.embed_tokens(char_ids)
+        # char emb has the shape  [B*T, N, channels], where N is the max number of chars tokens decoded from bpe tokens
+        x = self.encoder(
+            x=char_emb,
+            x_mask=char_mask
+        )['output']
+
+        # Get average embedding over the chars
+        mean_emb = ((x / char_mask.unsqueeze(-1).sum(1, keepdim=True)) * char_mask.unsqueeze(-1)).sum(1)
+        subword_emb = torch.zeros((subword_mask.size(0), subword_mask.size(1), mean_emb.size(-1)), device=device)
+        subword_emb[subword_mask.unsqueeze(-1).expand(-1, -1, mean_emb.size(-1))] = mean_emb.view(-1)
+
+        return subword_emb
+
+
 class SpeechDecoder(NeuralModule):
-    def __init__(self, speech_decoder_parms: DictConfig, lantent_dim: int, num_audio_codebooks: int, num_audio_tokens_per_codebook: int, llm_vocab_size: int):
+    def __init__(self, speech_decoder_parms: DictConfig, lantent_dim: int, num_audio_codebooks: int, num_audio_tokens_per_codebook: int, llm_vocab_size: int, llm_tokenizer_vocab_items: dict):
         super().__init__()
         self.use_input_cache = False
         self.speech_decoder_parms = speech_decoder_parms
@@ -159,6 +238,7 @@ class SpeechDecoder(NeuralModule):
         self.inference_speaker_reference = self.speech_decoder_parms.pop("inference_speaker_reference", None)
         self.max_speaker_reference_len = self.speech_decoder_parms.pop("max_speaker_reference_len", 5)
         self.speaker_encoder_model_name = self.speech_decoder_parms.pop("speaker_encoder_model_name", 'titanet_large')
+        self.cond_on_char_embedding = self.speech_decoder_parms.pop("cond_on_char_embedding", False)
 
         if self.use_speaker_encoder:
             # NeMo Speaker encoder
@@ -178,9 +258,14 @@ class SpeechDecoder(NeuralModule):
             if self.inference_speaker_reference:
                 self.update_inference_speaker_embedding(self.inference_speaker_reference)
 
-        if not self.cond_on_llm_latent and not self.cond_on_text_tokens:
+        if not self.cond_on_llm_latent and not self.cond_on_text_tokens and not self.cond_on_char_embedding:
             raise ValueError(
-                "At least one of 'cond_on_text_tokens' or 'cond_on_llm_latent' must be True for the Speech Decoder."
+                "At least one of 'cond_on_text_tokens' or 'cond_on_llm_latent' or 'cond_on_char_embedding' must be True for the Speech Decoder."
+            )
+
+        if self.cond_on_text_tokens and self.cond_on_char_embedding:
+            raise ValueError(
+                "'cond_on_text_tokens' and 'cond_on_char_embedding' are incompatible, you need to select one of these options !!"
             )
 
         # projection to adapt llm embeddings into the same shape of speech decoder expected input
@@ -194,6 +279,12 @@ class SpeechDecoder(NeuralModule):
 
         # projection to predict audio codes
         self.final_proj = nn.Linear(self.speech_decoder_parms["d_model"], num_audio_codebooks * num_audio_tokens_per_codebook)
+
+        if self.cond_on_char_embedding:
+            self.cas_params = dict(self.speech_decoder_parms)
+            # uses only 1 layer for the char encoder
+            self.cas_params["n_layers"] = 1
+            self.cas_encoder = CharAwareSubwordEncoder(self.cas_params, llm_tokenizer_vocab_items)
 
         # create embeddings for encode input tokens
         if self.cond_on_prev_audio_tokens:
@@ -305,6 +396,16 @@ class SpeechDecoder(NeuralModule):
                 speech_decoder_input = speech_decoder_input + text_tokens_embedded
             else:
                 speech_decoder_input = text_tokens_embedded
+
+        if self.cond_on_char_embedding:
+            char_embs = self.cas_encoder(input_text, subword_mask=speech_mask)
+
+            # if cond_on_llm_latent use a projection to sum the embeddings
+            if self.cond_on_llm_latent:
+                speech_decoder_input = self.text_input_projection(speech_decoder_input)
+                speech_decoder_input = speech_decoder_input + char_embs
+            else:
+                speech_decoder_input = char_embs
 
         if self.cond_on_speech_encoder_emb:
             if self.detach_input:
@@ -449,6 +550,7 @@ class S2sMCoreGPTModelSpeechDecoder(MCoreGPTModel):
         proj_head_loss_weights: List[float],
         vocab_size: int,
         speech_decoder_parms: DictConfig = None,
+        tokenizer=None,
         *args,
         **kwargs,
     ) -> None:
@@ -462,6 +564,15 @@ class S2sMCoreGPTModelSpeechDecoder(MCoreGPTModel):
 
         num_audio_codebooks = len(self.proj_head_dims) - 1 # -1 to not consider the text channel
         num_audio_tokens_per_codebook = self.proj_head_dims[-1] # the first in the list is the vocab size of llm and the rest is the codec vocab, so get the last one for simplicity
+        
+        
+        # get LLM vocab items
+        main_vocab_items = [(tokenizer.tokenizer.id_to_piece(idx), idx) for idx in range(tokenizer.tokenizer.get_piece_size())]
+        special_tokens_items = [
+            (tokenizer.id_to_special_token[tokenizer.original_vocab_size + i], tokenizer.original_vocab_size + i)
+            for i in range(tokenizer.vocab_size - tokenizer.original_vocab_size)
+        ]
+        llm_tokenizer_vocab_items = main_vocab_items + special_tokens_items
 
         self.speech_decoder = SpeechDecoder(
             speech_decoder_parms=dict(self.speech_decoder_parms),
@@ -469,6 +580,7 @@ class S2sMCoreGPTModelSpeechDecoder(MCoreGPTModel):
             num_audio_codebooks=num_audio_codebooks,
             num_audio_tokens_per_codebook=num_audio_tokens_per_codebook,
             llm_vocab_size=vocab_size,
+            llm_tokenizer_vocab_items=llm_tokenizer_vocab_items,
         )
 
     def extend_embedding(self, vocab_size: int, include_proj=False):
@@ -705,6 +817,7 @@ class S2sModularAudioGPTModelSpeechDecoder(ModularAudioGPTModel):
                 proj_head_dims=self.proj_head_dims,
                 proj_head_loss_weights=self.proj_head_loss_weights,
                 speech_decoder_parms=self.cfg.get('speech_decoder_parms', None),
+                tokenizer=self.tokenizer,
             )
 
             if self.cfg.get('scale_positional_embedding', False):
@@ -1907,6 +2020,27 @@ class S2sModularAudioGPTModelSpeechDecoder(ModularAudioGPTModel):
             speaker_encoder_emb = None
         else: # if training or eval extract embedding from first agent turn returned by the dataloader 
             if self.model.speech_decoder.use_speaker_encoder:
+                """
+                if not "s2s_duplex_overlap" in audio_batch:
+                    # print(audio_batch["answer_audios_first_turn"].type(), new_agent_signal.type())
+                    self.write_wave(
+                        audio_batch['answer_audio'][0],
+                        "/lustre/fsw/portfolios/convai/users/ecasanova/S2S-full-duplex/debug-samples/youtube_target_audio.wav",
+                        sr=22050
+                    )
+                    self.write_wave(
+                        audio_batch["answer_audios_first_turn"][0],
+                        "/lustre/fsw/portfolios/convai/users/ecasanova/S2S-full-duplex/debug-samples/youtube_speaker_ref.wav",
+                        sr=22050
+                    )
+                    self.write_wave(
+                        audio_batch["audio_signal"][0],
+                        "/lustre/fsw/portfolios/convai/users/ecasanova/S2S-full-duplex/debug-samples/youtube_input.wav",
+                        sr=16000
+                    )
+                    print(audio_batch)
+                    exit()
+                """
                 # limit speaker reference max len to 5 seconds
                 first_turn_agent_signal = audio_batch["answer_audios_first_turn"]
                 first_turn_agent_signal_lens = audio_batch["answer_audios_first_turn_lens"]

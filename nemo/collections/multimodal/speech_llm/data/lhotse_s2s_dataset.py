@@ -514,6 +514,26 @@ class LhotseAudioQuestionAnswerDataset(torch.utils.data.Dataset):
         answer_audios_first_turn = collate_vectors([a.squeeze(0) for a in answer_audios_first_turn], max_length=max(answer_audios_first_turn_lens), padding_value=0.0)
         answer_audios_first_turn_lens = torch.tensor(answer_audios_first_turn_lens).long()
 
+        """
+        import soundfile as sf
+        sr = 16000
+        file_name = "/lustre/fsw/portfolios/convai/users/ecasanova/S2S-full-duplex/debug-samples/dataloader_youtube_input.wav"
+        # one_audio_signal = np.clip(one_audio_signal, -1.0, 1.0)
+        sf.write(file_name, audio[0].cpu().numpy().astype(np.float32), sr)
+
+        sr = 22050
+        file_name = "/lustre/fsw/portfolios/convai/users/ecasanova/S2S-full-duplex/debug-samples/dataloader_youtube_target.wav"
+        # one_audio_signal = np.clip(one_audio_signal, -1.0, 1.0)
+        sf.write(file_name, answer_audios[0].cpu().numpy().astype(np.float32), sr)
+
+        sr = 22050
+        file_name = "/lustre/fsw/portfolios/convai/users/ecasanova/S2S-full-duplex/debug-samples/dataloader_youtube_spk_ref.wav"
+        # one_audio_signal = np.clip(one_audio_signal, -1.0, 1.0)
+        sf.write(file_name, answer_audios_first_turn[0].cpu().numpy().astype(np.float32), sr)
+        print(cuts[0])
+        #print(list(cuts.ids)[0])
+        """
+
         assert cnt + skipped == len(target_texts)
         assert target_texts_merge.shape[0] == len(num_turns)
         assert cnt + skipped + skipped_source == len(source_texts)
@@ -1307,7 +1327,6 @@ class LhotseAudioQuestionAnswerDataset(torch.utils.data.Dataset):
             return self.__getitem__tts_(cuts)
         if getattr(cuts[0], "tts_repeat_after_me", False):
             return self.__getitem__tts_repeat_after_me(cuts)
-        
         '''
         # half-duplex single turn s2s data and multi turn s2s data go here
         # TODO: the following stanza can be removed or cleaned if we only need duplex s2s
