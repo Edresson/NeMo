@@ -840,7 +840,7 @@ class S2sModularAudioGPTModelSpeechDecoder(ModularAudioGPTModel):
         mos_model = cls.get_mos_models_and_configs(cfg)
         logging.info(f"Loaded MOS Model: {mos_model}")
 
-        def overwrite_state_dict_with_ckpt_path(ckpt_path, ignore=[], nemo_path='model_weights.ckpt'):
+        def overwrite_state_dict_with_ckpt_path(ckpt_path, ignore=[], include_only=[], nemo_path='model_weights.ckpt'):
             if ckpt_path is not None:
                 # this may only work for tp=1
                 # check scripts/nlp_language_modeling/merge_lora_weights/merge_salm.py on tp>1
@@ -853,7 +853,7 @@ class S2sModularAudioGPTModelSpeechDecoder(ModularAudioGPTModel):
                 else:
                     torch_state_dict = torch.load(salm_model_path)['state_dict']
                 torch_state_dict = {k: v for k, v in torch_state_dict.items() if not any([i in k for i in ignore])}
-                
+
                 # remove layers with shape mismatch
                 model_dict = model.state_dict()
                 for k, v in list(torch_state_dict.items()):
@@ -864,10 +864,21 @@ class S2sModularAudioGPTModelSpeechDecoder(ModularAudioGPTModel):
                     elif k in model_dict and hasattr(model_dict[k], "numel") and v.numel() != model_dict[k].numel():
                         del torch_state_dict[k]
                         print(" | > Layer with shape mismatach in the model definition: {}".format(k))
+                    elif len(include_only):
+                        delete_key = True
+                        for pattern in include_only:
+                            if pattern in k:
+                                delete_key = False
+                                break
+
+                        if delete_key:
+                            del torch_state_dict[k]
+                            print(" | > Layer delete because it is not in include_only list: {}".format(k))
 
                 model.setup_complete = False
                 model.load_state_dict(torch_state_dict, strict=False)
                 logging.info(f"loading from {ckpt_path}: {torch_state_dict.keys()}")
+                print(" | > {} / {} layers are restored.".format(len(torch_state_dict), len(model_dict)))
 
         def overwrite_speech_decoder_state_dict_with_tts_ckpt_path(ckpt_path, nemo_path='model_weights.ckpt'):
             if ckpt_path is not None:
@@ -906,7 +917,7 @@ class S2sModularAudioGPTModelSpeechDecoder(ModularAudioGPTModel):
         overwrite_state_dict_with_ckpt_path(cfg.model.get('salm_model_path'))
         overwrite_state_dict_with_ckpt_path(cfg.model.get('s2s_salm_model_path'), ignore=['model.'])
         overwrite_speech_decoder_state_dict_with_tts_ckpt_path(cfg.model.get('tts_model_path', None))
-
+        overwrite_state_dict_with_ckpt_path(cfg.model.get('salm_model_path_load_speech_decoder', None), include_only=[".speech_decoder."])
         model.padded_vocab_size = cfg.model.s2s_vocab_size
 
         if cfg.model.get('megatron_amp_O2', False):
