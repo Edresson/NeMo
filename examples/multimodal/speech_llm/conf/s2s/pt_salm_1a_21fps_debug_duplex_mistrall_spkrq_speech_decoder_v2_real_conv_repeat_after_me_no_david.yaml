@@ -267,8 +267,60 @@ model:
       shard_seed: "trng"
       sampler_fusion: randomized_round_robin
       sampler_weights:
-        duplex: 0.5
-        blackwell: 0.5
+        duplex: 0.35
+        blackwell: 0.35
+        ttsrepeat: 0.25
+
+      ttsrepeat:
+        input_cfg:
+        - type: group
+          input_cfg:
+            - type: lhotse_shar
+              weight: 2.0
+              shar_path:
+                cuts: /lustre/fsw/portfolios/llmservice/projects/llmservice_nemo_speechlm/data/TTS/tts_lhotse_datasets_repeat_after_me/hifitts_v0/cuts.{000000..000302}.jsonl.gz
+                recording: /lustre/fsw/portfolios/llmservice/projects/llmservice_nemo_speechlm/data/TTS/tts_lhotse_datasets/hifitts_v0/recording.{000000..000302}.tar
+                target_audio: /lustre/fsw/portfolios/llmservice/projects/llmservice_nemo_speechlm/data/TTS/tts_lhotse_datasets/hifitts_v0/target_audio.{000000..000302}.tar
+              # shar_path: /lustre/fsw/portfolios/llmservice/projects/llmservice_nemo_speechlm/data/TTS/tts_lhotse_datasets/hifitts_v0/
+              tags:
+                tts_repeat_after_me: True
+            - type: lhotse_shar
+              weight: 2.0
+              shar_path:
+                cuts: /lustre/fsw/portfolios/llmservice/projects/llmservice_nemo_speechlm/data/TTS/tts_lhotse_datasets_repeat_after_me/libri100/cuts.{000000..000030}.jsonl.gz
+                recording: /lustre/fsw/portfolios/llmservice/projects/llmservice_nemo_speechlm/data/TTS/tts_lhotse_datasets/libri100/recording.{000000..000030}.tar
+                target_audio: /lustre/fsw/portfolios/llmservice/projects/llmservice_nemo_speechlm/data/TTS/tts_lhotse_datasets/libri100/target_audio.{000000..000030}.tar
+              # shar_path: /lustre/fsw/portfolios/llmservice/projects/llmservice_nemo_speechlm/data/TTS/tts_lhotse_datasets/libri100/
+              tags:
+                tts_repeat_after_me: True
+            - type: lhotse_shar
+              weight: 4.0
+              shar_path:
+                cuts: /lustre/fsw/portfolios/llmservice/projects/llmservice_nemo_speechlm/data/TTS/tts_lhotse_datasets_repeat_after_me/libri360/cuts.{000000..000107}.jsonl.gz
+                recording: /lustre/fsw/portfolios/llmservice/projects/llmservice_nemo_speechlm/data/TTS/tts_lhotse_datasets/libri360/recording.{000000..000107}.tar
+                target_audio: /lustre/fsw/portfolios/llmservice/projects/llmservice_nemo_speechlm/data/TTS/tts_lhotse_datasets/libri360/target_audio.{000000..000107}.tar
+              # shar_path: /lustre/fsw/portfolios/llmservice/projects/llmservice_nemo_speechlm/data/TTS/tts_lhotse_datasets/libri360/
+              tags:
+                tts_repeat_after_me: True
+            - type: lhotse_shar
+              weight: 1.0
+              shar_path:
+                cuts: /lustre/fsw/portfolios/llmservice/projects/llmservice_nemo_speechlm/data/TTS/tts_lhotse_datasets_repeat_after_me/rivaLindyRodney/cuts.{000000..000042}.jsonl.gz
+                recording: /lustre/fsw/portfolios/llmservice/projects/llmservice_nemo_speechlm/data/TTS/tts_lhotse_datasets/rivaLindyRodney/recording.{000000..000042}.tar
+                target_audio: /lustre/fsw/portfolios/llmservice/projects/llmservice_nemo_speechlm/data/TTS/tts_lhotse_datasets/rivaLindyRodney/target_audio.{000000..000042}.tar
+              # shar_path: /lustre/fsw/portfolios/llmservice/projects/llmservice_nemo_speechlm/data/TTS/tts_lhotse_datasets/rivaLindyRodney
+              tags:
+                tts_repeat_after_me: True
+            - type: lhotse_shar
+              weight: 9.0
+              shar_path:
+                cuts: /lustre/fsw/portfolios/llmservice/projects/llmservice_nemo_speechlm/data/TTS/tts_lhotse_datasets_repeat_after_me/InternalMLSEnglish17k/cuts.{000000..004151}.jsonl.gz
+                recording: /lustre/fsw/portfolios/llmservice/projects/llmservice_nemo_speechlm/data/TTS/tts_lhotse_datasets/InternalMLSEnglish17k/recording.{000000..004151}.tar
+                target_audio: /lustre/fsw/portfolios/llmservice/projects/llmservice_nemo_speechlm/data/TTS/tts_lhotse_datasets/InternalMLSEnglish17k/target_audio.{000000..004151}.tar
+              # shar_path: /lustre/fsw/portfolios/llmservice/projects/llmservice_nemo_speechlm/data/TTS/tts_lhotse_datasets/InternalMLSEnglish17k
+              tags:
+                tts_repeat_after_me: True
+
       blackwell:
         input_cfg:
         # blackwell data 4x less frequent than fisher and 14x less frequent than david ai
@@ -303,126 +355,6 @@ model:
             shar_path: /lustre/fsw/portfolios/llmservice/projects/llmservice_nemo_speechlm/data/duplex/fisher/fisher_eng_p2_LDC2005S13/
             tags:
               s2s_duplex_overlap: True
-
-        - type: group
-          weight: 14
-          tags:
-            s2s_duplex_overlap: True
-
-          input_cfg:
-          - type: lhotse_shar
-            shar_path: /lustre/fsw/portfolios/llmservice/users/vtrinh/datasets/s2s_shar/duplex/david_ai/shar/16kHz/bucket_0
-
-          - type: lhotse_shar
-            shar_path: /lustre/fsw/portfolios/llmservice/users/vtrinh/datasets/s2s_shar/duplex/david_ai/shar/16kHz/bucket_1
-
-          - type: lhotse_shar
-            shar_path: /lustre/fsw/portfolios/llmservice/users/vtrinh/datasets/s2s_shar/duplex/david_ai/shar/16kHz/bucket_2
-
-          - type: lhotse_shar
-            shar_path: /lustre/fsw/portfolios/llmservice/users/vtrinh/datasets/s2s_shar/duplex/david_ai/shar/16kHz/bucket_3
-
-          - type: lhotse_shar
-            shar_path: /lustre/fsw/portfolios/llmservice/users/vtrinh/datasets/s2s_shar/duplex/david_ai/shar/16kHz/bucket_4
-
-          - type: lhotse_shar
-            shar_path: /lustre/fsw/portfolios/llmservice/users/vtrinh/datasets/s2s_shar/duplex/david_ai/shar/16kHz/bucket_5
-
-          - type: lhotse_shar
-            shar_path: /lustre/fsw/portfolios/llmservice/users/vtrinh/datasets/s2s_shar/duplex/david_ai/shar/16kHz/bucket_6
-
-          - type: lhotse_shar
-            shar_path: /lustre/fsw/portfolios/llmservice/users/vtrinh/datasets/s2s_shar/duplex/david_ai/shar/16kHz/bucket_7
-
-          - type: lhotse_shar
-            shar_path: /lustre/fsw/portfolios/llmservice/users/vtrinh/datasets/s2s_shar/duplex/david_ai/shar/24kHz/bucket_0
-
-          - type: lhotse_shar
-            shar_path: /lustre/fsw/portfolios/llmservice/users/vtrinh/datasets/s2s_shar/duplex/david_ai/shar/24kHz/bucket_1
-
-          - type: lhotse_shar
-            shar_path: /lustre/fsw/portfolios/llmservice/users/vtrinh/datasets/s2s_shar/duplex/david_ai/shar/24kHz/bucket_10
-
-          - type: lhotse_shar
-            shar_path: /lustre/fsw/portfolios/llmservice/users/vtrinh/datasets/s2s_shar/duplex/david_ai/shar/24kHz/bucket_11
-
-          - type: lhotse_shar
-            shar_path: /lustre/fsw/portfolios/llmservice/users/vtrinh/datasets/s2s_shar/duplex/david_ai/shar/24kHz/bucket_12
-
-          - type: lhotse_shar
-            shar_path: /lustre/fsw/portfolios/llmservice/users/vtrinh/datasets/s2s_shar/duplex/david_ai/shar/24kHz/bucket_13
-
-            #- type: lhotse_shar
-            #  shar_path: /lustre/fsw/portfolios/llmservice/users/vtrinh/datasets/s2s_shar/duplex/david_ai/shar/24kHz/bucket_14
-
-          - type: lhotse_shar
-            shar_path: /lustre/fsw/portfolios/llmservice/users/vtrinh/datasets/s2s_shar/duplex/david_ai/shar/24kHz/bucket_2
-
-          - type: lhotse_shar
-            shar_path: /lustre/fsw/portfolios/llmservice/users/vtrinh/datasets/s2s_shar/duplex/david_ai/shar/24kHz/bucket_3
-
-          - type: lhotse_shar
-            shar_path: /lustre/fsw/portfolios/llmservice/users/vtrinh/datasets/s2s_shar/duplex/david_ai/shar/24kHz/bucket_4
-
-          - type: lhotse_shar
-            shar_path: /lustre/fsw/portfolios/llmservice/users/vtrinh/datasets/s2s_shar/duplex/david_ai/shar/24kHz/bucket_5
-
-          - type: lhotse_shar
-            shar_path: /lustre/fsw/portfolios/llmservice/users/vtrinh/datasets/s2s_shar/duplex/david_ai/shar/24kHz/bucket_6
-
-          - type: lhotse_shar
-            shar_path: /lustre/fsw/portfolios/llmservice/users/vtrinh/datasets/s2s_shar/duplex/david_ai/shar/24kHz/bucket_7
-
-          - type: lhotse_shar
-            shar_path: /lustre/fsw/portfolios/llmservice/users/vtrinh/datasets/s2s_shar/duplex/david_ai/shar/24kHz/bucket_8
-
-          - type: lhotse_shar
-            shar_path: /lustre/fsw/portfolios/llmservice/users/vtrinh/datasets/s2s_shar/duplex/david_ai/shar/24kHz/bucket_9
-
-          - type: lhotse_shar
-            shar_path: /lustre/fsw/portfolios/llmservice/users/vtrinh/datasets/s2s_shar/duplex/david_ai/shar/32kHz/bucket_0
-
-          - type: lhotse_shar
-            shar_path: /lustre/fsw/portfolios/llmservice/users/vtrinh/datasets/s2s_shar/duplex/david_ai/shar/32kHz/bucket_1
-
-          - type: lhotse_shar
-            shar_path: /lustre/fsw/portfolios/llmservice/users/vtrinh/datasets/s2s_shar/duplex/david_ai/shar/32kHz/bucket_2
-
-          - type: lhotse_shar
-            shar_path: /lustre/fsw/portfolios/llmservice/users/vtrinh/datasets/s2s_shar/duplex/david_ai/shar/32kHz/bucket_3
-
-          - type: lhotse_shar
-            shar_path: /lustre/fsw/portfolios/llmservice/users/vtrinh/datasets/s2s_shar/duplex/david_ai/shar/32kHz/bucket_4
-
-          - type: lhotse_shar
-            shar_path: /lustre/fsw/portfolios/llmservice/users/vtrinh/datasets/s2s_shar/duplex/david_ai/shar/32kHz/bucket_5
-
-          - type: lhotse_shar
-            shar_path: /lustre/fsw/portfolios/llmservice/users/vtrinh/datasets/s2s_shar/duplex/david_ai/shar/32kHz/bucket_6
-
-          - type: lhotse_shar
-            shar_path: /lustre/fsw/portfolios/llmservice/users/vtrinh/datasets/s2s_shar/duplex/david_ai/shar/32kHz/bucket_7
-
-          - type: lhotse_shar
-            shar_path: /lustre/fsw/portfolios/llmservice/users/vtrinh/datasets/s2s_shar/duplex/david_ai/shar/44_1kHz/bucket_0
-
-          - type: lhotse_shar
-            shar_path: /lustre/fsw/portfolios/llmservice/users/vtrinh/datasets/s2s_shar/duplex/david_ai/shar/44_1kHz/bucket_1
-
-          - type: lhotse_shar
-            shar_path: /lustre/fsw/portfolios/llmservice/users/vtrinh/datasets/s2s_shar/duplex/david_ai/shar/44_1kHz/bucket_2
-
-          - type: lhotse_shar
-            shar_path: /lustre/fsw/portfolios/llmservice/users/vtrinh/datasets/s2s_shar/duplex/david_ai/shar/44_1kHz/bucket_3
-
-          - type: lhotse_shar
-            shar_path: /lustre/fsw/portfolios/llmservice/users/vtrinh/datasets/s2s_shar/duplex/david_ai/shar/44_1kHz/bucket_4
-
-          - type: lhotse_shar
-            shar_path: /lustre/fsw/portfolios/llmservice/users/vtrinh/datasets/s2s_shar/duplex/david_ai/shar/44_1kHz/bucket_5
-
-          - type: lhotse_shar
-            shar_path: /lustre/fsw/portfolios/llmservice/users/vtrinh/datasets/s2s_shar/duplex/david_ai/shar/8kHz/bucket_0
 
       duplex:
         input_cfg:
