@@ -239,6 +239,7 @@ class SpeechDecoder(NeuralModule):
         self.max_speaker_reference_len = self.speech_decoder_parms.pop("max_speaker_reference_len", 5)
         self.speaker_encoder_model_name = self.speech_decoder_parms.pop("speaker_encoder_model_name", 'titanet_large')
         self.cond_on_char_embedding = self.speech_decoder_parms.pop("cond_on_char_embedding", False)
+        self.speech_encoder_emb_quantizer_levels = self.speech_decoder_parms.pop("speech_encoder_emb_quantizer_levels", None)
 
         if self.use_speaker_encoder:
             # NeMo Speaker encoder
@@ -305,7 +306,14 @@ class SpeechDecoder(NeuralModule):
                 self.text_input_projection = nn.Linear(self.speech_decoder_parms["d_model"], self.speech_decoder_parms["d_model"])
 
         if self.cond_on_speech_encoder_emb:
-            self.speech_encoder_emb_projection = nn.Linear(lantent_dim, self.speech_decoder_parms["d_model"])
+            if self.speech_encoder_emb_quantizer_levels:
+                from nemo.collections.tts.modules.audio_codec_modules import FiniteScalarQuantizer
+                bottleneck_dim = len(self.speech_encoder_emb_quantizer_levels)
+                self.speech_encoder_emb_quantizer_projection = nn.Linear(lantent_dim, bottleneck_dim)
+                self.see_vector_quantizer = FiniteScalarQuantizer(self.speech_encoder_emb_quantizer_levels)
+                self.speech_encoder_emb_projection = nn.Linear(bottleneck_dim, self.speech_decoder_parms["d_model"])
+            else:
+                self.speech_encoder_emb_projection = nn.Linear(lantent_dim, self.speech_decoder_parms["d_model"])
 
     @property
     def device(self):
@@ -365,13 +373,6 @@ class SpeechDecoder(NeuralModule):
                     self.cache["input_text"] = torch.cat([self.cache["input_text"], input_text], dim=1)
                     input_text = self.cache["input_text"]
 
-            if self.cache["speech_encoder_emb"] is None:
-                self.cache["speech_encoder_emb"] = speech_encoder_emb
-            else:
-                if speech_encoder_emb is not None:
-                    self.cache["speech_encoder_emb"] = torch.cat([self.cache["speech_encoder_emb"], speech_encoder_emb], dim=1)
-                    speech_encoder_emb = self.cache["speech_encoder_emb"]
-
 
         # map hidden states to the shape of the
         if hidden_states is not None and self.input_proj is not None:
@@ -420,6 +421,26 @@ class SpeechDecoder(NeuralModule):
         if self.cond_on_speech_encoder_emb:
             if self.detach_input:
                 speech_encoder_emb = speech_encoder_emb.detach()
+
+            
+            if self.use_input_cache:
+                if self.speech_encoder_emb_quantizer_levels:
+                    speech_encoder_emb = self.speech_encoder_emb_quantizer_projection(speech_encoder_emb[:, -1:])
+                    speech_encoder_emb, _ = self.see_vector_quantizer(inputs=speech_encoder_emb.transpose(1, 2), input_len=None)
+                    speech_encoder_emb = speech_encoder_emb.transpose(1, 2)
+
+                if self.cache["speech_encoder_emb"] is None:
+                    self.cache["speech_encoder_emb"] = speech_encoder_emb
+                else:
+                    if speech_encoder_emb is not None:
+                        self.cache["speech_encoder_emb"] = torch.cat([self.cache["speech_encoder_emb"], speech_encoder_emb], dim=1)
+                        speech_encoder_emb = self.cache["speech_encoder_emb"]
+            else:
+                if self.speech_encoder_emb_quantizer_levels:
+                    speech_encoder_emb = self.speech_encoder_emb_quantizer_projection(speech_encoder_emb)
+                    speech_encoder_emb, _ = self.see_vector_quantizer(inputs=speech_encoder_emb.transpose(1, 2), input_len=None)
+                    speech_encoder_emb = speech_encoder_emb.transpose(1, 2)
+
             speech_encoder_emb = self.speech_encoder_emb_projection(speech_encoder_emb)
             speech_decoder_input = speech_decoder_input + speech_encoder_emb
 
