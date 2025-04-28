@@ -398,7 +398,17 @@ class SpeechDecoder(NeuralModule):
                 speech_decoder_input = text_tokens_embedded
 
         if self.cond_on_char_embedding:
-            char_embs = self.cas_encoder(input_text, subword_mask=speech_mask)
+            # if inference time cache char_embs to speedup inference
+            if self.use_input_cache:
+                char_emb_last = self.cas_encoder(input_text[:, -1:], subword_mask=speech_mask[:, -1:])
+                if self.cache["char_embs"] is None:
+                    self.cache["char_embs"] = char_emb_last
+                else:
+                    self.cache["char_embs"] = torch.cat([self.cache["char_embs"], char_emb_last], dim=1)
+
+                char_embs = self.cache["char_embs"]
+            else:
+                char_embs = self.cas_encoder(input_text, subword_mask=speech_mask)
 
             # if cond_on_llm_latent use a projection to sum the embeddings
             if self.cond_on_llm_latent:
@@ -539,6 +549,7 @@ class SpeechDecoder(NeuralModule):
             'input_audio_tokens': None,
             'input_text': None,
             'speech_encoder_emb': None,
+            'char_embs': None,
         }
 
 # ToDo: if condition speech tokens on LLM-backbone does not bring good results, we should decouple speech decoder with MCoreGPTModel to avoid the unnecessary complexity
@@ -2220,7 +2231,83 @@ class S2sModularAudioGPTModelSpeechDecoder(ModularAudioGPTModel):
                 loss_mask[:, :, :1] = torch.where(sliced_text_channel == self.tokenizer.bos_id, 6.0, loss_mask[:, :, :1])
                 loss_mask[:, :, :1] = torch.where(sliced_text_channel == self.tokenizer.eos_id, 6.0, loss_mask[:, :, :1])
             else:
-                raise ValueError("scale_loss_mask_by=bos_eos is only supported for target_texts_merge")
+                raise ValueError("scale_loss_mask_by=dynamic_text_non_sil_and_bos_eos is only supported for target_texts_merge")
+
+        elif scale_loss_mask_by == 'dynamic_text_non_sil_4x_and_bos_eos':
+            loss_mask = loss_mask.float()
+            if 'target_texts_merge' in audio_batch:
+                text_silence_token_id = self.tokenizer.pad_id if hasattr(self.tokenizer, 'pad_id') and self.tokenizer.pad_id >= 0 else self.tokenizer.unk_id
+                
+                # Set text loss weights
+                for i, answer_codec in enumerate(answer_codecs):
+                    current_mask = loss_mask[i, :, :1]
+                    num_real_padding_tokens = (torch.numel(current_mask) - current_mask.sum()).item()
+                    silence_idxs = labels[i, :, :1] == text_silence_token_id
+                    # ignore the padding ids
+                    silence_idxs = silence_idxs * current_mask.bool()
+                    num_silence_tokens = silence_idxs.sum().item()
+                    num_non_silence = torch.numel(silence_idxs) - num_real_padding_tokens
+                    factor = num_silence_tokens/num_non_silence
+
+                    # make silence text tokens 4 x times less relevant in the loss than the silence tokens
+                    new_silence_weight = factor / 4
+                    loss_mask[i, :, :1] = torch.where(silence_idxs, new_silence_weight, loss_mask[i, :, :1])
+
+
+                    # cont eos and bos tokens in the 
+                    sliced_text_channel = audio_batch['target_texts_merge'][i][: loss_mask.shape[1]].unsqueeze(-1)
+                    bos_tokens_idx = sliced_text_channel == self.tokenizer.bos_id
+                    eos_tokens_idx = sliced_text_channel == self.tokenizer.eos_id
+                    num_special_tokens = bos_tokens_idx.sum() + eos_tokens_idx.sum()
+
+                    # make eos/bos weight 15% of the the total non silence weight
+                    eos_bos_weight = max(1, (num_non_silence * 0.15)/num_special_tokens)
+                    loss_mask[i, :, :1] = torch.where(bos_tokens_idx, eos_bos_weight, loss_mask[i, :, :1])
+                    loss_mask[i, :, :1] = torch.where(eos_tokens_idx, eos_bos_weight, loss_mask[i, :, :1])
+
+                    # make the speech channels and text channel equivalent in terms of weights again
+                    current_speech_mask = loss_mask[i, :, :1]
+                    text_channel_avg_weight = loss_mask[i, :, :1][loss_mask[i, :, :1] != 0].mean()
+                    loss_mask[i, :, 1:] = torch.where(loss_mask[i, :, 1:] != 0, text_channel_avg_weight, loss_mask[i, :, 1:])
+
+        elif scale_loss_mask_by == 'dynamic_text_non_sil_2x_and_bos_eos':
+            loss_mask = loss_mask.float()
+            if 'target_texts_merge' in audio_batch:
+                text_silence_token_id = self.tokenizer.pad_id if hasattr(self.tokenizer, 'pad_id') and self.tokenizer.pad_id >= 0 else self.tokenizer.unk_id
+                
+                # Set text loss weights
+                for i, answer_codec in enumerate(answer_codecs):
+                    current_mask = loss_mask[i, :, :1]
+                    num_real_padding_tokens = (torch.numel(current_mask) - current_mask.sum()).item()
+                    silence_idxs = labels[i, :, :1] == text_silence_token_id
+                    # ignore the padding ids
+                    silence_idxs = silence_idxs * current_mask.bool()
+                    num_silence_tokens = silence_idxs.sum().item()
+                    num_non_silence = torch.numel(silence_idxs) - num_real_padding_tokens
+                    factor = num_silence_tokens/num_non_silence
+
+                    # make silence text tokens 2 x times less relevant in the loss than the silence tokens
+                    new_silence_weight = factor / 2
+                    loss_mask[i, :, :1] = torch.where(silence_idxs, new_silence_weight, loss_mask[i, :, :1])
+
+
+                    # cont eos and bos tokens in the 
+                    sliced_text_channel = audio_batch['target_texts_merge'][i][: loss_mask.shape[1]].unsqueeze(-1)
+                    bos_tokens_idx = sliced_text_channel == self.tokenizer.bos_id
+                    eos_tokens_idx = sliced_text_channel == self.tokenizer.eos_id
+                    num_special_tokens = bos_tokens_idx.sum() + eos_tokens_idx.sum()
+
+                    # make eos/bos weight 15% of the the total non silence weight
+                    eos_bos_weight = max(1, (num_non_silence * 0.15)/num_special_tokens)
+                    loss_mask[i, :, :1] = torch.where(bos_tokens_idx, eos_bos_weight, loss_mask[i, :, :1])
+                    loss_mask[i, :, :1] = torch.where(eos_tokens_idx, eos_bos_weight, loss_mask[i, :, :1])
+
+                    # make the speech channels and text channel equivalent in terms of weights again
+                    current_speech_mask = loss_mask[i, :, :1]
+                    text_channel_avg_weight = loss_mask[i, :, :1][loss_mask[i, :, :1] != 0].mean()
+                    loss_mask[i, :, 1:] = torch.where(loss_mask[i, :, 1:] != 0, text_channel_avg_weight, loss_mask[i, :, 1:])
+            else:
+                raise ValueError("scale_loss_mask_by=dynamic_text_non_sil_4x_and_bos_eos is only supported for target_texts_merge")
 
         elif scale_loss_mask_by == None:
             pass
