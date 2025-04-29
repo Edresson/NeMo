@@ -200,7 +200,7 @@ class CharAwareSubwordEncoder(NeuralModule):
             subword_mask = subword_mask.squeeze(-1)
 
         char_ids, char_lengths = self.prepare_inputs(subword_ids, subword_mask)
-        char_mask = sequence_mask(char_lengths).squeeze(-1)
+        char_mask = sequence_mask(char_lengths)
         char_emb = self.embed_tokens(char_ids)
         # char emb has the shape  [B*T, N, channels], where N is the max number of chars tokens decoded from bpe tokens
         x = self.encoder(
@@ -301,9 +301,9 @@ class SpeechDecoder(NeuralModule):
             else:
                 self.text_embeddings = nn.Embedding(llm_vocab_size, self.speech_decoder_parms["d_model"])
 
-            # if cond on llm latent create the projection to sum the embeddings
-            if self.cond_on_llm_latent:
-                self.text_input_projection = nn.Linear(self.speech_decoder_parms["d_model"], self.speech_decoder_parms["d_model"])
+        # if cond on llm latent create the projection to sum the embeddings
+        if self.cond_on_llm_latent and (self.cond_on_text_tokens or self.cond_on_char_embedding):
+            self.text_input_projection = nn.Linear(self.speech_decoder_parms["d_model"], self.speech_decoder_parms["d_model"])
 
         if self.cond_on_speech_encoder_emb:
             if self.speech_encoder_emb_quantizer_levels:
