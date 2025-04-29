@@ -20,7 +20,6 @@ class MimiAudioEncoder(NeuralModule):
         self.config.use_causal_conv = is_causal
         self.config.hidden_size = hidden_size
         self.config.sliding_window = sliding_window
-
         # define upsampling rate
         self.downsampling_rate = self.config.sampling_rate / self.config.frame_rate
 
@@ -28,15 +27,17 @@ class MimiAudioEncoder(NeuralModule):
         self.encoder_transformer = MimiTransformerModel(self.config)
 
         # extra downsample requeried because MiMiEncoder works in a different frame rate
-        self.downsample = MimiConv1d(
-            self.config,
-            self.config.hidden_size,
-            self.config.hidden_size,
-            kernel_size=2 * int(self.encodec_frame_rate / self.config.frame_rate),
-            stride=2,
-            bias=False,
-            pad_mode="replicate",
-        )
+        self.use_extra_downsample = self.encodec_frame_rate != self.config.frame_rate
+        if self.use_extra_downsample:
+            self.downsample = MimiConv1d(
+                self.config,
+                self.config.hidden_size,
+                self.config.hidden_size,
+                kernel_size=2 * int(self.encodec_frame_rate / self.config.frame_rate),
+                stride=2,
+                bias=False,
+                pad_mode="replicate",
+            )
 
         self.out_projection = MimiConv1d(
             self.config,
@@ -59,7 +60,10 @@ class MimiAudioEncoder(NeuralModule):
         embeddings = self.encoder_transformer(
             embeddings.transpose(1, 2)
         )[0].transpose(1, 2)
-        embeddings = self.downsample(embeddings)
+
+        if self.use_extra_downsample:
+            embeddings = self.downsample(embeddings)
+
         embeddings = self.out_projection(embeddings)
 
         # compute output_len based on downsampling rate
@@ -88,15 +92,17 @@ class MimiAudioDecoder(NeuralModule):
         self.decoder = MimiDecoder(self.config)
 
         # extra upsampling requeried because MiMiEncoder works in a different frame rate
-        self.upsample = MimiConvTranspose1d(
-            self.config,
-            self.config.hidden_size,
-            self.config.hidden_size,
-            kernel_size=2 * int(self.encodec_frame_rate / self.config.frame_rate),
-            stride=2,
-            bias=False,
-            groups=self.config.upsample_groups,
-        )
+        self.use_extra_upsample = self.encodec_frame_rate != self.config.frame_rate
+        if self.use_extra_upsample:
+            self.upsample = MimiConvTranspose1d(
+                self.config,
+                self.config.hidden_size,
+                self.config.hidden_size,
+                kernel_size=2 * int(self.encodec_frame_rate / self.config.frame_rate),
+                stride=2,
+                bias=False,
+                groups=self.config.upsample_groups,
+            )
 
         self.in_projection = MimiConv1d(
             self.config,
@@ -115,8 +121,9 @@ class MimiAudioDecoder(NeuralModule):
 
     def forward(self, inputs, input_len, past_key_values=None, return_dict=None, return_past_key_values=False):
         embeddings = self.in_projection(inputs)
+        if self.use_extra_upsample:
+            embeddings = self.upsample(embeddings)
 
-        embeddings = self.upsample(embeddings)
         decoder_outputs = self.decoder_transformer(
             embeddings.transpose(1, 2), past_key_values=past_key_values, return_dict=return_dict
         )

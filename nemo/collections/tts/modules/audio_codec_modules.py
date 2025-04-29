@@ -1870,7 +1870,7 @@ class GroupFiniteScalarQuantizer(VectorQuantizerBase):
         """Input is split into groups, each group is encoded separately, then the results are concatenated."""
         inputs_grouped = inputs.chunk(self.num_groups, dim=1)
         indices = []
-
+        # ToDo: replace it by while_loop
         for in_group, fsq_group in zip(inputs_grouped, self.fsqs):
             indices_group = fsq_group.encode(inputs=in_group, input_len=input_len)
             indices.append(indices_group)
