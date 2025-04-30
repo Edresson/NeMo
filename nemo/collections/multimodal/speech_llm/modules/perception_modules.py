@@ -93,6 +93,14 @@ class AudioPerceptionModule(NeuralModule, Exportable):
         else:
             self.proj = nn.Identity()
 
+        self.modality_adapter_quantizer_levels = cfg.get("modality_adapter_quantizer_levels", None)
+        if self.modality_adapter_quantizer_levels:
+            from nemo.collections.tts.modules.audio_codec_modules import FiniteScalarQuantizer
+            bottleneck_dim = len(self.modality_adapter_quantizer_levels)
+            self.modality_adapter_quantizer_bottleneck = nn.Linear(cfg.output_dim, bottleneck_dim)
+            self.modality_adapter_vector_quantizer = FiniteScalarQuantizer(self.modality_adapter_quantizer_levels)
+            self.modality_adapter_quantizer_projection = nn.Linear(bottleneck_dim, cfg.output_dim)
+
     def maybe_preprocess_audio(
         self,
         input_signal=None,
@@ -137,6 +145,10 @@ class AudioPerceptionModule(NeuralModule, Exportable):
 
         # b, c, t -> b, t, c
         encoded = self.proj(encoded.transpose(1, 2))
+        if self.modality_adapter_quantizer_levels is not None:
+            encoded = self.modality_adapter_quantizer_bottleneck(encoded)
+            encoded, _ = self.modality_adapter_vector_quantizer(inputs=encoded.transpose(1, 2), input_len=None)
+            encoded = self.modality_adapter_quantizer_projection(encoded.transpose(1, 2))
 
         return encoded, encoded_len
 
