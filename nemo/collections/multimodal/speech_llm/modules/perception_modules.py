@@ -97,9 +97,9 @@ class AudioPerceptionModule(NeuralModule, Exportable):
         if self.modality_adapter_quantizer_levels:
             from nemo.collections.tts.modules.audio_codec_modules import FiniteScalarQuantizer
             bottleneck_dim = len(self.modality_adapter_quantizer_levels)
-            self.modality_adapter_quantizer_bottleneck = nn.Linear(cfg.output_dim, bottleneck_dim)
+            self.modality_adapter_quantizer_bottleneck = nn.Linear(cfg.modality_adapter.d_model, bottleneck_dim)
             self.modality_adapter_vector_quantizer = FiniteScalarQuantizer(self.modality_adapter_quantizer_levels)
-            self.modality_adapter_quantizer_projection = nn.Linear(bottleneck_dim, cfg.output_dim)
+            self.modality_adapter_quantizer_projection = nn.Linear(bottleneck_dim, cfg.modality_adapter.d_model)
 
     def maybe_preprocess_audio(
         self,
@@ -141,14 +141,16 @@ class AudioPerceptionModule(NeuralModule, Exportable):
             processed_signal = self.spec_augmentation(input_spec=processed_signal, length=processed_signal_length)
 
         encoded, encoded_len = self.encoder(audio_signal=processed_signal, length=processed_signal_length)
+
+        if self.modality_adapter_quantizer_levels is not None:
+            encoded = self.modality_adapter_quantizer_bottleneck(encoded.transpose(1, 2))
+            encoded, _ = self.modality_adapter_vector_quantizer(inputs=encoded.transpose(1, 2), input_len=None)
+            encoded = self.modality_adapter_quantizer_projection(encoded.transpose(1, 2)).transpose(1, 2)
+
         encoded, encoded_len = self.modality_adapter(audio_signal=encoded, length=encoded_len)
 
         # b, c, t -> b, t, c
         encoded = self.proj(encoded.transpose(1, 2))
-        if self.modality_adapter_quantizer_levels is not None:
-            encoded = self.modality_adapter_quantizer_bottleneck(encoded)
-            encoded, _ = self.modality_adapter_vector_quantizer(inputs=encoded.transpose(1, 2), input_len=None)
-            encoded = self.modality_adapter_quantizer_projection(encoded.transpose(1, 2))
 
         return encoded, encoded_len
 
