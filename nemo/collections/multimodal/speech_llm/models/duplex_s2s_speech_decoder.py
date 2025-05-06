@@ -950,6 +950,7 @@ class S2sModularAudioGPTModelSpeechDecoder(ModularAudioGPTModel):
         overwrite_state_dict_with_ckpt_path(cfg.model.get('s2s_salm_model_path'), ignore=['model.'])
         overwrite_speech_decoder_state_dict_with_tts_ckpt_path(cfg.model.get('tts_model_path', None))
         overwrite_state_dict_with_ckpt_path(cfg.model.get('salm_model_path_load_speech_decoder', None), include_only=[".speech_decoder."])
+        overwrite_state_dict_with_ckpt_path(cfg.model.get('salm_model_path_load_perception', None), include_only=[".perception."])
         model.padded_vocab_size = cfg.model.s2s_vocab_size
 
         if cfg.model.get('megatron_amp_O2', False):
