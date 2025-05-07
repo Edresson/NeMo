@@ -101,6 +101,9 @@ class AudioCodecModel(ModelPT):
 
         # Number of samples in each audio frame that is encoded
         self.samples_per_frame = cfg.samples_per_frame
+        
+        # Grad clipping
+        self.grad_clip_value = cfg.get("grad_clip_value", 0.0)
 
         # Discriminator updates
         self.disc_updates_per_period = cfg.get("disc_updates_per_period", 1)
@@ -671,6 +674,9 @@ class AudioCodecModel(ModelPT):
 
             optim_disc.zero_grad()
             self.manual_backward(loss_disc)
+            if self.grad_clip_value != 0:
+                torch.nn.utils.clip_grad_norm_(self.parameters(), self.grad_clip_value)
+
             optim_disc.step()
 
         generator_losses = []
@@ -784,6 +790,9 @@ class AudioCodecModel(ModelPT):
 
         optim_gen.zero_grad()
         self.manual_backward(loss_gen_all)
+        if self.grad_clip_value != 0:
+            torch.nn.utils.clip_grad_norm_(self.parameters(), self.grad_clip_value)
+
         optim_gen.step()
 
         self.update_lr()
