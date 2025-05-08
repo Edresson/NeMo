@@ -1,10 +1,126 @@
 import numpy as np
 import math
 import torch
+import torch.nn as nn
+import torch.nn.functional as F
 
 from transformers import MimiConfig
 from transformers.models.mimi.modeling_mimi import MimiEncoder, MimiTransformerModel, MimiConv1d, MimiConvTranspose1d, MimiDecoder
 from nemo.core.classes.module import NeuralModule
+
+from contextlib import contextmanager
+@contextmanager
+def default_precision(dtype=torch.float32):
+    default_dtype = torch.get_default_dtype()
+    torch.set_default_dtype(dtype)
+    try:
+        yield
+    finally:
+        torch.set_default_dtype(default_dtype)
+
+
+class ReshapeTransformerEncoder(NeuralModule):
+    """
+    Transformer Audio encoder.
+
+    Args:
+        output_dim: Dimension of encoder output.
+    """
+
+    def __init__(
+        self,
+        samples_per_frame: int,
+        audio_proj_size: int = 1024, 
+        output_dim: int = 32,
+        n_layers: int = 8,
+        d_model: int = 1024,
+        d_ffn: int = 4096,
+        is_causal: bool = True,
+        sliding_window_size: int = 12,
+    ):
+        super().__init__()
+
+
+        self.samples_per_frame = samples_per_frame
+        self.audio_proj_size = audio_proj_size
+        self.output_dim = output_dim
+
+        self.config = MimiConfig()
+        self.config.use_causal_conv = is_causal
+        self.config.num_hidden_layers = n_layers
+        self.config.intermediate_size = d_ffn
+        self.config.hidden_size = d_model
+        self.config.sliding_window = sliding_window_size
+        self.layers = MimiTransformerModel(self.config)
+
+        self.inp_projection_no_bias = nn.Linear(samples_per_frame, audio_proj_size, bias=False)
+        self.inp_projection = nn.Linear(audio_proj_size, d_model)
+        self.out_projection = nn.Linear(d_model, output_dim)
+
+    def forward(self, audio, audio_len):
+        encoded_len = audio_len
+        B, T = audio.size()
+        audio = audio.reshape(B, -1, self.samples_per_frame) # B, T, F, where 7 is the number of samples per frame that controls the frame rate
+        with default_precision(torch.float32):
+            encoded_len = (audio_len / self.samples_per_frame).long()
+
+        out = self.inp_projection_no_bias(audio)
+        out = self.inp_projection(out)
+        out = self.layers(out)[0]
+        # out projection
+        encoded = self.out_projection(out).transpose(1, 2)
+        return encoded, encoded_len
+
+
+class ReshapeTransformerDecoder(NeuralModule):
+    """
+    Transformer Audio Decoder.
+
+    Args:
+        input_dim: Dimension of encoder output.
+    """
+
+    def __init__(
+        self,
+        samples_per_frame: int,
+        audio_proj_size: int = 1024, 
+        input_dim: int = 32,
+        n_layers: int = 8,
+        d_model: int = 1024,
+        d_ffn: int = 4096,
+        is_causal: bool = True,
+        sliding_window_size: int = 12,
+    ):
+        super().__init__()
+
+
+        self.samples_per_frame = samples_per_frame
+        self.audio_proj_size = audio_proj_size
+
+        self.config = MimiConfig()
+        self.config.use_causal_conv = is_causal
+        self.config.num_hidden_layers = n_layers
+        self.config.intermediate_size = d_ffn
+        self.config.hidden_size = d_model
+        self.config.sliding_window = sliding_window_size
+        self.layers = MimiTransformerModel(self.config)
+
+        self.inp_projection = nn.Linear(input_dim, d_model)
+        self.out_projection = nn.Linear(d_model, audio_proj_size)
+        self.out_projection_no_bias = nn.Linear(audio_proj_size, samples_per_frame, bias=False)
+
+    def forward(self, inputs, input_len):
+        encoded_len = input_len
+        out = self.inp_projection(inputs.transpose(1, 2))
+        out = self.layers(out)[0]
+
+        out = self.out_projection(out)
+        audio = self.out_projection_no_bias(out)
+
+        # resample audio to size
+        audio = audio.reshape(inputs.size(0), -1)
+        audio_len = (input_len*self.samples_per_frame).int()
+        return audio, audio_len
 
 
 class MimiAudioEncoder(NeuralModule):
