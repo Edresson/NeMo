@@ -673,11 +673,14 @@ class AudioCodecModel(ModelPT):
             metrics["d_loss"] = loss_disc
 
             optim_disc.zero_grad()
-            self.manual_backward(loss_disc)
-            if self.grad_clip_value != 0:
-                torch.nn.utils.clip_grad_norm_(self.parameters(), self.grad_clip_value)
+            if not torch.isnan(loss_disc):
+                self.manual_backward(loss_disc)
+                if self.grad_clip_value != 0:
+                    torch.nn.utils.clip_grad_norm_(self.parameters(), self.grad_clip_value)
 
-            optim_disc.step()
+                optim_disc.step()
+            else:
+                print("NaN detected at step", self.global_step, "Batch id:", batch_idx)
 
         generator_losses = []
         # stft does not support bf16, so make it run in fp32
@@ -789,13 +792,16 @@ class AudioCodecModel(ModelPT):
         loss_gen_all = sum(generator_losses)
 
         optim_gen.zero_grad()
-        self.manual_backward(loss_gen_all)
-        if self.grad_clip_value != 0:
-            torch.nn.utils.clip_grad_norm_(self.parameters(), self.grad_clip_value)
+        if not torch.isnan(loss_gen_all):
+            self.manual_backward(loss_gen_all)
+            if self.grad_clip_value != 0:
+                torch.nn.utils.clip_grad_norm_(self.parameters(), self.grad_clip_value)
 
-        optim_gen.step()
+            optim_gen.step()
 
-        self.update_lr()
+            self.update_lr()
+        else:
+            print("NaN detected at step", self.global_step, "Batch id:", batch_idx)
 
         self.log_dict(metrics, on_step=True, sync_dist=True)
         self.log("t_loss", loss_mel_l1, prog_bar=True, logger=False, sync_dist=True)
