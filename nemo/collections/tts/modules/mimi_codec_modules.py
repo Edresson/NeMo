@@ -7,6 +7,7 @@ import torch.nn.functional as F
 from transformers import MimiConfig
 from transformers.models.mimi.modeling_mimi import MimiEncoder, MimiTransformerModel, MimiConv1d, MimiConvTranspose1d, MimiDecoder
 from nemo.core.classes.module import NeuralModule
+from nemo.collections.tts.parts.utils.helpers import get_mask_from_lengths
 
 from contextlib import contextmanager
 @contextmanager
@@ -40,12 +41,14 @@ class ReshapeTransformerEncoder(NeuralModule):
     ):
         super().__init__()
 
-
+        self.is_causal = is_causal
         self.samples_per_frame = samples_per_frame
         self.audio_proj_size = audio_proj_size
         self.output_dim = output_dim
 
         self.config = MimiConfig()
+        self.config._attn_implementation = "eager"
+
         self.config.use_causal_conv = is_causal
         self.config.num_hidden_layers = n_layers
         self.config.intermediate_size = d_ffn
@@ -58,6 +61,12 @@ class ReshapeTransformerEncoder(NeuralModule):
         self.out_projection = nn.Linear(d_model, output_dim)
 
     def forward(self, audio, audio_len):
+        if self.is_causal:
+            mask = get_mask_from_lengths(audio_len)
+        else:
+            # mask none does not apply causal mask
+            mask = None
+
         encoded_len = audio_len
         B, T = audio.size()
         audio = audio.reshape(B, -1, self.samples_per_frame) # B, T, F, where 7 is the number of samples per frame that controls the frame rate
@@ -66,7 +75,8 @@ class ReshapeTransformerEncoder(NeuralModule):
 
         out = self.inp_projection_no_bias(audio)
         out = self.inp_projection(out)
-        out = self.layers(out)[0]
+
+        out = self.layers(out, attention_mask=mask)[0]
         # out projection
         encoded = self.out_projection(out).transpose(1, 2)
         return encoded, encoded_len
@@ -93,11 +103,13 @@ class ReshapeTransformerDecoder(NeuralModule):
     ):
         super().__init__()
 
-
         self.samples_per_frame = samples_per_frame
         self.audio_proj_size = audio_proj_size
+        self.is_causal = is_causal
 
         self.config = MimiConfig()
+        self.config._attn_implementation = "eager"
+        
         self.config.use_causal_conv = is_causal
         self.config.num_hidden_layers = n_layers
         self.config.intermediate_size = d_ffn
@@ -110,9 +122,15 @@ class ReshapeTransformerDecoder(NeuralModule):
         self.out_projection_no_bias = nn.Linear(audio_proj_size, samples_per_frame, bias=False)
 
     def forward(self, inputs, input_len):
+        if self.is_causal:
+            mask = get_mask_from_lengths(input_len)
+        else:
+            # mask none does not apply causal mask
+            mask = None
+
         encoded_len = input_len
         out = self.inp_projection(inputs.transpose(1, 2))
-        out = self.layers(out)[0]
+        out = self.layers(out, attention_mask=mask)[0]
 
         out = self.out_projection(out)
         audio = self.out_projection_no_bias(out)
@@ -126,8 +144,11 @@ class ReshapeTransformerDecoder(NeuralModule):
 class MimiAudioEncoder(NeuralModule):
     def __init__(self, out_size=32, sampling_rate=24000, upsampling_ratios=[8, 6, 5, 4], frame_rate=12.5, is_causal=True, hidden_size=512, sliding_window=250, num_transformer_layers=8):
         super().__init__()
+        self.is_causal = is_causal
+
         # get Mimi default config
         self.config = MimiConfig()
+        self.config._attn_implementation = "eager"
 
         # redefine configs based on nemo configs
         self.config.frame_rate = frame_rate
@@ -173,10 +194,16 @@ class MimiAudioEncoder(NeuralModule):
         return math.ceil(self.config.sampling_rate / hop_length)
 
     def forward(self, audio, audio_len):
+        if self.is_causal:
+            mask = get_mask_from_lengths(audio_len)
+        else:
+            # mask none does not apply causal mask
+            mask = None
+
         audio = audio.unsqueeze(1)
         embeddings = self.encoder(audio)
         embeddings = self.encoder_transformer(
-            embeddings.transpose(1, 2)
+            embeddings.transpose(1, 2), attention_mask=mask
         )[0].transpose(1, 2)
 
         if self.use_extra_downsample:
@@ -192,8 +219,11 @@ class MimiAudioEncoder(NeuralModule):
 class MimiAudioDecoder(NeuralModule):
     def __init__(self, input_size=32, sampling_rate=24000, upsampling_ratios=[8, 6, 5, 4], frame_rate=12.5, is_causal=True, hidden_size=512, sliding_window=250, num_transformer_layers=8):
         super().__init__()
+        self.is_causal = is_causal
+
         # get Mimi default config
         self.config = MimiConfig()
+        self.config._attn_implementation = "eager"
 
         # redefine configs based on nemo configs
         self.config.frame_rate = frame_rate
@@ -239,12 +269,18 @@ class MimiAudioDecoder(NeuralModule):
         return math.ceil(self.config.sampling_rate / hop_length)
 
     def forward(self, inputs, input_len, past_key_values=None, return_dict=None, return_past_key_values=False):
+        if self.is_causal:
+            mask = get_mask_from_lengths(input_len)
+        else:
+            # mask none does not apply causal mask
+            mask = None
+
         embeddings = self.in_projection(inputs)
         if self.use_extra_upsample:
             embeddings = self.upsample(embeddings)
 
         decoder_outputs = self.decoder_transformer(
-            embeddings.transpose(1, 2), past_key_values=past_key_values, return_dict=return_dict
+            embeddings.transpose(1, 2), attention_mask=mask, past_key_values=past_key_values, return_dict=return_dict
         )
 
         embeddings = decoder_outputs[0].transpose(1, 2)
