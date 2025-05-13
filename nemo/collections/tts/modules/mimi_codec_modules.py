@@ -38,6 +38,8 @@ class ReshapeTransformerEncoder(NeuralModule):
         d_ffn: int = 4096,
         is_causal: bool = True,
         sliding_window_size: int = 12,
+        max_position_embeddings: int = 8000,
+        rope_theta: float = 10000.0,
     ):
         super().__init__()
 
@@ -48,6 +50,8 @@ class ReshapeTransformerEncoder(NeuralModule):
 
         self.config = MimiConfig()
         self.config._attn_implementation = "eager"
+        self.config.max_position_embeddings = max_position_embeddings
+        self.config.rope_theta = rope_theta
 
         self.config.use_causal_conv = is_causal
         self.config.num_hidden_layers = n_layers
@@ -100,6 +104,8 @@ class ReshapeTransformerDecoder(NeuralModule):
         d_ffn: int = 4096,
         is_causal: bool = True,
         sliding_window_size: int = 12,
+        max_position_embeddings: int = 8000,
+        rope_theta: float = 10000.0,
     ):
         super().__init__()
 
@@ -109,7 +115,9 @@ class ReshapeTransformerDecoder(NeuralModule):
 
         self.config = MimiConfig()
         self.config._attn_implementation = "eager"
-        
+        self.config.max_position_embeddings = max_position_embeddings
+        self.config.rope_theta = rope_theta
+
         self.config.use_causal_conv = is_causal
         self.config.num_hidden_layers = n_layers
         self.config.intermediate_size = d_ffn
