@@ -66,17 +66,17 @@ class ReshapeTransformerEncoder(NeuralModule):
         self.out_projection = nn.Linear(d_model, output_dim)
 
     def forward(self, audio, audio_len):
-        if self.is_causal:
-            mask = get_mask_from_lengths(audio_len)
-        else:
-            # mask none does not apply causal mask
-            mask = None
-
         encoded_len = audio_len
         B, T = audio.size()
         audio = audio.reshape(B, -1, self.samples_per_frame) # B, T, F, where 7 is the number of samples per frame that controls the frame rate
         with default_precision(torch.float32):
             encoded_len = (audio_len / self.samples_per_frame).long()
+
+        if self.is_causal:
+            mask = get_mask_from_lengths(encoded_len)
+        else:
+            # mask none does not apply causal mask
+            mask = None
 
         out = self.inp_projection_no_bias(audio)
         out = self.inp_projection(out)
