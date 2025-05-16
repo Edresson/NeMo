@@ -40,6 +40,7 @@ class ReshapeTransformerEncoder(NeuralModule):
         sliding_window_size: int = 12,
         max_position_embeddings: int = 8000,
         rope_theta: float = 10000.0,
+        attn_implementation: str = "eager",
     ):
         super().__init__()
 
@@ -49,7 +50,7 @@ class ReshapeTransformerEncoder(NeuralModule):
         self.output_dim = output_dim
 
         self.config = MimiConfig()
-        self.config._attn_implementation = "eager"
+        self.config._attn_implementation = attn_implementation
         self.config.max_position_embeddings = max_position_embeddings
         self.config.rope_theta = rope_theta
 
@@ -106,6 +107,7 @@ class ReshapeTransformerDecoder(NeuralModule):
         sliding_window_size: int = 12,
         max_position_embeddings: int = 8000,
         rope_theta: float = 10000.0,
+        attn_implementation: str = "eager",
     ):
         super().__init__()
 
@@ -114,7 +116,7 @@ class ReshapeTransformerDecoder(NeuralModule):
         self.is_causal = is_causal
 
         self.config = MimiConfig()
-        self.config._attn_implementation = "eager"
+        self.config._attn_implementation = attn_implementation
         self.config.max_position_embeddings = max_position_embeddings
         self.config.rope_theta = rope_theta
 
