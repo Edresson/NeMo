@@ -1336,7 +1336,7 @@ class DiscriminatorSTFT(NeuralModule):
            stability of the feature matching loss
     """
 
-    def __init__(self, filters: int = 32, lrelu_slope: float = 0.1):
+    def __init__(self, filters: int = 32, lrelu_slope: float = 0.1, padding: tuple = (1, 1)):
         super().__init__()
 
         self.activation = nn.LeakyReLU(lrelu_slope)
@@ -1406,6 +1406,8 @@ class MultiBandDiscriminatorSTFT(NeuralModule):
         self.discriminators = nn.ModuleList([DiscriminatorSTFT() for _ in stft_bands])
         n_stft = self.n_fft // 2 + 1
         self.stft_bands = [(int(band[0] * n_stft), int(band[1] * n_stft)) for band in stft_bands]
+
+
 
     def compute_stft(self, audio):
         # [B, fft, T_spec]
