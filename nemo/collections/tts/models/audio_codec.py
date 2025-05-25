@@ -262,7 +262,7 @@ class AudioCodecModel(ModelPT):
                     self.distil_loss = torch.nn.MSELoss(reduction='none')# MaskedMSELoss()
                 else:
                     self.distil_loss = AudioTokenLoss(num_codebooks=self.token_predictor.num_codebooks)
-        
+
         self.use_sampling_flow = cfg.get("use_sampling_flow", False)
         self.inference_sampling_temperature = cfg.get("inference_sampling_temperature", 0.667)
         self.flow_loss_scale = cfg.get("flow_loss_scale", 1.0)

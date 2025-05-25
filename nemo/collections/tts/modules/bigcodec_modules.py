@@ -45,7 +45,7 @@ class SpecDiscriminator(nn.Module):
                  use_weight_norm=True,
                  ):
         super().__init__()
-
+        self.use_weight_norm = use_weight_norm
         if stft_params is None:
             stft_params = {
                 'fft_sizes': [1024, 2048, 512],
@@ -67,8 +67,8 @@ class SpecDiscriminator(nn.Module):
                 downsample_scales=downsample_scales,
             )
 
-        if use_weight_norm:
-            self.apply_weight_norm()
+        # uses weight norm if self.use_weight_norm is true, else use spectral norm
+        self.apply_norm()
         self.reset_parameters()
 
     def forward(self, audio_real, audio_gen):
@@ -108,11 +108,12 @@ class SpecDiscriminator(nn.Module):
                 return
         self.apply(_remove_weight_norm)
 
-    def apply_weight_norm(self):
-        def _apply_weight_norm(m):
+    def apply_norm(self):
+        norm_fn = torch.nn.utils.weight_norm if self.use_weight_norm else torch.nn.utils.spectral_norm
+        def _apply_norm(m):
             if isinstance(m, nn.Conv1d) or isinstance(m, nn.ConvTranspose1d) or isinstance(m, nn.Conv2d) or isinstance(m, nn.ConvTranspose2d):
-                torch.nn.utils.weight_norm(m)
-        self.apply(_apply_weight_norm)
+                norm_fn(m)
+        self.apply(_apply_norm)
 
     def reset_parameters(self):
         def _reset_parameters(m):
