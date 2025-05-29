@@ -1,4 +1,4 @@
-# Copyright (c) 2024, NVIDIA CORPORATION.  All rights reserved.
+# Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -12,17 +12,26 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from typing import Optional
+from typing import TYPE_CHECKING, Any, Optional
 
+import lightning.pytorch as pl
 import nemo_run as run
-import pytorch_lightning as pl
+import torch
 
 import nemo.lightning as nl
 from nemo.collections import llm
 from nemo.collections.llm.gpt.data.packed_sequence import PackedSequenceSpecs
+from nemo.collections.llm.peft import DoRA, LoRA
 from nemo.collections.llm.recipes.log.default import tensorboard_logger
 from nemo.collections.llm.recipes.optim.adam import distributed_fused_adam_with_cosine_annealing
 from nemo.collections.llm.recipes.precision.mixed_precision import bf16_mixed
+from nemo.lightning.pytorch.callbacks import PEFT
+from nemo.utils.exp_manager import TimingCallback
+
+if TYPE_CHECKING:
+    from lightning.pytorch.loggers import TensorBoardLogger, WandbLogger
+
+TokenizerType = Any
 
 
 def default_finetune_recipe(
@@ -33,6 +42,7 @@ def default_finetune_recipe(
     num_nodes: int = 1,
     num_gpus_per_node: int = 8,
     packed_sequence: bool = False,  # once packing recipe is well tested, change this default to true
+    tokenizer: Optional[TokenizerType] = "model",
 ) -> run.Partial:
     """
     Create a default fine-tuning recipe for any model.
@@ -47,6 +57,9 @@ def default_finetune_recipe(
         name (str): Name of the fine-tuning run.
         num_nodes (int): Number of compute nodes to use.
         num_gpus_per_node (int): Number of GPUs per node.
+        packed_sequence (bool): Whether to use packed sequence.
+        tokenizer (Optional[TokenizerType]): Tokenizer setting to be applied. Can be 'data' or 'model'
+            or an instance of TokenizerSpec.
 
     Returns:
         run.Partial: Partial configuration for fine-tuning.
@@ -71,9 +84,10 @@ def default_finetune_recipe(
             num_gpus_per_node=num_gpus_per_node,
         ),
         data=datamodule,
-        log=llm.default_log(dir=dir, name=name, tensorboard_logger=tensorboard_logger(name=name)),
+        log=default_finetune_log(dir=dir, name=name, tensorboard_logger=tensorboard_logger(name=name)),
         optim=distributed_fused_adam_with_cosine_annealing(max_lr=1e-4, min_lr=0, warmup_steps=50, adam_beta2=0.98),
         resume=nemo_resume(resume_path),
+        tokenizer=tokenizer,
     )
 
     return recipe
@@ -82,7 +96,7 @@ def default_finetune_recipe(
 def default_finetune_trainer(
     tensor_parallelism=1,
     pipeline_parallelism=1,
-    pipeline_parallelism_type=None,
+    pipeline_parallelism_type=torch.bfloat16,
     virtual_pipeline_parallelism=None,
     context_parallelism=1,
     sequence_parallelism=False,
@@ -93,6 +107,19 @@ def default_finetune_trainer(
     limit_val_batches=None,
     val_check_interval=30,
 ):
+    """
+    Create a default fine-tuning trainer for any model.
+
+    This function sets up a template for strategy and trainer.
+
+    Args:
+        See docstrings of MegatronStrategy and Trainer.
+
+    Returns:
+        run.Config: Config for a finetuning trainer.
+
+    See usages of this in recipes for further details.
+    """
     strategy = run.Config(
         nl.MegatronStrategy,
         tensor_model_parallel_size=tensor_parallelism,
@@ -102,6 +129,7 @@ def default_finetune_trainer(
         context_parallel_size=context_parallelism,
         sequence_parallel=sequence_parallelism,
         gradient_as_bucket_view=True,
+        ckpt_load_strictness="log_all",
     )
 
     trainer = run.Config(
@@ -111,21 +139,61 @@ def default_finetune_trainer(
         devices=num_gpus_per_node,
         limit_test_batches=limit_test_batches,
         limit_val_batches=limit_val_batches,
-        log_every_n_steps=10,
+        log_every_n_steps=1,
         max_steps=max_steps,
         num_nodes=num_nodes,
         plugins=bf16_mixed(),
         strategy=strategy,
         use_distributed_sampler=False,
         val_check_interval=val_check_interval,
+        callbacks=[run.Config(TimingCallback)],
     )
 
     return trainer
 
 
+def default_finetune_log(
+    dir: Optional[str] = None,
+    name: str = "default",
+    tensorboard_logger: Optional[run.Config['TensorBoardLogger']] = None,
+    wandb_logger: Optional[run.Config['WandbLogger']] = None,
+) -> run.Config[nl.NeMoLogger]:
+    """
+    Create a default fine-tuning logger for any model.
+
+    This function sets up a template for ModelCheckpoint and NeMoLogger.
+
+    Args:
+        See docstrings of ModelCheckpoint and NeMoLogger.
+
+    Returns:
+        run.Config: Config for a finetuning NeMoLogger.
+
+    See usages of this in recipes for further details.
+    """
+
+    ckpt = run.Config(
+        nl.ModelCheckpoint,
+        save_last="link",
+        save_top_k=2,
+        every_n_train_steps=50,
+        filename="{model_name}--{val_loss:.2f}-{step}-{consumed_samples}",
+    )
+
+    return run.Config(
+        nl.NeMoLogger,
+        ckpt=ckpt,
+        name=name,
+        tensorboard=tensorboard_logger,
+        wandb=wandb_logger,
+        log_dir=dir,
+    )
+
+
 def nemo_resume(model_id: str) -> run.Config[nl.AutoResume]:
     """
-    Configure automatic resumption from a NeMo checkpoint converted from Huggingface for https://huggingface.co/{model_id}.
+    Configure automatic resumption from a NeMo checkpoint converted from Huggingface for
+    https://huggingface.co/{model_id}.
 
     This NeMo checkpoint should be converted from Huggingface beforehand, using nemo.collections.llm.import_ckpt.
     When converting the checkpoint, the NeMo checkpoint will be saved in NEMO_HOME (set to ~/.cache/nemo by default).
@@ -143,3 +211,41 @@ def nemo_resume(model_id: str) -> run.Config[nl.AutoResume]:
         nl.AutoResume,
         restore_config=run.Config(nl.RestoreConfig, path=f"nemo://{model_id}"),
     )
+
+
+@run.cli.factory(name='lora')
+def lora() -> run.Config[PEFT]:
+    """
+    Factory function to create a LoRA configuration.
+
+    Returns:
+        run.Config[PEFT]: Configuration for the LoRA class.
+
+    Examples:
+        CLI usage:
+            $ nemo llm finetune -f llama3_8b peft=lora
+
+        Python API usage:
+            >>> lora_config = lora()
+            >>> print(lora_config)
+    """
+    return run.Config(LoRA)
+
+
+@run.cli.factory(name='dora')
+def dora() -> run.Config[PEFT]:
+    """
+    Factory function to create a DoRA configuration.
+
+    Returns:
+        run.Config[PEFT]: Configuration for the DoRA class.
+
+    Examples:
+        CLI usage:
+            $ nemo llm finetune -f llama3_8b peft=dora
+
+        Python API usage:
+            >>> dora_config = dora()
+            >>> print(dora_config)
+    """
+    return run.Config(DoRA)

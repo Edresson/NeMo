@@ -1,4 +1,4 @@
-# Copyright (c) 2024, NVIDIA CORPORATION.  All rights reserved.
+# Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -14,10 +14,10 @@
 
 from typing import Any
 
+from lightning.pytorch.trainer.trainer import Trainer
 from llama_index.core.bridge.pydantic import PrivateAttr
 from llama_index.core.llms import CompletionResponse, CompletionResponseGen, CustomLLM, LLMMetadata
 from llama_index.core.llms.callbacks import llm_completion_callback
-from pytorch_lightning.trainer.trainer import Trainer
 
 from nemo.collections.nlp.models.language_modeling.megatron_gpt_model import MegatronGPTModel
 from nemo.collections.nlp.modules.common.transformer.text_generation import LengthParam, SamplingParam

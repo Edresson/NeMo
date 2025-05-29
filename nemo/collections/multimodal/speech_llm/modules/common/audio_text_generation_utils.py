@@ -1,4 +1,4 @@
-# Copyright (c) 2024, NVIDIA CORPORATION.  All rights reserved.
+# Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -11,6 +11,8 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+#
+# flake8: noqa
 
 """Utilities for generating text."""
 
@@ -255,7 +257,7 @@ def synced_generate(
     for tokens, lengths, output_logits, full_logits, audio_feat_lens in batch_token_iterator:
         context_length += 1
     context_length += audio_feat_lens.min().item()
-    if parallel_state.is_pipeline_last_stage():
+    if parallel_state.is_pipeline_last_stage(ignore_virtual=True):
         src = parallel_state.get_pipeline_model_parallel_last_rank()
         group = parallel_state.get_embedding_group()
         if compute_logprob:
@@ -266,7 +268,7 @@ def synced_generate(
             torch.distributed.broadcast(full_logits, src, group)
 
     else:
-        if parallel_state.is_pipeline_first_stage():
+        if parallel_state.is_pipeline_first_stage(ignore_virtual=True):
             src = parallel_state.get_pipeline_model_parallel_last_rank()
             group = parallel_state.get_embedding_group()
 
@@ -349,6 +351,25 @@ def generate(
     num_audios = None
     context_start_idx = None
     audio_signal, audio_signal_length = None, None
+    if isinstance(inputs, tuple) and len(inputs) == 2:
+        context_tokens_tensor, context_length_tensor = inputs
+    elif isinstance(inputs, tuple) and len(inputs) == 4:
+        context_tokens_tensor, context_length_tensor, audio_signal, audio_signal_length = inputs
+    elif isinstance(inputs, tuple) and len(inputs) == 6:  # multi-audio
+        has_multi_audios = True
+        (
+            context_tokens_tensor,
+            context_length_tensor,
+            audio_signal,
+            audio_signal_length,
+            num_audios,
+            context_start_idx,
+        ) = inputs
+    else:
+        context_tokens_tensor, context_length_tensor = inference_strategy.tokenize_batch(
+            inputs, tokens_to_generate, add_BOS
+        )
+    """  to unblock TP inference
     if torch.distributed.get_rank() == text_generation_utils.get_model_parallel_src_rank():
         if isinstance(inputs, tuple) and len(inputs) == 2:
             context_tokens_tensor, context_length_tensor = inputs
@@ -406,6 +427,7 @@ def generate(
             num_audios,
             context_start_idx,
         ) = receive_generate_info(has_multi_audios)
+    """
 
     output = synced_generate(
         model,
@@ -577,7 +599,7 @@ def sample_sequence_batch(
                 compute_attention_mask,
             )
             output = inference_strategy.forward_step(batch, tensor_shape)
-            if parallel_state.is_pipeline_last_stage():
+            if parallel_state.is_pipeline_last_stage(ignore_virtual=True):
                 if compute_logprob:
                     output = output[0]['logits']
                     output = tensor_parallel.gather_from_tensor_model_parallel_region(output)
@@ -677,7 +699,7 @@ def sample_sequence_batch(
                     yield tokens, lengths, None, None, audio_feat_lens
 
             else:
-                if parallel_state.is_pipeline_first_stage():
+                if parallel_state.is_pipeline_first_stage(ignore_virtual=True):
                     src = parallel_state.get_pipeline_model_parallel_last_rank()
                     group = parallel_state.get_embedding_group()
                     new_tokens = torch.empty_like(tokens[:, context_length])

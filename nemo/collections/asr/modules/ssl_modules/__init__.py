@@ -1,4 +1,4 @@
-# Copyright (c) 2024, NVIDIA CORPORATION.  All rights reserved.
+# Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -17,5 +17,9 @@ from nemo.collections.asr.modules.ssl_modules.augmentation import (
     SpeakerNoiseAugmentation,
 )
 from nemo.collections.asr.modules.ssl_modules.masking import ConvFeatureMaksingWrapper, RandomBlockMasking
+from nemo.collections.asr.modules.ssl_modules.multi_layer_feat import (
+    ConformerMultiLayerFeatureExtractor,
+    ConformerMultiLayerFeaturePreprocessor,
+)
 from nemo.collections.asr.modules.ssl_modules.multi_softmax_decoder import MultiSoftmaxDecoder
 from nemo.collections.asr.modules.ssl_modules.quantizers import RandomProjectionVectorQuantizer

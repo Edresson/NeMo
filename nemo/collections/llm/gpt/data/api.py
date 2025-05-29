@@ -1,4 +1,4 @@
-# Copyright (c) 2024, NVIDIA CORPORATION.  All rights reserved.
+# Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -12,11 +12,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import lightning.pytorch as pl
 import nemo_run as run
-import pytorch_lightning as pl
 
 from nemo.collections.llm.gpt.data.dolly import DollyDataModule
-from nemo.collections.llm.gpt.data.hf_dataset import HfDatasetDataModule
+from nemo.collections.llm.gpt.data.hf_dataset import HFDatasetDataModule
 from nemo.collections.llm.gpt.data.mock import MockDataModule
 from nemo.collections.llm.gpt.data.squad import SquadDataModule
 
@@ -41,8 +41,8 @@ def dolly() -> pl.LightningDataModule:
 
 @run.cli.factory
 @run.autoconvert
-def hf_dataset(dataset: str) -> pl.LightningDataModule:
-    return HfDatasetDataModule(dataset=dataset, global_batch_size=16, micro_batch_size=2)
+def hf_dataset(path: str) -> pl.LightningDataModule:
+    return HFDatasetDataModule(path=path, global_batch_size=16, micro_batch_size=2)
 
 
 __all__ = ["mock", "squad", "dolly", "hf_dataset"]

@@ -18,10 +18,11 @@ from typing import List, Optional
 
 import torch
 from hydra.utils import instantiate
+from lightning.pytorch import Trainer
+from lightning.pytorch.loggers import TensorBoardLogger
 from omegaconf import DictConfig, OmegaConf, open_dict
-from pytorch_lightning import Trainer
-from pytorch_lightning.loggers import TensorBoardLogger
 
+from nemo.collections.asr.parts.utils.rnnt_utils import Hypothesis
 from nemo.collections.common.parts.preprocessing import parsers
 from nemo.collections.tts.losses.aligner_loss import BinLoss, ForwardSumLoss
 from nemo.collections.tts.losses.fastpitchloss import DurationLoss, EnergyLoss, MelLoss, PitchLoss
@@ -269,7 +270,8 @@ class FastPitchModel(SpectrogramGenerator, Exportable, FastPitchAdapterModelMixi
     def parse(self, str_input: str, normalize=True) -> torch.tensor:
         if self.training:
             logging.warning("parse() is meant to be called in eval mode.")
-
+        if isinstance(str_input, Hypothesis):
+            str_input = str_input.text
         if normalize and self.text_normalizer_call is not None:
             str_input = self.text_normalizer_call(str_input, **self.text_normalizer_call_kwargs)
 

@@ -1,4 +1,4 @@
-# Copyright (c) 2024, NVIDIA CORPORATION.  All rights reserved.
+# Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -36,7 +36,7 @@ class SemiSortBatchSampler(DistributedSampler):
         randomization_factor: Optional[float] = None,
         seed: int = 42,
     ) -> None:
-        """
+        r"""
         Semi Sorted Batching, as proposed in _SSB ("Speed up training with variable
         length inputs by efficient batching strategies.", Zhenhao Ge et al. (2021).).
 

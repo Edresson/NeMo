@@ -1,4 +1,4 @@
-# Copyright (c) 2024, NVIDIA CORPORATION.  All rights reserved.
+# Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -19,8 +19,8 @@ from typing import Any, Dict
 import modelopt.torch.distill as mtd
 import modelopt.torch.opt as mto
 import torch.multiprocessing as mp
+from lightning.pytorch.trainer.trainer import Trainer
 from omegaconf import DictConfig, OmegaConf, open_dict
-from pytorch_lightning.trainer.trainer import Trainer
 
 try:
     from megatron.core import parallel_state, tensor_parallel
@@ -146,7 +146,9 @@ class DistillationMegatronGPTModel(MegatronGPTModel):
             seq_len_interpolation_factor=self.cfg.get('seq_len_interpolation_factor', None),
             rotary_base=self.cfg.get('rotary_base', 10000),
         )
-        if self.cfg.get("apply_embedding_scaling", False) and parallel_state.is_pipeline_first_stage():
+        if self.cfg.get("apply_embedding_scaling", False) and parallel_state.is_pipeline_first_stage(
+            ignore_virtual=False
+        ):
             extend_instance(model.embedding, EmbeddingScalingMixin)
 
         # [ModelOpt] Distillation mode.
@@ -180,9 +182,9 @@ class DistillationMegatronGPTModel(MegatronGPTModel):
                 required_keys.add('attention_mask')
                 if 'cu_seqlens' in batch:
                     required_keys.add('cu_seqlens')
-                if parallel_state.is_pipeline_first_stage():
+                if parallel_state.is_pipeline_first_stage(ignore_virtual=False):
                     required_keys.update(('tokens', 'position_ids'))
-                if parallel_state.is_pipeline_last_stage():
+                if parallel_state.is_pipeline_last_stage(ignore_virtual=False):
                     required_keys.update(('labels', 'loss_mask'))
             if self.get_attention_mask_from_fusion and 'attention_mask' in required_keys:
                 required_keys.remove('attention_mask')
@@ -468,7 +470,11 @@ def adjust_distillation_model_for_mcore(model: mtd.DistillationModel, distill_cf
     """Extra modifcations to ``mtd.DistillationModel`` requried for Megatron-Core."""
 
     # HACK: Get rid of ModelOpt Distillation state
-    mto.ModeloptStateManager(model)._state.pop()
+    modelopt_states = mto.ModeloptStateManager(model).state_dict()
+    if len(modelopt_states) > 1:
+        modelopt_states.pop()
+    else:
+        delattr(model, mto.ModeloptStateManager._state_key)
 
     # HACK: Hide teacher during `sharded_state_dict` method.
     def _sharded_state_dict(self, *args, **kwargs) -> ShardedStateDict:

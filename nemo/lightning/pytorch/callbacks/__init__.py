@@ -1,4 +1,4 @@
-# Copyright (c) 2024, NVIDIA CORPORATION.  All rights reserved.
+# Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -15,7 +15,9 @@
 from nemo.lightning.pytorch.callbacks.ddp_parity_checker import DdpParityChecker
 from nemo.lightning.pytorch.callbacks.debugging import ParameterDebugger
 from nemo.lightning.pytorch.callbacks.garbage_collection import GarbageCollectionCallback
+from nemo.lightning.pytorch.callbacks.jit_transform import JitConfig, JitTransform
 from nemo.lightning.pytorch.callbacks.memory_profiler import MemoryProfileCallback
+from nemo.lightning.pytorch.callbacks.model_callback import ModelCallback
 from nemo.lightning.pytorch.callbacks.model_checkpoint import ModelCheckpoint
 from nemo.lightning.pytorch.callbacks.model_transform import ModelTransform
 from nemo.lightning.pytorch.callbacks.nsys import NsysCallback
@@ -23,6 +25,7 @@ from nemo.lightning.pytorch.callbacks.peft import PEFT
 from nemo.lightning.pytorch.callbacks.preemption import PreemptionCallback
 from nemo.lightning.pytorch.callbacks.progress_bar import MegatronProgressBar
 from nemo.lightning.pytorch.callbacks.progress_printer import ProgressPrinter
+from nemo.lightning.pytorch.callbacks.pytorch_profiler import PytorchProfilerCallback
 
 __all__ = [
     "MemoryProfileCallback",
@@ -30,10 +33,14 @@ __all__ = [
     "ModelTransform",
     "PEFT",
     "NsysCallback",
+    "PytorchProfilerCallback",
     "MegatronProgressBar",
     "ProgressPrinter",
     "PreemptionCallback",
     "DdpParityChecker",
     "GarbageCollectionCallback",
     "ParameterDebugger",
+    "ModelCallback",
+    "JitTransform",
+    "JitConfig",
 ]

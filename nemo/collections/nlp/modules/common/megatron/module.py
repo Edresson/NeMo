@@ -11,6 +11,9 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+#
+# flake8: noqa
+# pylint: skip-file
 
 """Megatron Module"""
 
@@ -113,7 +116,7 @@ class MegatronModule(torch.nn.Module):
 
     def initialize_word_embeddings(self, init_method, vocab_size, hidden_size):
         if not self.share_token_embeddings:
-            raise Exception('initialize_word_embeddings() was called but ' 'share_token_embeddings is false')
+            raise Exception('initialize_word_embeddings() was called but share_token_embeddings is false')
 
         # This function just initializes the word embeddings in the final stage
         # when we are using pipeline parallelism. If we aren't using pipeline
@@ -133,14 +136,17 @@ class MegatronModule(torch.nn.Module):
         # 3. In the training loop, before an all-reduce between the grads of
         #    the two word_embeddings layers to ensure that every applied weight
         #    update is the same on both stages.
-        if parallel_state.is_pipeline_last_stage() and not self.pre_process:
+        if parallel_state.is_pipeline_last_stage(ignore_virtual=True) and not self.pre_process:
             # This is relevant for T5 when the decoder is only on a single rank. It is the last stage of the pipeline and also has embeddings on this rank already.
-            assert not parallel_state.is_pipeline_first_stage()
+            assert not parallel_state.is_pipeline_first_stage(ignore_virtual=True)
             self._word_embeddings_for_head_key = 'word_embeddings_for_head'
             # set word_embeddings weights to 0 here, then copy first
             # stage's weights using all_reduce below.
             self.word_embeddings = tensor_parallel.VocabParallelEmbedding(
-                vocab_size, hidden_size, init_method=init_method, config=self.config,
+                vocab_size,
+                hidden_size,
+                init_method=init_method,
+                config=self.config,
             )
             self.word_embeddings.weight.data.fill_(0)
             self.word_embeddings.weight.shared = True
@@ -290,7 +296,7 @@ class Float16Module(MegatronModule):
         if getattr(self.module, 'pre_process', True):
             inputs = fp32_to_float16(inputs, self.float16_converter)
         outputs = self.module(*inputs, **kwargs)
-        if parallel_state.is_pipeline_last_stage() and self.training:
+        if parallel_state.is_pipeline_last_stage(ignore_virtual=False) and self.training:
             outputs = float16_to_fp32(outputs)
         return outputs
 

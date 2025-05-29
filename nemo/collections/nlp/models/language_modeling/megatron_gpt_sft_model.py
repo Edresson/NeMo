@@ -11,15 +11,19 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+#
+# flake8: noqa
+# pylint: skip-file
+
 import itertools
 import json
 from functools import partial
 from typing import Any, Optional
 
 import torch
+from lightning.pytorch.loops.fetchers import _DataFetcherWrapper
+from lightning.pytorch.trainer.trainer import Trainer
 from omegaconf import DictConfig, ListConfig
-from pytorch_lightning.loops.fetchers import _DataFetcherWrapper
-from pytorch_lightning.trainer.trainer import Trainer
 
 from nemo.collections.common.metrics import MetricStringToTorchMetric
 from nemo.collections.nlp.data.language_modeling.megatron.base_dataset_utils import (
@@ -615,7 +619,7 @@ class MegatronGPTSFTModel(NLPAdapterModelMixin, MegatronGPTModel):
             # Expand on_validation_epoch_end from parent class MegatronGPTModel as on_validation_epoch_end doesnt take outputs arg
             # loss = super().on_validation_epoch_end([x['loss'] for x in output])
             loss_vals = [x['loss'] for x in output]
-            if parallel_state.is_pipeline_last_stage():
+            if parallel_state.is_pipeline_last_stage(ignore_virtual=False):
                 # only the last pipeline parallel stages return loss with their batch size
                 if self.cfg.data.get('validation_drop_last', True):
                     loss = torch.stack(loss_vals).mean()

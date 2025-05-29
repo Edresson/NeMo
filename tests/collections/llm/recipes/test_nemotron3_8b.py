@@ -1,4 +1,4 @@
-# Copyright (c) 2024, NVIDIA CORPORATION.  All rights reserved.
+# Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -15,12 +15,12 @@
 import nemo_run as run
 import pytest
 
-from nemo.collections.llm.api import finetune, pretrain
+from nemo.collections.llm.api import pretrain
 from nemo.collections.llm.gpt.data.mock import MockDataModule
 from nemo.collections.llm.gpt.data.squad import SquadDataModule
 from nemo.collections.llm.gpt.model.nemotron import Nemotron3Config8B, NemotronModel
 from nemo.collections.llm.recipes import nemotron3_8b
-from nemo.lightning import AutoResume, Trainer
+from nemo.lightning import Trainer
 
 
 class TestNemotron3_8B:
@@ -66,13 +66,13 @@ class TestNemotron3_8B:
     def test_finetune_recipe(self, recipe_module):
         recipe = recipe_module.finetune_recipe()
         assert isinstance(recipe, run.Partial)
-        assert recipe.__fn_or_cls__ == finetune
+        assert isinstance(recipe, run.Partial)
         assert isinstance(recipe.model, run.Config)
         assert recipe.model.__fn_or_cls__ == NemotronModel
         assert isinstance(recipe.trainer, run.Config)
         assert recipe.trainer.__fn_or_cls__ == Trainer
         assert isinstance(recipe.data, run.Config)
         assert recipe.data.__fn_or_cls__ == SquadDataModule
-        assert recipe.data.seq_length == 4096
-        assert recipe.data.global_batch_size == 32
-        assert recipe.data.micro_batch_size == 2
+        assert recipe.data.seq_length == 2048
+        assert recipe.data.global_batch_size == 128
+        assert recipe.data.micro_batch_size == 1

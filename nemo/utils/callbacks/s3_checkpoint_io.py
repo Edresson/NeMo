@@ -1,4 +1,4 @@
-# Copyright (c) 2024, NVIDIA CORPORATION.  All rights reserved.
+# Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -22,7 +22,7 @@ from tempfile import NamedTemporaryFile
 from typing import Any, Callable, Dict, Optional, Union
 
 import torch
-from lightning_fabric.plugins.io.checkpoint_io import CheckpointIO
+from lightning.fabric.plugins.io.checkpoint_io import CheckpointIO
 
 from nemo.utils import logging
 from nemo.utils.s3_utils import (

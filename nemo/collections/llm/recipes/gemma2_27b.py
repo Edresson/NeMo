@@ -1,4 +1,4 @@
-# Copyright (c) 2024, NVIDIA CORPORATION.  All rights reserved.
+# Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -14,13 +14,13 @@
 
 from typing import Optional
 
+import lightning.pytorch as pl
 import nemo_run as run
-import pytorch_lightning as pl
 import torch
 
 from nemo.collections.llm.api import finetune, pretrain
 from nemo.collections.llm.gpt.data.mock import MockDataModule
-from nemo.collections.llm.peft.lora import LoRA
+from nemo.collections.llm.peft import PEFT_STR2CLS
 from nemo.collections.llm.recipes.finetune_default import default_finetune_recipe
 from nemo.collections.llm.recipes.gemma2 import gemma2_model, gemma2_trainer
 from nemo.collections.llm.recipes.log.default import default_log, default_resume, tensorboard_logger
@@ -62,7 +62,7 @@ def pretrain_recipe(
     virtual_pipeline_parallelism: Optional[int] = None,
     context_parallelism: int = 1,
     sequence_parallelism: bool = False,
-    num_nodes: int = 1,
+    num_nodes: int = 2,
     num_gpus_per_node: int = 8,
     max_steps: int = 1168251,
     precision: str = "bf16-mixed",
@@ -191,8 +191,10 @@ def finetune_recipe(
         name (str): Name of the fine-tuning run.
         num_nodes (int): Number of compute nodes to use.
         num_gpus_per_node (int): Number of GPUs per node.
-        peft_scheme (Optional[str]): Name of the peft scheme to use for fine-tuning. Allowed values: 'lora', 'none'/None.
-        packed_sequence (Optional[bool]): Packing multiple training sequences into one long sequence for training efficiency. Default sequence length is 2048.
+        peft_scheme (Optional[str]): Name of the peft scheme to use for fine-tuning.
+            Allowed values: 'lora'/'dora'/'none'/None.
+        packed_sequence (Optional[bool]): Packing multiple training sequences into one long sequence for training
+            efficiency. Default sequence length is 2048.
 
     Returns:
         run.Partial: Partial configuration for fine-tuning.
@@ -206,19 +208,20 @@ def finetune_recipe(
             >>> print(recipe)
 
     Note:
-        This recipe uses the SQuAD dataset for fine-tuning. For more information
-        on fine-tuning LLMs with NeMo, see the fine-tuning guide in the
-        `examples/llm/finetune/` directory.
+        This recipe uses the SQuAD dataset for fine-tuning.
     """
     recipe = default_finetune_recipe(
         model(), "google/gemma-2-27b", dir, name, num_nodes, num_gpus_per_node, packed_sequence
     )
+    # Gemma requires BOS
+    recipe.data.dataset_kwargs = {'add_bos': True}
+
     if peft_scheme is None or peft_scheme.lower() == 'none':
         recipe.optim.config.lr = 5e-6
         recipe.trainer.strategy.tensor_model_parallel_size = 8
         recipe.trainer.strategy.pipeline_model_parallel_size = 2
-    elif peft_scheme.lower() == 'lora':
-        recipe.peft = run.Config(LoRA)
+    elif peft_scheme.lower() in ['lora', 'dora']:
+        recipe.peft = run.Config(PEFT_STR2CLS[peft_scheme.lower()])
         recipe.trainer.strategy.tensor_model_parallel_size = 4
         recipe.optim.config.lr = 1e-4
     else:

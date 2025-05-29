@@ -1,4 +1,4 @@
-# Copyright (c) 2024, NVIDIA CORPORATION.  All rights reserved.
+# Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -58,7 +58,7 @@ def get_args(argv):
         "--model_type",
         type=str,
         required=True,
-        choices=["neva", "video-neva", "lita", "vila", "vita", "salm"],
+        choices=["neva", "video-neva", "lita", "vila", "vita", "salm", "mllama"],
         help="Type of the model that is supported.",
     )
     parser.add_argument(
@@ -66,7 +66,7 @@ def get_args(argv):
         "--llm_model_type",
         type=str,
         required=True,
-        choices=["gptnext", "gpt", "llama", "falcon", "starcoder", "mixtral", "gemma"],
+        choices=["gptnext", "gpt", "llama", "falcon", "starcoder", "mixtral", "gemma", "mllama"],
         help="Type of LLM. gptnext, gpt, llama, falcon, and starcoder are only supported."
         " gptnext and gpt are the same and keeping it for backward compatibility",
     )
@@ -212,7 +212,7 @@ def nemo_deploy(argv):
             triton_model_name=args.triton_model_name,
             triton_model_version=args.triton_model_version,
             max_batch_size=args.max_batch_size,
-            port=args.triton_port,
+            http_port=args.triton_port,
             address=args.triton_http_address,
         )
 

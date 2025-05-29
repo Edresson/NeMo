@@ -1,4 +1,4 @@
-# Copyright (c) 2024, NVIDIA CORPORATION.  All rights reserved.
+# Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -26,7 +26,7 @@ class Artifact(ABC, Generic[ValueT]):
         self.skip = skip
 
     @abstractmethod
-    def dump(self, value: ValueT, absolute_dir: Path, relative_dir: Path) -> ValueT:
+    def dump(self, instance, value: ValueT, absolute_dir: Path, relative_dir: Path) -> ValueT:
         pass
 
     @abstractmethod

@@ -1,4 +1,4 @@
-# Copyright (c) 2024, NVIDIA CORPORATION.  All rights reserved.
+# Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -15,11 +15,11 @@
 
 from typing import Optional
 
+import lightning.pytorch as pl
 import nemo_run as run
-import pytorch_lightning as pl
 import torch
+from lightning.pytorch.callbacks.callback import Callback
 from megatron.core.distributed import DistributedDataParallelConfig
-from pytorch_lightning.callbacks.callback import Callback
 
 from nemo import lightning as nl
 from nemo.collections import llm
@@ -36,7 +36,9 @@ NAME = "mamba2_130m"
 
 @run.cli.factory(name=NAME)
 def tokenizer(tokenizer_model: str = None) -> run.Config[pl.LightningModule]:
-
+    """
+    Factory function to create a tokenizer configuration.
+    """
     return run.Config(
         get_nmt_tokenizer,
         library='huggingface',
@@ -63,10 +65,13 @@ def model(tokenizer_model: str = None) -> run.Config[pl.LightningModule]:
             >>> print(model_config)
     """
     return run.Config(
-        llm.GPTModel, config=run.Config(llm.BaseMambaConfig130M), tokenizer=tokenizer(tokenizer_model=tokenizer_model)
+        llm.MambaModel,
+        config=run.Config(llm.BaseMambaConfig130M),
+        tokenizer=tokenizer(tokenizer_model=tokenizer_model),
     )
 
 
+@run.cli.factory(target=finetune, name=NAME)
 def trainer(
     tensor_parallelism: int = 1,
     pipeline_parallelism: int = 1,
@@ -76,7 +81,11 @@ def trainer(
     sequence_parallelism: bool = False,
     num_nodes: int = 1,
     num_gpus_per_node: int = 8,
-    max_steps: int = 1168251,
+    max_steps: int = 100,
+    val_check_interval: int = 100,
+    limit_test_batches: int = 50,
+    limit_val_batches: int = 32,
+    log_every_n_steps: int = 10,
     callbacks: Optional[list[run.Config[Callback]]] = None,
 ) -> run.Config[nl.Trainer]:
     """
@@ -137,15 +146,15 @@ def trainer(
         accumulate_grad_batches=1,
         callbacks=callbacks,
         devices=num_gpus_per_node,
-        limit_test_batches=50,
-        limit_val_batches=32,
-        log_every_n_steps=10,
         max_steps=max_steps,
         num_nodes=num_nodes,
         plugins=bf16_mixed(),
         strategy=strategy,
         use_distributed_sampler=False,
-        val_check_interval=2000,
+        val_check_interval=val_check_interval,
+        limit_test_batches=limit_test_batches,
+        limit_val_batches=limit_val_batches,
+        log_every_n_steps=log_every_n_steps,
     )
 
     return trainer
@@ -158,6 +167,16 @@ def pretrain_recipe(
     tokenizer_model: str = None,
     num_nodes: int = 1,
     num_gpus_per_node: int = 8,
+    tensor_parallelism: int = 1,
+    pipeline_parallelism: int = 1,
+    max_steps: int = 100,
+    val_check_interval: int = 100,
+    limit_test_batches: int = 50,
+    limit_val_batches: int = 32,
+    log_every_n_steps: int = 10,
+    seq_length: int = 4096,
+    gbs: int = 8,
+    mbs: int = 1,
     fn=pretrain,
 ) -> run.Partial:
     """
@@ -184,25 +203,28 @@ def pretrain_recipe(
         Python API usage:
             >>> recipe = pretrain_recipe(name="mamba2_130M_pretrain", num_nodes=1)
             >>> print(recipe)
-
-    Note:
-        For more details on pre-training LLMs with NeMo, see the pre-training
-        guide in the `examples/llm/pretrain/` directory.
     """
     return run.Partial(
         fn,
         model=model(),
         trainer=trainer(
+            max_steps=max_steps,
             num_nodes=num_nodes,
+            tensor_parallelism=tensor_parallelism,
+            pipeline_parallelism=pipeline_parallelism,
             num_gpus_per_node=num_gpus_per_node,
+            val_check_interval=val_check_interval,
+            limit_test_batches=limit_test_batches,
+            limit_val_batches=limit_val_batches,
+            log_every_n_steps=log_every_n_steps,
             callbacks=[run.Config(TimingCallback)],
         ),
         data=run.Config(
             MockDataModule,
-            seq_length=4096,
-            global_batch_size=8,
-            micro_batch_size=1,
-            tokenizer=tokenizer(tokenizer_model=tokenizer_model),
+            seq_length=seq_length,
+            global_batch_size=gbs,
+            micro_batch_size=mbs,
+            tokenizer=tokenizer(),
         ),
         log=default_log(dir=dir, name=name, tensorboard_logger=tensorboard_logger(name=name)),
         optim=distributed_fused_adam_with_cosine_annealing(max_lr=3e-4),
@@ -218,6 +240,14 @@ def finetune_recipe(
     tokenizer_model: str = None,
     num_nodes: int = 1,
     num_gpus_per_node: int = 8,
+    tensor_model_parallel_size: int = 1,
+    pipeline_model_parallel_size: int = 1,
+    seq_length: int = 4096,
+    max_steps: int = 100,
+    val_check_interval: int = 100,
+    limit_test_batches: int = 50,
+    limit_val_batches: int = 32,
+    log_every_n_steps: int = 10,
     gbs: int = 8,
     mbs: int = 1,
     peft_scheme: Optional[str] = 'none',
@@ -248,12 +278,10 @@ def finetune_recipe(
             >>> print(recipe)
 
     Note:
-        This recipe uses the SQuAD dataset for fine-tuning. For more information
-        on fine-tuning LLMs with NeMo, see the fine-tuning guide in the
-        `examples/llm/finetune/` directory.
+        This recipe uses the SQuAD dataset for fine-tuning.
         For converting an SSM pytorch checkpoint, use the following line of python code:
 
-        llm.GPTModel(llm.BaseMambaConfig130M(), tokenizer=tokenizer()).import_ckpt(
+        llm.MambaModel(llm.BaseMambaConfig130M(), tokenizer=tokenizer()).import_ckpt(
             path="pytorch://ABSOLUTE_PATH_TO_CKPT/your_pytorch_state_dict_file",
             model_config=llm.BaseMambaConfig130M())
         This line will cache the nemo checkpoint to following directory:
@@ -266,8 +294,8 @@ def finetune_recipe(
     )
     strategy = run.Config(
         nl.MegatronStrategy,
-        tensor_model_parallel_size=1,
-        pipeline_model_parallel_size=1,
+        tensor_model_parallel_size=tensor_model_parallel_size,
+        pipeline_model_parallel_size=pipeline_model_parallel_size,
         gradient_as_bucket_view=True,
         ckpt_load_optimizer=False,
         ckpt_save_optimizer=False,
@@ -283,10 +311,11 @@ def finetune_recipe(
         accelerator="gpu",
         accumulate_grad_batches=1,
         devices=num_gpus_per_node,
-        limit_test_batches=10,
-        limit_val_batches=10,
-        log_every_n_steps=20,
-        max_steps=100,
+        max_steps=max_steps,
+        val_check_interval=val_check_interval,
+        limit_test_batches=limit_test_batches,
+        limit_val_batches=limit_val_batches,
+        log_every_n_steps=log_every_n_steps,
         num_nodes=num_nodes,
         plugins=run.Config(
             nl.MegatronMixedPrecision,
@@ -296,7 +325,6 @@ def finetune_recipe(
         callbacks=[checkpoint_callback],
         strategy=strategy,
         use_distributed_sampler=False,
-        val_check_interval=20,
     )
     recipe = run.Partial(
         llm.finetune,
@@ -304,7 +332,7 @@ def finetune_recipe(
         trainer=trainer,
         data=run.Config(
             llm.SquadDataModule,
-            seq_length=2048,
+            seq_length=seq_length,
             global_batch_size=gbs,
             micro_batch_size=mbs,
             tokenizer=tokenizer(tokenizer_model=tokenizer_model),

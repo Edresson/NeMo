@@ -1,4 +1,4 @@
-# Copyright (c) 2024, NVIDIA CORPORATION.  All rights reserved.
+# Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -13,13 +13,13 @@
 # limitations under the License.
 
 from nemo.collections.vlm.neva.data.config import DataConfig, ImageDataConfig, VideoDataConfig
-from nemo.collections.vlm.neva.data.lazy import NevaLazyDataModule
-from nemo.collections.vlm.neva.data.mock import MockDataModule
+from nemo.collections.vlm.neva.data.mock import MockDataModule as NevaMockDataModule
 from nemo.collections.vlm.neva.data.multimodal_tokens import ImageToken, MultiModalToken, VideoToken
+from nemo.collections.vlm.neva.data.preloaded import NevaPreloadedDataModule
 
 __all__ = [
-    "NevaLazyDataModule",
-    "MockDataModule",
+    "NevaPreloadedDataModule",
+    "NevaMockDataModule",
     "DataConfig",
     "ImageDataConfig",
     "VideoDataConfig",

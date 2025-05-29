@@ -1,4 +1,4 @@
-# Copyright (c) 2024, NVIDIA CORPORATION.  All rights reserved.
+# Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -17,6 +17,7 @@ from pathlib import Path
 
 import torch
 from megatron.core.distributed import DistributedDataParallelConfig as McoreDDPConfig
+from megatron.core.transformer.enums import AttnBackend
 from megatron.core.utils import init_method_normal, scaled_init_method_normal
 
 from nemo.collections.llm import MixtralConfig8x7B, MixtralModel, PreTrainingDataModule
@@ -102,6 +103,7 @@ def main(args):
         bias_dropout_fusion=True,
         apply_rope_fusion=True,
         distribute_saved_activations=False,
+        attention_backend=AttnBackend.unfused,
     )
 
     data = PreTrainingDataModule(

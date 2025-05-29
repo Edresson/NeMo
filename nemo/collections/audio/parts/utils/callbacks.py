@@ -1,4 +1,4 @@
-# Copyright (c) 2024, NVIDIA CORPORATION & AFFILIATES.  All rights reserved.
+# Copyright (c) 2025, NVIDIA CORPORATION & AFFILIATES.  All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -16,10 +16,10 @@ from typing import List, Optional, Type
 
 import einops
 import torch
-from pytorch_lightning import Callback, LightningModule, Trainer
-from pytorch_lightning.loggers import TensorBoardLogger
-from pytorch_lightning.loggers.logger import Logger
-from pytorch_lightning.loggers.wandb import WandbLogger
+from lightning.pytorch import Callback, LightningModule, Trainer
+from lightning.pytorch.loggers import TensorBoardLogger
+from lightning.pytorch.loggers.logger import Logger
+from lightning.pytorch.loggers.wandb import WandbLogger
 
 from nemo.utils import logging
 from nemo.utils.decorators import experimental

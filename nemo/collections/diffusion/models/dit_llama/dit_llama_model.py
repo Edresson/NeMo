@@ -1,4 +1,4 @@
-# Copyright (c) 2024, NVIDIA CORPORATION.  All rights reserved.
+# Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-
+from functools import partial
 from typing import Literal
 
 from megatron.core.transformer.transformer_config import TransformerConfig
@@ -54,7 +54,9 @@ class DiTLlamaModel(DiTCrossAttentionModel):
             patch_temporal=patch_temporal,
             in_channels=in_channels,
             out_channels=out_channels,
-            transformer_decoder_layer_spec=get_dit_llama_spec,
+            transformer_decoder_layer_spec=partial(
+                get_dit_llama_spec, num_experts=config.num_moe_experts, attn_mask_type=config.attn_mask_type
+            ),
             pos_embedder=dit_embeddings.FactorizedLearnable3DEmbedding,
             **kwargs,
         )

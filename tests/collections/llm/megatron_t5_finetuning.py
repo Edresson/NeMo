@@ -1,4 +1,4 @@
-# Copyright (c) 2024, NVIDIA CORPORATION.  All rights reserved.
+# Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -18,8 +18,8 @@
 import argparse
 
 import torch
+from lightning.pytorch.loggers import WandbLogger
 from megatron.core.optimizer import OptimizerConfig
-from pytorch_lightning.loggers import WandbLogger
 
 from nemo import lightning as nl
 from nemo.collections import llm
@@ -36,6 +36,7 @@ def get_args():
     parser.add_argument('--devices', type=int, help="Number of devices to use for training")
     parser.add_argument('--max-steps', type=int, help="Number of steps to train for")
     parser.add_argument('--peft', type=str, default='none', help="none | lora")
+    parser.add_argument('--data-dir', type=str, default=None, help="directory to finetuning data")
     parser.add_argument('--experiment-dir', type=str, help="directory to write results and checkpoints to")
     parser.add_argument('--experiment-name', type=str, help="name of experiment")
     parser.add_argument('--wandb-project', type=str, default=None, help="wandb project name")
@@ -58,6 +59,7 @@ if __name__ == '__main__':
     )
 
     data = SquadDataModule(
+        dataset_root=args.data_dir,
         seq_length=512,
         seq_length_dec=128,
         micro_batch_size=16,
@@ -87,6 +89,7 @@ if __name__ == '__main__':
         pipeline_model_parallel_size=1,
         pipeline_dtype=torch.float32,
         ckpt_load_optimizer=False,
+        ckpt_load_strictness="log_all",  # Only for CI tests to use older versions of checkpoint
     )
     checkpoint_callback = ModelCheckpoint(
         every_n_train_steps=5000,
@@ -103,7 +106,7 @@ if __name__ == '__main__':
         optimizer='adam',
         lr=2.0e-5,
         use_distributed_optimizer=False,
-        bf16=False,
+        bf16=True,
         weight_decay=0.1,
     )
     opt = MegatronOptimizerModule(
@@ -124,7 +127,7 @@ if __name__ == '__main__':
         log_every_n_steps=1,
         limit_val_batches=2,
         val_check_interval=50,
-        plugins=nl.MegatronMixedPrecision(precision="32"),
+        plugins=nl.MegatronMixedPrecision(precision="bf16-mixed"),
     )
 
     if args.wandb_project is not None:

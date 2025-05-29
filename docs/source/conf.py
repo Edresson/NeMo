@@ -60,6 +60,7 @@ autodoc_mock_imports = [
     'IPython',
     'ipadic',
     'psutil',
+    'pytorch_lightning',
     'regex',
     'PIL',
     'boto3',
@@ -132,6 +133,7 @@ bibtex_bibfiles = [
     'core/adapters/adapter_bib.bib',
     'multimodal/mm_all.bib',
     'vision/vision_all.bib',
+    'audio/audio_all.bib',
 ]
 
 intersphinx_mapping = {
@@ -185,6 +187,14 @@ exclude_patterns = []
 
 # The name of the Pygments (syntax highlighting) style to use.
 pygments_style = "default"
+
+# Ignore Github links and downloading a large file
+# Github links are now getting rate limited from the Github Actions
+linkcheck_ignore = [
+    "https://zenodo.org/record/5525342/files/thorsten-neutral_v03.tgz?download=1",
+    ".*github\\.com.*",
+    ".*githubusercontent\\.com.*",
+]
 
 ### Previous NeMo theme
 # # NVIDIA theme settings.

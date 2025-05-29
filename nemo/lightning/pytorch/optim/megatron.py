@@ -1,4 +1,4 @@
-# Copyright (c) 2024, NVIDIA CORPORATION.  All rights reserved.
+# Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -15,7 +15,7 @@
 import inspect
 from typing import Callable, List, Optional
 
-import pytorch_lightning as pl
+import lightning.pytorch as pl
 from megatron.core.distributed import finalize_model_grads
 from megatron.core.optimizer import OptimizerConfig
 from megatron.core.utils import get_model_config

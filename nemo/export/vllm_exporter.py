@@ -1,4 +1,4 @@
-# Copyright (c) 2024, NVIDIA CORPORATION.  All rights reserved.
+# Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -18,16 +18,28 @@ import os.path
 from typing import Iterable, List, Optional, Union
 
 import numpy
+import vllm.envs as envs
 import wrapt
 from vllm import RequestOutput, SamplingParams
-from vllm.config import CacheConfig, DeviceConfig, LoadConfig, LoadFormat, LoRAConfig, ParallelConfig, SchedulerConfig
+from vllm.config import (
+    CacheConfig,
+    DeviceConfig,
+    LoadConfig,
+    LoadFormat,
+    LoRAConfig,
+    ObservabilityConfig,
+    ParallelConfig,
+    SchedulerConfig,
+    VllmConfig,
+)
 from vllm.executor.ray_utils import initialize_ray_cluster
 from vllm.lora.request import LoRARequest
+from vllm.v1.core.sched.scheduler import Scheduler as V1Scheduler
+from vllm.v1.engine.llm_engine import LLMEngine
 
 from nemo.deploy import ITritonDeployable
 from nemo.deploy.utils import cast_output
-from nemo.export.utils.lora_converter import convert_lora_nemo_to_canonical
-from nemo.export.vllm.engine import NemoLLMEngine
+from nemo.export.utils import convert_lora_nemo_to_canonical, prepare_directory_for_export
 from nemo.export.vllm.model_config import NemoModelConfig
 from nemo.export.vllm.model_loader import NemoModelLoader
 
@@ -36,12 +48,15 @@ LOGGER = logging.getLogger("NeMo")
 
 @wrapt.decorator
 def noop_decorator(func):
+    """Used as batch if pytriton is not supported"""
+
     def wrapper(*args, **kwargs):
         return func(*args, **kwargs)
 
     return wrapper
 
 
+batch = noop_decorator
 use_pytriton = True
 try:
     from pytriton.decorators import batch
@@ -78,6 +93,7 @@ class vLLMExporter(ITritonDeployable):
 
     def __init__(self):
         self.request_id = 0
+        assert envs.VLLM_USE_V1, "Only vLLM V1 is supported"
 
     def export(
         self,
@@ -87,7 +103,7 @@ class vLLMExporter(ITritonDeployable):
         device: str = 'auto',
         tensor_parallel_size: int = 1,
         pipeline_parallel_size: int = 1,
-        max_model_len: int = None,
+        max_model_len: Optional[int] = None,
         lora_checkpoints: Optional[List[str]] = None,
         dtype: str = 'auto',
         seed: int = 0,
@@ -95,6 +111,7 @@ class vLLMExporter(ITritonDeployable):
         weight_storage: str = 'auto',
         gpu_memory_utilization: float = 0.9,
         quantization: Optional[str] = None,
+        delete_existing_files: bool = True,
     ):
         """
         Exports the Nemo checkpoint to vLLM and initializes the engine.
@@ -128,7 +145,9 @@ class vLLMExporter(ITritonDeployable):
                 executor, which can range from 0 to 1.
             quantization (str): quantization method that is used to quantize the model weights.
                 Possible choices are None (weights not quantized, default) and "fp8".
+            delete_existing_files (bool): if True, deletes all the files in model_dir.
         """
+        prepare_directory_for_export(model_dir, delete_existing_files=delete_existing_files)
 
         # Pouplate the basic configuration structures
         device_config = DeviceConfig(device)
@@ -149,7 +168,6 @@ class vLLMExporter(ITritonDeployable):
             quantization=quantization,
             quantization_param_path=None,
             enforce_eager=False,
-            max_seq_len_to_capture=None,
         )
 
         if model_config.nemo_model_config.get("fp8", False):
@@ -168,7 +186,7 @@ class vLLMExporter(ITritonDeployable):
 
         # Dynamic online FP8 quantization currently does not support in-memory conversion [TODO]
         if quantization is not None and weight_storage in {'auto', 'memory'}:
-            LOGGER.warning(f'Setting weight_storage = "file" for FP8 quantization')
+            LOGGER.warning('Setting weight_storage = "file" for FP8 quantization')
             weight_storage = 'file'
 
         # See if we have an up-to-date safetensors file
@@ -222,10 +240,10 @@ class vLLMExporter(ITritonDeployable):
             max_num_seqs=256,
             # Note: max_model_len can be derived by model_config if the input value is None
             max_model_len=model_config.max_model_len,
-            use_v2_block_manager=False,
             num_lookahead_slots=0,
             delay_factor=0.0,
             enable_chunked_prefill=False,
+            scheduler_cls=V1Scheduler,
         )
 
         load_config = LoadConfig(
@@ -240,42 +258,36 @@ class vLLMExporter(ITritonDeployable):
         )
 
         # Initialize the cluster and specify the executor class.
-        if device_config.device_type == "neuron":
-            from vllm.executor.neuron_executor import NeuronExecutor
-
-            executor_class = NeuronExecutor
-        elif device_config.device_type == "cpu":
-            from vllm.executor.cpu_executor import CPUExecutor
-
-            executor_class = CPUExecutor
-        elif parallel_config.distributed_executor_backend == "ray":
+        if parallel_config.distributed_executor_backend == "ray":
             initialize_ray_cluster(parallel_config)
-            from vllm.executor.ray_gpu_executor import RayGPUExecutor
+            from vllm.v1.executor.ray_distributed_executor import RayDistributedExecutor
 
-            executor_class = RayGPUExecutor
+            executor_class = RayDistributedExecutor
+
         elif parallel_config.distributed_executor_backend == "mp":
-            from vllm.executor.multiproc_gpu_executor import MultiprocessingGPUExecutor
+            from vllm.v1.executor.multiproc_executor import MultiprocExecutor
 
-            executor_class = MultiprocessingGPUExecutor
+            executor_class = MultiprocExecutor
+
         else:
-            assert parallel_config.world_size == 1, "Ray is required if parallel_config.world_size > 1."
-            from vllm.executor.gpu_executor import GPUExecutor
+            assert parallel_config.distributed_executor_backend == "uni" or parallel_config.world_size == 1
 
-            executor_class = GPUExecutor
+            from vllm.v1.executor.abstract import UniProcExecutor
+
+            executor_class = UniProcExecutor
 
         # Initialize the engine
-        self.engine = NemoLLMEngine(
-            model_config=model_config,
-            cache_config=cache_config,
-            parallel_config=parallel_config,
-            scheduler_config=scheduler_config,
-            device_config=device_config,
-            load_config=load_config,
-            lora_config=lora_config,
-            speculative_config=None,
-            decoding_config=None,
-            observability_config=None,
-            prompt_adapter_config=None,
+        self.engine = LLMEngine(
+            vllm_config=VllmConfig(
+                model_config=model_config,
+                cache_config=cache_config,
+                parallel_config=parallel_config,
+                scheduler_config=scheduler_config,
+                device_config=device_config,
+                load_config=load_config,
+                lora_config=lora_config,
+                observability_config=ObservabilityConfig(),
+            ),
             executor_class=executor_class,
             log_stats=log_stats,
         )
@@ -403,6 +415,8 @@ class vLLMExporter(ITritonDeployable):
             Tensor(name="top_p", shape=(-1,), dtype=numpy.single, optional=True),
             Tensor(name="temperature", shape=(-1,), dtype=numpy.single, optional=True),
             Tensor(name="lora_uids", shape=(-1,), dtype=bytes, optional=True),
+            Tensor(name="output_generation_logits", shape=(-1,), dtype=numpy.bool_, optional=True),
+            Tensor(name="output_context_logits", shape=(-1,), dtype=numpy.bool_, optional=True),
         )
         return inputs
 
@@ -413,6 +427,9 @@ class vLLMExporter(ITritonDeployable):
 
     @batch
     def triton_infer_fn(self, **inputs: numpy.ndarray):
+        """
+        This function is used to perform inference on a batch of prompts.
+        """
         request_ids = []
         num_requests = len(inputs["prompts"])
         for index in range(num_requests):
@@ -427,6 +444,9 @@ class vLLMExporter(ITritonDeployable):
 
     @batch
     def triton_infer_fn_streaming(self, **inputs: numpy.ndarray):
+        """
+        This function is used to perform streaming inference.
+        """
         request_ids = []
         num_requests = len(inputs["prompts"])
         for index in range(num_requests):
@@ -455,6 +475,8 @@ class vLLMExporter(ITritonDeployable):
         prompt_embeddings_checkpoint_path: Optional[str] = None,
         streaming: bool = False,
         output_log_probs: bool = False,
+        output_generation_logits: bool = False,
+        output_context_logits: bool = False,
     ) -> Union[List[List[str]], Iterable[List[List[str]]]]:
         """
         The forward function performs LLM evaluation on the provided array of prompts with other parameters shared,
@@ -483,6 +505,12 @@ class vLLMExporter(ITritonDeployable):
 
         if output_log_probs:
             raise NotImplementedError("output_log_probs is not supported")
+
+        if output_generation_logits:
+            raise NotImplementedError("output_generation_logits is not supported")
+
+        if output_context_logits:
+            raise NotImplementedError("output_context_logits is not supported")
 
         request_ids = []
         for index in range(len(input_texts)):

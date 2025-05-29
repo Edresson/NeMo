@@ -1,4 +1,4 @@
-# Copyright (c) 2024, NVIDIA CORPORATION.  All rights reserved.
+# Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -56,6 +56,8 @@ def bpe_tokenizer(tmp_path_factory):
         do_lower_case=False,
         output_dir=str(tmpdir),
         remove_extra_whitespaces=True,
+        bos=True,
+        eos=True,
     )
     return SentencePieceTokenizer(str(tmpdir / "tokenizer.model"))
 

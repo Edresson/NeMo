@@ -1,4 +1,4 @@
-# Copyright (c) 2024, NVIDIA CORPORATION.  All rights reserved.
+# Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -17,11 +17,11 @@ import types
 from pathlib import Path
 from typing import Any, Dict
 
+import lightning.pytorch as pl
 import pytest
-import pytorch_lightning as pl
 import torch
-from lightning_fabric.plugins import TorchCheckpointIO
-from pytorch_lightning.demos.boring_classes import BoringModel
+from lightning.fabric.plugins import TorchCheckpointIO
+from lightning.pytorch.demos.boring_classes import BoringModel
 
 from nemo.collections.nlp.parts.nlp_overrides import NLPDDPStrategy
 from nemo.utils.callbacks.dist_ckpt_io import (

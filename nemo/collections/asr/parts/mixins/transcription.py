@@ -1,4 +1,4 @@
-# Copyright (c) 2024, NVIDIA CORPORATION.  All rights reserved.
+# Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -16,8 +16,7 @@ import json
 import os
 import tempfile
 from abc import ABC, abstractmethod
-from collections.abc import Iterable
-from dataclasses import dataclass, fields, is_dataclass
+from dataclasses import dataclass
 from functools import partial
 from typing import Any, Dict, List, Optional, Tuple, Union
 
@@ -30,10 +29,11 @@ from tqdm import tqdm
 from nemo.collections.asr.parts.preprocessing.perturb import process_augmentations
 from nemo.collections.asr.parts.preprocessing.segment import AudioSegment, ChannelSelectorType
 from nemo.collections.asr.parts.utils import manifest_utils
+from nemo.collections.asr.parts.utils.rnnt_utils import Hypothesis
 from nemo.collections.common.data.utils import move_data_to_device
 from nemo.utils import logging, logging_mode
 
-TranscriptionReturnType = Union[List[str], List['Hypothesis'], Tuple[List[str]], Tuple[List['Hypothesis']]]
+TranscriptionReturnType = Union[List[str], List[Hypothesis], Tuple[List[str]], Tuple[List[Hypothesis]]]
 GenericTranscriptionType = Union[List[Any], List[List[Any]], Tuple[Any], Tuple[List[Any]], Dict[str, List[Any]]]
 
 
@@ -61,6 +61,7 @@ class TranscribeConfig:
     num_workers: Optional[int] = None
     channel_selector: ChannelSelectorType = None
     augmentor: Optional[DictConfig] = None
+    timestamps: Optional[bool] = None  # returns timestamps for each word and segments if model supports punctuations
     verbose: bool = True
 
     # Utility
@@ -86,7 +87,8 @@ def get_value_from_transcription_config(trcfg, key, default):
         return getattr(trcfg, key)
     else:
         logging.debug(
-            f"Using default value of {default} for {key} because it is not present in the transcription config {trcfg}."
+            f"Using default value of {default} for {key} because it is not present \
+                in the transcription config {trcfg}."
         )
         return default
 
@@ -179,6 +181,7 @@ class TranscriptionMixin(ABC):
         channel_selector: Optional[ChannelSelectorType] = None,
         augmentor: DictConfig = None,
         verbose: bool = True,
+        timestamps: Optional[bool] = None,
         override_config: Optional[TranscribeConfig] = None,
         **config_kwargs,
     ) -> GenericTranscriptionType:
@@ -200,6 +203,9 @@ class TranscriptionMixin(ABC):
                 to `None`. Defaults to `None`. Uses zero-based indexing.
             augmentor: (DictConfig): Augment audio samples during transcription if augmentor is applied.
             verbose: (bool) whether to display tqdm progress bar
+            timestamps: Optional(Bool): timestamps will be returned if set to True as part of hypothesis object
+                (output.timestep['segment']/output.timestep['word']). Refer to `Hypothesis` class for more details.
+                Default is None and would retain the previous state set by using self.change_decoding_strategy().
             override_config: (Optional[TranscribeConfig]) override transcription config pre-defined by the user.
                 **Note**: All other arguments in the function will be ignored if override_config is passed.
                 You should call this argument as `model.transcribe(audio, override_config=TranscribeConfig(...))`.
@@ -229,6 +235,7 @@ class TranscriptionMixin(ABC):
                 channel_selector=channel_selector,
                 augmentor=augmentor,
                 verbose=verbose,
+                timestamps=timestamps,
                 **config_kwargs,
             )
         else:
@@ -267,18 +274,7 @@ class TranscriptionMixin(ABC):
                     if results is None:
                         results = []
 
-                        # if list of inner list of results, copy structure
-                        if isinstance(processed_outputs[0], list):
-                            for _ in processed_outputs:
-                                results.append([])
-
-                    # If nested list structure
-                    if isinstance(processed_outputs[0], list):
-                        for i, processed_output in enumerate(processed_outputs):
-                            results[i].extend(processed_output)
-                    else:
-                        # If flat list structure
-                        results.extend(processed_outputs)
+                    results.extend(processed_outputs)
 
                 elif isinstance(processed_outputs, dict):
                     # Create a results of the same type as each element in processed_outputs

@@ -27,6 +27,7 @@
 # limitations under the License.
 
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import List, Optional, Tuple, Union
 
 import numpy as np
@@ -49,7 +50,20 @@ def pack_hypotheses(
     hypotheses: List[rnnt_utils.Hypothesis],
     logitlen: torch.Tensor,
 ) -> List[rnnt_utils.Hypothesis]:
+    """
+    Packs a list of hypotheses into a tensor and prepares decoder states.
 
+    This function takes a list of token sequences (hypotheses) and converts
+    it into a tensor format. If any decoder states are on the GPU, they
+    are moved to the CPU. Additionally, the function removes any timesteps
+    with a value of -1 from the sequences.
+
+    Args:
+        hypotheses (list): A list of token sequences representing hypotheses.
+
+    Returns:
+        list: A list of packed hypotheses in tensor format.
+    """
     if hasattr(logitlen, 'cpu'):
         logitlen_cpu = logitlen.to('cpu')
     else:
@@ -407,7 +421,7 @@ class GreedyRNNTInfer(_GreedyRNNTInfer):
         # out_len: [seq_len]
 
         # Initialize blank state and empty label set in Hypothesis
-        hypothesis = rnnt_utils.Hypothesis(score=0.0, y_sequence=[], dec_state=None, timestep=[], last_token=None)
+        hypothesis = rnnt_utils.Hypothesis(score=0.0, y_sequence=[], dec_state=None, timestamp=[], last_token=None)
 
         if partial_hypotheses is not None:
             hypothesis.last_token = partial_hypotheses.last_token
@@ -479,7 +493,7 @@ class GreedyRNNTInfer(_GreedyRNNTInfer):
                     # Append token to label set, update RNN state.
                     hypothesis.y_sequence.append(k)
                     hypothesis.score += float(v)
-                    hypothesis.timestep.append(time_idx)
+                    hypothesis.timestamp.append(time_idx)
                     hypothesis.dec_state = hidden_prime
                     hypothesis.last_token = k
 
@@ -578,7 +592,10 @@ class GreedyBatchedRNNTInfer(_GreedyRNNTInfer, WithOptionalCudaGraphs):
             (evaluating Joint multiple times in inner loop); It uses a minimal possible amount of calls
             to prediction network (with maximum possible batch size),
             which makes it especially useful for scaling the prediction network.
-        use_cuda_graph_decoder: if CUDA graphs should be enabled for decoding (currently recommended only for inference)
+        use_cuda_graph_decoder: if CUDA graphs should be enabled for decoding
+                                (currently recommended only for inference)
+        ngram_lm_model: optional n-gram language model (LM) file to use for decoding
+        ngram_lm_alpha: LM weight
     """
 
     def __init__(
@@ -592,6 +609,8 @@ class GreedyBatchedRNNTInfer(_GreedyRNNTInfer, WithOptionalCudaGraphs):
         confidence_method_cfg: Optional[DictConfig] = None,
         loop_labels: bool = True,
         use_cuda_graph_decoder: bool = True,
+        ngram_lm_model: Optional[str | Path] = None,
+        ngram_lm_alpha: float = 0.0,
     ):
         super().__init__(
             decoder_model=decoder_model,
@@ -622,6 +641,8 @@ class GreedyBatchedRNNTInfer(_GreedyRNNTInfer, WithOptionalCudaGraphs):
                     preserve_frame_confidence=preserve_frame_confidence,
                     confidence_method_cfg=confidence_method_cfg,
                     allow_cuda_graphs=self.use_cuda_graph_decoder,
+                    ngram_lm_model=ngram_lm_model,
+                    ngram_lm_alpha=ngram_lm_alpha,
                 )
             else:
                 # Frame-Looping algorithm
@@ -773,7 +794,7 @@ class GreedyBatchedRNNTInfer(_GreedyRNNTInfer, WithOptionalCudaGraphs):
             # Initialize list of Hypothesis
             batchsize = x.shape[0]
             hypotheses = [
-                rnnt_utils.Hypothesis(score=0.0, y_sequence=[], timestep=[], token_duration=[], dec_state=None)
+                rnnt_utils.Hypothesis(score=0.0, y_sequence=[], timestamp=[], token_duration=[], dec_state=None)
                 for _ in range(batchsize)
             ]
 
@@ -910,7 +931,7 @@ class GreedyBatchedRNNTInfer(_GreedyRNNTInfer, WithOptionalCudaGraphs):
                         for kidx, ki in enumerate(k):
                             if blank_mask[kidx] == 0:
                                 hypotheses[kidx].y_sequence.append(ki)
-                                hypotheses[kidx].timestep.append(time_idx)
+                                hypotheses[kidx].timestamp.append(time_idx)
                                 hypotheses[kidx].score += float(v[kidx])
                         symbols_added += 1
 
@@ -972,7 +993,7 @@ class GreedyBatchedRNNTInfer(_GreedyRNNTInfer, WithOptionalCudaGraphs):
         # Initialize state
         batchsize = x.shape[0]
         hypotheses = [
-            rnnt_utils.Hypothesis(score=0.0, y_sequence=[], timestep=[], dec_state=None) for _ in range(batchsize)
+            rnnt_utils.Hypothesis(score=0.0, y_sequence=[], timestamp=[], dec_state=None) for _ in range(batchsize)
         ]
 
         # Initialize Hidden state matrix (shared by entire batch)
@@ -983,8 +1004,6 @@ class GreedyBatchedRNNTInfer(_GreedyRNNTInfer, WithOptionalCudaGraphs):
             # alignments is a 3-dimensional dangling list representing B x T x U
             for hyp in hypotheses:
                 hyp.alignments = [[]]
-        else:
-            alignments = None
 
         # If confidence scores need to be preserved, register a danling list to hold the values
         if self.preserve_frame_confidence:
@@ -1121,7 +1140,7 @@ class GreedyBatchedRNNTInfer(_GreedyRNNTInfer, WithOptionalCudaGraphs):
                         for kidx, ki in enumerate(k):
                             if blank_mask[kidx] == 0:
                                 hypotheses[kidx].y_sequence.append(ki)
-                                hypotheses[kidx].timestep.append(time_idx)
+                                hypotheses[kidx].timestamp.append(time_idx)
                                 hypotheses[kidx].score += float(v[kidx])
 
                     symbols_added += 1
@@ -1169,6 +1188,10 @@ class GreedyBatchedRNNTInfer(_GreedyRNNTInfer, WithOptionalCudaGraphs):
 
 
 class ExportedModelGreedyBatchedRNNTInfer:
+    """
+    Exported Model Greedy Batched RNNT Infer class
+    """
+
     def __init__(self, encoder_model: str, decoder_joint_model: str, max_symbols_per_step: Optional[int] = None):
         self.encoder_model_path = encoder_model
         self.decoder_joint_model_path = decoder_joint_model
@@ -1344,9 +1367,25 @@ class ExportedModelGreedyBatchedRNNTInfer:
         raise NotImplementedError()
 
     def run_encoder(self, audio_signal, length):
+        """
+        Runs encoder network:
+
+        Args:
+            audio_signal: audio signal
+            length: audio length
+        """
         raise NotImplementedError()
 
     def run_decoder_joint(self, enc_logits, targets, target_length, *states):
+        """
+        Runs decoder joint networks.
+
+        Args:
+            enc_logits: encoder logits
+            targets: targets
+            target_length: target length
+            states: states
+        """
         raise NotImplementedError()
 
     def _get_initial_states(self, batchsize):
@@ -1354,6 +1393,10 @@ class ExportedModelGreedyBatchedRNNTInfer:
 
 
 class ONNXGreedyBatchedRNNTInfer(ExportedModelGreedyBatchedRNNTInfer):
+    """
+    ONNX Greedy Batched RNNT Infer class
+    """
+
     def __init__(self, encoder_model: str, decoder_joint_model: str, max_symbols_per_step: Optional[int] = 10):
         super().__init__(
             encoder_model=encoder_model,
@@ -1365,7 +1408,7 @@ class ONNXGreedyBatchedRNNTInfer(ExportedModelGreedyBatchedRNNTInfer):
             import onnx
             import onnxruntime
         except (ModuleNotFoundError, ImportError):
-            raise ImportError(f"`onnx` or `onnxruntime` could not be imported, please install the libraries.\n")
+            raise ImportError("`onnx` or `onnxruntime` could not be imported, please install the libraries.\n")
 
         if torch.cuda.is_available():
             # Try to use onnxruntime-gpu
@@ -1433,7 +1476,8 @@ class ONNXGreedyBatchedRNNTInfer(ExportedModelGreedyBatchedRNNTInfer):
 
         self._blank_index = log_probs.shape[-1] - 1  # last token of vocab size is blank token
         logging.info(
-            f"Enc-Dec-Joint step was evaluated, blank token id = {self._blank_index}; vocab size = {log_probs.shape[-1]}"
+            f"Enc-Dec-Joint step was evaluated, \
+                blank token id = {self._blank_index}; vocab size = {log_probs.shape[-1]}"
         )
 
     def run_encoder(self, audio_signal, length):
@@ -1512,6 +1556,10 @@ class ONNXGreedyBatchedRNNTInfer(ExportedModelGreedyBatchedRNNTInfer):
 
 
 class TorchscriptGreedyBatchedRNNTInfer(ExportedModelGreedyBatchedRNNTInfer):
+    """
+    Torchscript Greedy Batched RNNT Infer
+    """
+
     def __init__(
         self,
         encoder_model: str,
@@ -1688,7 +1736,7 @@ class GreedyMultiblankRNNTInfer(GreedyRNNTInfer):
         # out_len: [seq_len]
 
         # Initialize blank state and empty label set in Hypothesis
-        hypothesis = rnnt_utils.Hypothesis(score=0.0, y_sequence=[], dec_state=None, timestep=[], last_token=None)
+        hypothesis = rnnt_utils.Hypothesis(score=0.0, y_sequence=[], dec_state=None, timestamp=[], last_token=None)
 
         if partial_hypotheses is not None:
             hypothesis.last_token = partial_hypotheses.last_token
@@ -1773,7 +1821,7 @@ class GreedyMultiblankRNNTInfer(GreedyRNNTInfer):
                     # Append token to label set, update RNN state.
                     hypothesis.y_sequence.append(k)
                     hypothesis.score += float(v)
-                    hypothesis.timestep.append(time_idx)
+                    hypothesis.timestamp.append(time_idx)
                     hypothesis.dec_state = hidden_prime
                     hypothesis.last_token = k
 
@@ -1909,7 +1957,7 @@ class GreedyBatchedMultiblankRNNTInfer(GreedyBatchedRNNTInfer):
             # Initialize list of Hypothesis
             batchsize = x.shape[0]
             hypotheses = [
-                rnnt_utils.Hypothesis(score=0.0, y_sequence=[], timestep=[], dec_state=None) for _ in range(batchsize)
+                rnnt_utils.Hypothesis(score=0.0, y_sequence=[], timestamp=[], dec_state=None) for _ in range(batchsize)
             ]
 
             # Initialize Hidden state matrix (shared by entire batch)
@@ -2069,7 +2117,7 @@ class GreedyBatchedMultiblankRNNTInfer(GreedyBatchedRNNTInfer):
                         for kidx, ki in enumerate(k):
                             if blank_mask[kidx] == 0:
                                 hypotheses[kidx].y_sequence.append(ki)
-                                hypotheses[kidx].timestep.append(time_idx)
+                                hypotheses[kidx].timestamp.append(time_idx)
                                 hypotheses[kidx].score += float(v[kidx])
 
                         symbols_added += 1
@@ -2145,7 +2193,7 @@ class GreedyBatchedMultiblankRNNTInfer(GreedyBatchedRNNTInfer):
         # Initialize state
         batchsize = x.shape[0]
         hypotheses = [
-            rnnt_utils.Hypothesis(score=0.0, y_sequence=[], timestep=[], dec_state=None) for _ in range(batchsize)
+            rnnt_utils.Hypothesis(score=0.0, y_sequence=[], timestamp=[], dec_state=None) for _ in range(batchsize)
         ]
 
         # Initialize Hidden state matrix (shared by entire batch)
@@ -2287,7 +2335,7 @@ class GreedyBatchedMultiblankRNNTInfer(GreedyBatchedRNNTInfer):
                         for kidx, ki in enumerate(k):
                             if blank_mask[kidx] == 0:
                                 hypotheses[kidx].y_sequence.append(ki)
-                                hypotheses[kidx].timestep.append(time_idx)
+                                hypotheses[kidx].timestamp.append(time_idx)
                                 hypotheses[kidx].score += float(v[kidx])
 
                     symbols_added += 1
@@ -2336,6 +2384,8 @@ class GreedyBatchedMultiblankRNNTInfer(GreedyBatchedRNNTInfer):
 
 @dataclass
 class GreedyRNNTInferConfig:
+    """Greedy RNNT Infer Config"""
+
     max_symbols_per_step: Optional[int] = 10
     preserve_alignments: bool = False
     preserve_frame_confidence: bool = False
@@ -2354,6 +2404,8 @@ class GreedyRNNTInferConfig:
 
 @dataclass
 class GreedyBatchedRNNTInferConfig:
+    """Greedy Batched RNNT Infer Config"""
+
     max_symbols_per_step: Optional[int] = 10
     preserve_alignments: bool = False
     preserve_frame_confidence: bool = False
@@ -2362,6 +2414,8 @@ class GreedyBatchedRNNTInferConfig:
     confidence_method_cfg: Optional[ConfidenceMethodConfig] = field(default_factory=lambda: ConfidenceMethodConfig())
     loop_labels: bool = True
     use_cuda_graph_decoder: bool = True
+    ngram_lm_model: Optional[str] = None
+    ngram_lm_alpha: float = 0.0
 
     def __post_init__(self):
         # OmegaConf.structured ensures that post_init check is always executed
@@ -2517,7 +2571,7 @@ class GreedyTDTInfer(_GreedyRNNTInfer):
 
         # Initialize blank state and empty label set in Hypothesis
         hypothesis = rnnt_utils.Hypothesis(
-            score=0.0, y_sequence=[], dec_state=None, timestep=[], token_duration=[], last_token=None
+            score=0.0, y_sequence=[], dec_state=None, timestamp=[], token_duration=[], last_token=None
         )
 
         if partial_hypotheses is not None:
@@ -2545,7 +2599,6 @@ class GreedyTDTInfer(_GreedyRNNTInfer):
             f = x.narrow(dim=0, start=time_idx, length=1)
 
             # Setup exit flags and counter
-            not_blank = True
             symbols_added = 0
 
             need_loop = True
@@ -2597,13 +2650,11 @@ class GreedyTDTInfer(_GreedyRNNTInfer):
                 del logp
 
                 # If blank token is predicted, exit inner loop, move onto next timestep t
-                if k == self._blank_index:
-                    not_blank = False
-                else:
+                if k != self._blank_index:
                     # Append token to label set, update RNN state.
                     hypothesis.y_sequence.append(k)
                     hypothesis.score += float(v)
-                    hypothesis.timestep.append(time_idx)
+                    hypothesis.timestamp.append(time_idx)
                     hypothesis.dec_state = hidden_prime
                     hypothesis.last_token = k
                     if self.include_duration:
@@ -2622,10 +2673,12 @@ class GreedyTDTInfer(_GreedyRNNTInfer):
 
             if self.preserve_alignments:
                 # convert Ti-th logits into a torch array
-                hypothesis.alignments.append([])  # blank buffer for next timestep
+                for i in range(skip):
+                    hypothesis.alignments.append([])  # blank buffer until next timestep
 
             if self.preserve_frame_confidence:
-                hypothesis.frame_confidence.append([])  # blank buffer for next timestep
+                for i in range(skip):
+                    hypothesis.frame_confidence.append([])  # blank buffer for next timestep
 
             if symbols_added == self.max_symbols:
                 time_idx += 1
@@ -2708,7 +2761,10 @@ class GreedyBatchedTDTInfer(_GreedyRNNTInfer, WithOptionalCudaGraphs):
                     - 'lin' for using the linear mapping.
                     - 'exp' for using exponential mapping with linear shift.
 
-        use_cuda_graph_decoder: if CUDA graphs should be enabled for decoding (currently recommended only for inference)
+        use_cuda_graph_decoder: if CUDA graphs should be enabled for decoding
+                                (currently recommended only for inference)
+        ngram_lm_model: optional n-gram language model (LM) file to use for decoding
+        ngram_lm_alpha: LM weight
     """
 
     def __init__(
@@ -2724,6 +2780,8 @@ class GreedyBatchedTDTInfer(_GreedyRNNTInfer, WithOptionalCudaGraphs):
         include_duration_confidence: bool = False,
         confidence_method_cfg: Optional[DictConfig] = None,
         use_cuda_graph_decoder: bool = True,
+        ngram_lm_model: Optional[str | Path] = None,
+        ngram_lm_alpha: float = 0.0,
     ):
         super().__init__(
             decoder_model=decoder_model,
@@ -2755,6 +2813,8 @@ class GreedyBatchedTDTInfer(_GreedyRNNTInfer, WithOptionalCudaGraphs):
                 include_duration_confidence=include_duration_confidence,
                 confidence_method_cfg=confidence_method_cfg,
                 allow_cuda_graphs=use_cuda_graph_decoder,
+                ngram_lm_model=ngram_lm_model,
+                ngram_lm_alpha=ngram_lm_alpha,
             )
             self._greedy_decode = self._greedy_decode_blank_as_pad_loop_labels
         else:

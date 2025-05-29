@@ -1,4 +1,4 @@
-# Copyright (c) 2024, NVIDIA CORPORATION.  All rights reserved.
+# Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -14,10 +14,10 @@
 
 from typing import TYPE_CHECKING, Dict, List, Optional
 
+import lightning.pytorch as pl
 import numpy as np
-import pytorch_lightning as pl
 import torch
-from pytorch_lightning.utilities.types import EVAL_DATALOADERS, TRAIN_DATALOADERS
+from lightning.pytorch.utilities.types import EVAL_DATALOADERS, TRAIN_DATALOADERS
 from torch.utils import data
 from torch.utils.data import DataLoader, Dataset
 
@@ -31,6 +31,8 @@ if TYPE_CHECKING:
 
 
 class MockDataModule(pl.LightningDataModule):
+    """Mock data module for testing"""
+
     def __init__(
         self,
         seq_length: int = 512,
@@ -50,6 +52,8 @@ class MockDataModule(pl.LightningDataModule):
         super().__init__()
         self.seq_length = seq_length
         self.seq_length_dec = seq_length_dec
+        self.micro_batch_size = micro_batch_size
+        self.global_batch_size = global_batch_size
         self.num_train_samples = num_train_samples
         self.num_val_samples = num_val_samples
         self.num_test_samples = num_test_samples
@@ -69,6 +73,7 @@ class MockDataModule(pl.LightningDataModule):
         )
 
     def setup(self, stage: str = "") -> None:
+        """Setup the datasets"""
         self._train_ds = _MockT5Dataset(
             self.tokenizer, "train", self.num_train_samples, self.seq_length, self.seq_length_dec
         )
@@ -80,16 +85,19 @@ class MockDataModule(pl.LightningDataModule):
         )
 
     def train_dataloader(self) -> TRAIN_DATALOADERS:
+        """Dataloader for training set"""
         if not hasattr(self, "_train_ds"):
             self.setup()
         return self._create_dataloader(self._train_ds)
 
     def val_dataloader(self) -> EVAL_DATALOADERS:
+        """Dataloader for validation set"""
         if not hasattr(self, "_validation_ds"):
             self.setup()
         return self._create_dataloader(self._validation_ds)
 
     def test_dataloader(self) -> EVAL_DATALOADERS:
+        """Dataloader for test set"""
         if not hasattr(self, "_test_ds"):
             self.setup()
         return self._create_dataloader(self._test_ds)
@@ -103,6 +111,29 @@ class MockDataModule(pl.LightningDataModule):
             collate_fn=dataset.collate_fn,
             **kwargs,
         )
+
+    def reconfigure_limit_batches(self):
+        """
+        Reconfigure trainer.limit_train_batches and trainer.limit_val_batches in terms of num of microbatches.
+        """
+        from nemo.collections.llm.gpt.data.utils import _reconfigure_limit_batches
+
+        # Override limit_train_batches in terms of num of microbatches
+        self.trainer.limit_train_batches = _reconfigure_limit_batches(self.trainer.limit_train_batches, self._train_ds)
+        # Override limit_val_batches to be a multiple of num microbatches to prevent val_step from exiting
+        #   in between a step
+        self.trainer.limit_val_batches = _reconfigure_limit_batches(
+            self.trainer.limit_val_batches, self._validation_ds
+        )
+
+        try:
+            from megatron.core.num_microbatches_calculator import get_num_microbatches
+
+        except (ImportError, ModuleNotFoundError):
+            from apex.transformer.pipeline_parallel.utils import get_num_microbatches
+
+        # Override num sanity steps to be a multiple of num of microbatches
+        self.trainer.num_sanity_val_steps *= get_num_microbatches()
 
 
 class _MockT5Dataset(Dataset):
@@ -125,13 +156,11 @@ class _MockT5Dataset(Dataset):
         self.seed = seed
         self.create_attention_mask = create_attention_mask
 
-        self.mask_encoder = torch.ones((self.seq_length, self.seq_length), device='cpu')
-        self.mask_decoder = torch.tril(torch.ones((self.seq_length_dec, self.seq_length_dec), device='cpu'))
-        self.mask_encoder_decoder = torch.ones((self.seq_length_dec, self.seq_length), device='cpu')
-        self.mask_encoder = self.mask_encoder < 0.5
-        self.mask_decoder = self.mask_decoder < 0.5
-        self.mask_encoder_decoder = self.mask_encoder_decoder < 0.5
-
+        # update for T5 now use FlashFused attention (b11s)
+        self.mask_encoder = torch.ones(self.seq_length, device='cpu')
+        self.mask_decoder = torch.ones(self.seq_length_dec, device='cpu')
+        self.mask_encoder = ~(self.mask_encoder < 0.5)
+        self.mask_decoder = ~(self.mask_decoder < 0.5)
         self.loss_mask = torch.ones(self.seq_length_dec, dtype=torch.float)
 
     def __len__(self) -> int:
@@ -156,7 +185,6 @@ class _MockT5Dataset(Dataset):
             "truncated": 0,
             "enc_mask": self.mask_encoder,
             "dec_mask": self.mask_decoder,
-            "enc_dec_mask": self.mask_encoder_decoder,
         }
 
         return batch

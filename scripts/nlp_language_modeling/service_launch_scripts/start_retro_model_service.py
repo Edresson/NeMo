@@ -15,8 +15,8 @@
 import os
 
 import torch
+from lightning.pytorch import Trainer
 from omegaconf.omegaconf import OmegaConf, open_dict
-from pytorch_lightning import Trainer
 
 from nemo.collections.nlp.models.language_modeling.megatron_retrieval_model import MegatronRetrievalModel
 from nemo.collections.nlp.modules.common.text_generation_server import MegatronServer
@@ -66,7 +66,10 @@ def main(cfg) -> None:
         save_restore_connector.model_extracted_dir = model_path
 
     model_cfg = MegatronRetrievalModel.restore_from(
-        model_path, trainer=trainer, return_config=True, save_restore_connector=save_restore_connector,
+        model_path,
+        trainer=trainer,
+        return_config=True,
+        save_restore_connector=save_restore_connector,
     )
 
     with open_dict(model_cfg):
@@ -76,7 +79,10 @@ def main(cfg) -> None:
         model_cfg.activations_checkpoint_method = None
 
     model = MegatronRetrievalModel.restore_from(
-        model_path, trainer=trainer, save_restore_connector=save_restore_connector, override_config_path=model_cfg,
+        model_path,
+        trainer=trainer,
+        save_restore_connector=save_restore_connector,
+        override_config_path=model_cfg,
     )
 
     # check whether the DDP is initialized
@@ -93,7 +99,10 @@ def main(cfg) -> None:
     model.set_inference_config(None, retrieval_service)
 
     # running text generation, use inference server
-    if parallel_state.is_pipeline_first_stage() and parallel_state.get_tensor_model_parallel_rank() == 0:
+    if (
+        parallel_state.is_pipeline_first_stage(ignore_virtual=True)
+        and parallel_state.get_tensor_model_parallel_rank() == 0
+    ):
         server = MegatronServer(model.cuda(), inference_strategy=model.inference_strategy)
         server.run("0.0.0.0", port=cfg.port)
 

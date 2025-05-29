@@ -1,4 +1,4 @@
-# Copyright (c) 2024, NVIDIA CORPORATION.  All rights reserved.
+# Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -19,12 +19,24 @@ from typing import List, Optional
 class BaseConversationTemplateConfig:
     """Conversation template config related parameters"""
 
-    system: Optional[str] = (
-        "A chat between a curious user and artificial assistant agent. The assistant gives helpful, detailed and polite answers to user's questions.".format()
-    )  # fmt: off
+    system: Optional[str] = ""
     roles: List[str] = field(default_factory=lambda: ['user', 'assistant'])
-    stop_string: str = "</s>"
-    chat_template = """
+    stop_string: Optional[str] = None
+    chat_template = None
+
+
+@dataclass
+class LLaVATemplateConfig(BaseConversationTemplateConfig):
+    """LLava-specific template configuration which extends the base config"""
+
+    system: str = field(
+        default="A chat between a curious user and an artificial intelligence assistant. "
+        "The assistant gives helpful, detailed and polite answers to user's questions."
+    )
+    roles: List[str] = field(default_factory=lambda: ['user', 'assistant'])
+    stop_string: str = field(default="</s>")
+    chat_template: str = field(
+        default="""
     {%- for message in messages %}
         {%- if message['role'] == 'system' %}
             {{- message['content'].strip() + ' ' -}}
@@ -36,3 +48,13 @@ class BaseConversationTemplateConfig:
         {%- endif %}
     {%- endfor -%}
     """
+    )
+
+
+@dataclass
+class MLlamaTemplateConfig(BaseConversationTemplateConfig):
+    """MLlama specific template configuration which extends the base config"""
+
+    system: str = field(default=None)
+    roles: List[str] = field(default_factory=lambda: ['user', 'assistant'])
+    stop_string: str = field(default="<|eot_id|>")

@@ -1,4 +1,4 @@
-# Copyright (c) 2024, NVIDIA CORPORATION.  All rights reserved.
+# Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -17,7 +17,7 @@ from functools import lru_cache
 from pathlib import Path
 from typing import TYPE_CHECKING, List, Optional, Union
 
-import pytorch_lightning as pl
+import lightning.pytorch as pl
 from torch.utils.data import DataLoader
 
 from nemo.collections.llm.t5.data.core import create_sft_dataset

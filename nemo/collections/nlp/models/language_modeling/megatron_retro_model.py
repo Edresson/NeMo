@@ -11,6 +11,9 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+#
+# flake8: noqa
+# pylint: skip-file
 
 import itertools
 import json
@@ -23,10 +26,10 @@ from functools import partial
 from typing import Any, Dict, Iterator, List, Optional, Union
 
 import torch
+from lightning.pytorch.accelerators import CPUAccelerator
+from lightning.pytorch.trainer.trainer import Trainer
 from omegaconf import OmegaConf, open_dict
 from omegaconf.dictconfig import DictConfig
-from pytorch_lightning.accelerators import CPUAccelerator
-from pytorch_lightning.trainer.trainer import Trainer
 
 from nemo.collections.nlp.data.language_modeling.megatron.data_samplers import (
     MegatronPretrainingRandomSampler,
@@ -76,6 +79,7 @@ try:
     from megatron.core.models.retro.utils import get_config_path as get_retro_config_path
     from megatron.core.models.retro.utils import get_gpt_data_dir as get_retro_data_dir
     from megatron.core.pipeline_parallel.schedules import get_forward_backward_func
+    from megatron.core.transformer.enums import AttnBackend
     from megatron.core.transformer.module import Float16Module as MCoreFloat16Module
     from megatron.core.transformer.transformer_config import TransformerConfig
     from megatron.core.utils import init_method_normal, scaled_init_method_normal
@@ -273,11 +277,11 @@ class MegatronRetroModel(MegatronGPTModel):
                 required_keys.update(batch.keys())
             else:
                 required_keys.add('attention_mask')
-                if parallel_state.is_pipeline_first_stage():
+                if parallel_state.is_pipeline_first_stage(ignore_virtual=False):
                     required_keys.update(
                         ('tokens', 'position_ids', 'context_input_ids', 'context_position_ids', 'context_mask')
                     )
-                if parallel_state.is_pipeline_last_stage():
+                if parallel_state.is_pipeline_last_stage(ignore_virtual=False):
                     required_keys.update(('labels', 'loss_mask'))
             if self.get_attention_mask_from_fusion:
                 required_keys.remove('attention_mask')
@@ -390,7 +394,7 @@ class MegatronRetroModel(MegatronGPTModel):
             # Advance inference sequence offset.
             if self.inference_params:
                 # if last stage, then (final) output is [b, s, h], otherwise it's [s, b, h]
-                if parallel_state.is_pipeline_last_stage():
+                if parallel_state.is_pipeline_last_stage(ignore_virtual=True):
                     self.inference_params.sequence_len_offset += output_tensor.size(1)
                 else:
                     self.inference_params.sequence_len_offset += output_tensor.size(0)
@@ -431,6 +435,8 @@ class MegatronRetroModel(MegatronGPTModel):
 
         te_version = packaging.version.Version(version("transformer-engine"))
         if te_version >= packaging.version.Version("1.3"):
+            if HAVE_MEGATRON_CORE:
+                retro_config.attention_backend = AttnBackend.unfused
             try:
                 os.environ["NVTE_FLASH_ATTN"] = "0"
                 os.environ["NVTE_FUSED_ATTN"] = "0"

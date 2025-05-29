@@ -1,4 +1,4 @@
-# Copyright (c) 2024, NVIDIA CORPORATION.  All rights reserved.
+# Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -20,8 +20,8 @@ import threading
 from functools import partial
 
 import torch
+from lightning.pytorch.trainer.trainer import Trainer
 from omegaconf import OmegaConf, open_dict
-from pytorch_lightning.trainer.trainer import Trainer
 from torch.utils.data import DataLoader, Dataset
 
 from nemo.collections.nlp.models.language_modeling.megatron_mamba_model import MegatronMambaModel
@@ -374,7 +374,10 @@ def main(cfg) -> None:
     if cfg.server:
         from nemo.collections.nlp.modules.common.megatron_web_server import get_chatbot_demo, get_demo
 
-        if parallel_state.is_pipeline_first_stage() and parallel_state.get_tensor_model_parallel_rank() == 0:
+        if (
+            parallel_state.is_pipeline_first_stage(ignore_virtual=True)
+            and parallel_state.get_tensor_model_parallel_rank() == 0
+        ):
             if cfg.web_server:
                 if cfg.chat:
                     defaults = {

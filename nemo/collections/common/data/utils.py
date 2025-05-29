@@ -1,4 +1,4 @@
-# Copyright (c) 2024, NVIDIA CORPORATION.  All rights reserved.
+# Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -20,6 +20,8 @@ import torch
 
 def move_data_to_device(inputs: Any, device: Union[str, torch.device], non_blocking: bool = True) -> Any:
     """Recursively moves inputs to the specified device"""
+    if inputs is None:
+        return None
     if isinstance(inputs, torch.Tensor):
         return inputs.to(device, non_blocking=non_blocking)
     elif isinstance(inputs, (list, tuple, set)):

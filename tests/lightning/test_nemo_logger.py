@@ -1,4 +1,4 @@
-# Copyright (c) 2024, NVIDIA CORPORATION.  All rights reserved.
+# Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -19,8 +19,8 @@ from pathlib import Path
 from unittest.mock import patch
 
 import pytest
-from pytorch_lightning.callbacks import ModelCheckpoint as PTLModelCheckpoint
-from pytorch_lightning.loggers import WandbLogger
+from lightning.pytorch.callbacks import ModelCheckpoint as PTLModelCheckpoint
+from lightning.pytorch.loggers import WandbLogger
 
 from nemo import lightning as nl
 from nemo.constants import NEMO_ENV_VARNAME_VERSION

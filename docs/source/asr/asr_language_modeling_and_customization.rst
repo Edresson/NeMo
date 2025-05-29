@@ -99,15 +99,15 @@ Evaluate by Beam Search Decoding and N-gram LM
 
 NeMo's beam search decoders are capable of using the KenLM's N-gram models to find the best candidates.
 The script to evaluate an ASR model with beam search decoding and N-gram models can be found at
-`scripts/asr_language_modeling/ngram_lm/eval_beamsearch_ngram.py <https://github.com/NVIDIA/NeMo/blob/stable/scripts/asr_language_modeling/ngram_lm/eval_beamsearch_ngram.py>`__.
+`scripts/asr_language_modeling/ngram_lm/eval_beamsearch_ngram_ctc.py <https://github.com/NVIDIA/NeMo/blob/stable/scripts/asr_language_modeling/ngram_lm/eval_beamsearch_ngram_ctc.py>`__.
 
-This script has a large number of possible argument overrides; therefore, it is recommended that you use ``python eval_beamsearch_ngram.py --help`` to see the full list of arguments.
+This script has a large number of possible argument overrides; therefore, it is recommended that you use ``python eval_beamsearch_ngram_ctc.py --help`` to see the full list of arguments.
 
 You can evaluate an ASR model using the following:
 
 .. code-block::
 
-    python eval_beamsearch_ngram.py nemo_model_file=<path to the .nemo file of the model> \
+    python eval_beamsearch_ngram_ctc.py nemo_model_file=<path to the .nemo file of the model> \
            input_manifest=<path to the evaluation JSON manifest file \
            kenlm_model_file=<path to the binary KenLM model> \
            beam_width=[<list of the beam widths, separated with commas>] \
@@ -118,18 +118,18 @@ You can evaluate an ASR model using the following:
            decoding_mode=beamsearch_ngram \
            decoding_strategy="<Beam library such as beam, pyctcdecode or flashlight>"
 
-It can evaluate a model in the following three modes by setting the argument `--decoding_mode`:
+It can evaluate a model in the following three modes by setting the argument ``--decoding_mode``:
 
 *  greedy: Just greedy decoding is done and no beam search decoding is performed.
 *  beamsearch: The beam search decoding is done, but without using the N-gram language model. Final results are equivalent to setting the weight of LM (beam_beta) to zero.
 *  beamsearch_ngram: The beam search decoding is done with N-gram LM.
 
-In `beamsearch` mode, the evaluation is performed using beam search decoding without any language model. The performance is reported in terms of Word Error Rate (WER) and Character Error Rate (CER). Moreover, when the best candidate is selected among the candidates, it is also reported as the best WER/CER. This can serve as an indicator of the quality of the predicted candidates.
+In ``beamsearch`` mode, the evaluation is performed using beam search decoding without any language model. The performance is reported in terms of Word Error Rate (WER) and Character Error Rate (CER). Moreover, when the best candidate is selected among the candidates, it is also reported as the best WER/CER. This can serve as an indicator of the quality of the predicted candidates.
 
 
 The script initially loads the ASR model and predicts the outputs of the model's encoder as log probabilities. This part is computed in batches on a device specified by --device, which can be either a CPU (`--device=cpu`) or a single GPU (`--device=cuda:0`).
-The batch size for this part is specified by `--acoustic_batch_size`. Using the largest feasible batch size can speed up the calculation of log probabilities. Additionally, you can use `--use_amp` to accelerate the calculation and allow for larger --acoustic_batch_size values.
-Currently, multi-GPU support is not available for calculating log probabilities. However, using `--probs_cache_file` can help. This option stores the log probabilities produced by the model’s encoder in a pickle file, allowing you to skip the first step in future runs.
+The batch size for this part is specified by ``--acoustic_batch_size``. Using the largest feasible batch size can speed up the calculation of log probabilities. Additionally, you can use `--use_amp` to accelerate the calculation and allow for larger --acoustic_batch_size values.
+Currently, multi-GPU support is not available for calculating log probabilities. However, using ``--probs_cache_file`` can help. This option stores the log probabilities produced by the model's encoder in a pickle file, allowing you to skip the first step in future runs.
 
 The following is the list of the important arguments for the evaluation script:
 
@@ -167,7 +167,7 @@ The following is the list of the important arguments for the evaluation script:
 | decoding_strategy                    | str      | beam             | String argument for type of decoding strategy for the model.            |
 +--------------------------------------+----------+------------------+-------------------------------------------------------------------------+
 | decoding                             | Dict     | BeamCTC          | Subdict of beam search configs. Values found via                        |
-|                                      | Config   | InferConfig      | python eval_beamsearch_ngram.py --help                                  |
+|                                      | Config   | InferConfig      | python eval_beamsearch_ngram_ctc.py --help                              |
 +--------------------------------------+----------+------------------+-------------------------------------------------------------------------+
 | text_processing.do_lowercase         | bool     | ``False``        | Whether to make the training text all lower case.                       |
 +--------------------------------------+----------+------------------+-------------------------------------------------------------------------+
@@ -178,11 +178,11 @@ The following is the list of the important arguments for the evaluation script:
 | text_processing.separate_punctuation | bool     | ``True``         | Whether to separate punctuation with the previous word by space.        |
 +--------------------------------------+----------+------------------+-------------------------------------------------------------------------+
 
-The width of the beam search (`--beam_width`) specifies the number of top candidates or predictions the beam search decoder will consider. Larger beam widths result in more accurate but slower predictions.
+The width of the beam search (``--beam_width``) specifies the number of top candidates or predictions the beam search decoder will consider. Larger beam widths result in more accurate but slower predictions.
 
 .. note::
 
-    The ``eval_beamsearch_ngram.py`` script contains the entire subconfig used for CTC Beam Decoding.
+    The ``eval_beamsearch_ngram_ctc.py`` script contains the entire subconfig used for CTC Beam Decoding.
     Therefore it is possible to forward arguments for various beam search libraries such as ``flashlight``
     and ``pyctcdecode`` via the ``decoding`` subconfig.
 
@@ -223,14 +223,14 @@ It supports several advanced features, such as lexicon-based decoding, lexicon-f
 .. code-block::
 
     # Lexicon-based decoding
-    python eval_beamsearch_ngram.py ... \
+    python eval_beamsearch_ngram_ctc.py ... \
            decoding_strategy="flashlight" \
            decoding.beam.flashlight_cfg.lexicon_path='/path/to/lexicon.lexicon' \
            decoding.beam.flashlight_cfg.beam_size_token = 32 \
            decoding.beam.flashlight_cfg.beam_threshold = 25.0
 
     # Lexicon-free decoding
-    python eval_beamsearch_ngram.py ... \
+    python eval_beamsearch_ngram_ctc.py ... \
            decoding_strategy="flashlight" \
            decoding.beam.flashlight_cfg.beam_size_token = 32 \
            decoding.beam.flashlight_cfg.beam_threshold = 25.0
@@ -256,7 +256,7 @@ It has advanced features, such as word boosting, which can be useful for transcr
 .. code-block::
 
     # PyCTCDecoding
-    python eval_beamsearch_ngram.py ... \
+    python eval_beamsearch_ngram_ctc.py ... \
            decoding_strategy="pyctcdecode" \
            decoding.beam.pyctcdecode_cfg.beam_prune_logp = -10. \
            decoding.beam.pyctcdecode_cfg.token_min_logp = -5. \
@@ -273,7 +273,7 @@ For example, the following set of parameters would result in 212=4 beam search d
 
 .. code-block::
 
-    python eval_beamsearch_ngram.py ... \
+    python eval_beamsearch_ngram_ctc.py ... \
                         beam_width=[64,128] \
                         beam_alpha=[1.0] \
                         beam_beta=[1.0,0.5]
@@ -308,15 +308,14 @@ You can also find a similar script to evaluate an RNNT/HAT model with beam searc
 Neural Rescoring
 ****************
 
-When using the neural rescoring approach, a neural network is used to score candidates. A candidate is the text transcript predicted by the ASR model’s decoder. The top K candidates produced by beam search decoding (with a beam width of K) are given to a neural language model for ranking. The language model assigns a score to each candidate, which is usually combined with the scores from beam search decoding to produce the final scores and rankings.
+When using the neural rescoring approach, a neural network is used to score candidates. A candidate is the text transcript predicted by the ASR model's decoder. The top K candidates produced by beam search decoding (with a beam width of K) are given to a neural language model for ranking. The language model assigns a score to each candidate, which is usually combined with the scores from beam search decoding to produce the final scores and rankings.
 
 Train Neural Rescorer
 =====================
 
 An example script to train such a language model with Transformer can be found at `examples/nlp/language_modeling/transformer_lm.py <https://github.com/NVIDIA/NeMo/blob/stable/examples/nlp/language_modeling/transformer_lm.py>`__.
-It trains a ``TransformerLMModel`` which can be used as a neural rescorer for an ASR system. Full documentation on language models training is available at:
+It trains a ``TransformerLMModel`` which can be used as a neural rescorer for an ASR system. For more information on language models training, see LLM/NLP documentation.
 
-:doc:`../nlp/language_modeling`
 
 You can also use a pretrained language model from the Hugging Face library, such as Transformer-XL and GPT, instead of training your model.
 Models like BERT and RoBERTa are not supported by this script because they are trained as Masked Language Models. As a result, they are not efficient or effective for scoring sentences out of the box.
@@ -330,7 +329,7 @@ Given a trained TransformerLMModel `.nemo` file or a pretrained HF model, the sc
 can be used to re-score beams obtained with ASR model. You need the `.tsv` file containing the candidates produced
 by the acoustic model and the beam search decoding to use this script. The candidates can be the result of just the beam
 search decoding or the result of fusion with an N-gram LM. You can generate this file by specifying `--preds_output_folder` for
-`scripts/asr_language_modeling/ngram_lm/eval_beamsearch_ngram.py <https://github.com/NVIDIA/NeMo/blob/stable/scripts/asr_language_modeling/ngram_lm/eval_beamsearch_ngram.py>`__.
+`scripts/asr_language_modeling/ngram_lm/eval_beamsearch_ngram_ctc.py <https://github.com/NVIDIA/NeMo/blob/stable/scripts/asr_language_modeling/ngram_lm/eval_beamsearch_ngram_ctc.py>`__.
 
 The neural rescorer would rescore the beams/candidates by using two parameters of `rescorer_alpha` and `rescorer_beta`, as follows:
 
@@ -345,7 +344,7 @@ Use the following steps to evaluate a neural LM:
 #. Obtain `.tsv` file with beams and their corresponding scores. Scores can be from a regular beam search decoder or
    in fusion with an N-gram LM scores. For a given beam size `beam_size` and a number of examples
    for evaluation `num_eval_examples`, it should contain (`num_eval_examples` x `beam_size`) lines of
-   form `beam_candidate_text \t score`. This file can be generated by `scripts/asr_language_modeling/ngram_lm/eval_beamsearch_ngram.py <https://github.com/NVIDIA/NeMo/blob/stable/scripts/asr_language_modeling/ngram_lm/eval_beamsearch_ngram.py>`__
+   form `beam_candidate_text \t score`. This file can be generated by `scripts/asr_language_modeling/ngram_lm/eval_beamsearch_ngram_ctc.py <https://github.com/NVIDIA/NeMo/blob/stable/scripts/asr_language_modeling/ngram_lm/eval_beamsearch_ngram_ctc.py>`__
 
 #. Rescore the candidates by `scripts/asr_language_modeling/neural_rescorer/eval_neural_rescorer.py <https://github.com/NVIDIA/NeMo/blob/stable/scripts/asr_language_modeling/neural_rescorer/eval_neural_rescorer.py>`__.
 
@@ -439,7 +438,7 @@ You can then pass this file to your Flashlight config object during decoding:
 .. code-block::
 
     # Lexicon-based decoding
-    python eval_beamsearch_ngram.py ... \
+    python eval_beamsearch_ngram_ctc.py ... \
            decoding_strategy="flashlight" \
            decoding.beam.flashlight_cfg.lexicon_path='/path/to/lexicon.lexicon' \
            decoding.beam.flashlight_cfg.boost_path='/path/to/my_boost_file.boost' \
@@ -539,7 +538,7 @@ To run WFST decoding in NeMo, one needs to provide a NeMo ASR model and either a
 
 The script to evaluate an ASR model with WFST decoding and N-gram models can be found at
 `scripts/asr_language_modeling/ngram_lm/eval_wfst_decoding_ctc.py
-<https://github.com/NVIDIA/NeMo/blob/stable/scripts/asr_language_modeling/ngram_lm/eval_wfst_decoding_ctc.py>`__.
+<https://github.com/NVIDIA/NeMo/blob/main/scripts/asr_language_modeling/ngram_lm/eval_wfst_decoding_ctc.py>`__.
 
 This script has a large number of possible argument overrides, therefore it is advised to use ``python eval_wfst_decoding_ctc.py --help`` to see the full list of arguments.
 

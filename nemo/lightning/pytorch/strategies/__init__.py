@@ -1,4 +1,4 @@
-# Copyright (c) 2024, NVIDIA CORPORATION.  All rights reserved.
+# Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -12,11 +12,12 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from nemo.lightning.pytorch.strategies.fsdp2_strategy import FSDP2Strategy
 from nemo.lightning.pytorch.strategies.fsdp_strategy import FSDPStrategy
 from nemo.lightning.pytorch.strategies.megatron_strategy import MegatronStrategy
 
-
 __all__ = [
     "FSDPStrategy",
+    "FSDP2Strategy",
     "MegatronStrategy",
 ]

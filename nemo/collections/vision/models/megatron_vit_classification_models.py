@@ -11,15 +11,18 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+#
+# flake8: noqa
+# pylint: skip-file
 
 import itertools
 from functools import partial
 from typing import Any, Optional
 
 import torch
+from lightning.pytorch.accelerators import CPUAccelerator
+from lightning.pytorch.trainer.trainer import Trainer
 from omegaconf.dictconfig import DictConfig
-from pytorch_lightning.accelerators import CPUAccelerator
-from pytorch_lightning.trainer.trainer import Trainer
 
 from nemo.collections.nlp.data.language_modeling.megatron.data_samplers import MegatronPretrainingSampler
 from nemo.collections.nlp.models.language_modeling.megatron_base_model import MegatronBaseModel
@@ -387,7 +390,7 @@ class MegatronVitClassificationModel(MegatronBaseModel):
             # launch grad reductions
             # Note: grads in first pipeline stage have already been
             # reduced
-            if not parallel_state.is_pipeline_first_stage():
+            if not parallel_state.is_pipeline_first_stage(ignore_virtual=False):
                 self.reduce_overlap_gradients()
         elif self.megatron_amp_O2:
             # # when using pipeline parallelism grads must be all-reduced after the pipeline (not asynchronously)
@@ -484,11 +487,11 @@ class MegatronVitClassificationModel(MegatronBaseModel):
                 tokens, labels = batch
             else:
                 # Vision transformer doesn't need attention mask
-                if parallel_state.is_pipeline_first_stage():
+                if parallel_state.is_pipeline_first_stage(ignore_virtual=False):
                     # Fist pipeline stage needs only the tokens and position_ids
                     tokens = batch[0].cuda(non_blocking=True)
                     labels = None
-                elif parallel_state.is_pipeline_last_stage():
+                elif parallel_state.is_pipeline_last_stage(ignore_virtual=False):
                     # Last pipeline stage needs only the labels and loss_mask
                     labels = batch[1].cuda(non_blocking=True)
                     tokens = None
@@ -534,7 +537,7 @@ class MegatronVitClassificationModel(MegatronBaseModel):
         if not self.validation_step_outputs:
             return None
 
-        if parallel_state.is_pipeline_last_stage():
+        if parallel_state.is_pipeline_last_stage(ignore_virtual=False):
             loss_outputs = [output[0] for output in self.validation_step_outputs]
             acc_outputs = [output[1] for output in self.validation_step_outputs]
 

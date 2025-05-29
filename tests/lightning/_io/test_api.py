@@ -1,4 +1,4 @@
-# Copyright (c) 2024, NVIDIA CORPORATION.  All rights reserved.
+# Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -19,7 +19,7 @@ from pathlib import Path
 import fiddle as fdl
 import pytest
 import yaml
-from pytorch_lightning.loggers import TensorBoardLogger
+from lightning.pytorch.loggers import TensorBoardLogger
 
 from nemo import lightning as nl
 from nemo.collections import llm

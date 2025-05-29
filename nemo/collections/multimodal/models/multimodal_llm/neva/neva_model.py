@@ -11,6 +11,9 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+#
+# flake8: noqa
+# pylint: skip-file
 
 import os
 from functools import partial
@@ -22,8 +25,8 @@ import packaging
 import torch
 import torch.nn.functional as F
 from einops import rearrange, reduce, repeat
+from lightning.pytorch.trainer.trainer import Trainer
 from omegaconf import DictConfig, ListConfig, OmegaConf
-from pytorch_lightning.trainer.trainer import Trainer
 from transformers import CLIPVisionModel, SiglipVisionModel
 
 from nemo.collections.common.parts.utils import extend_instance
@@ -91,7 +94,7 @@ except (ImportError, ModuleNotFoundError):
 try:
     from megatron.core import InferenceParams, dist_checkpointing, parallel_state, tensor_parallel
     from megatron.core.dist_checkpointing.dict_utils import dict_list_map_inplace
-    from megatron.core.dist_checkpointing.mapping import LocalNonpersitentObject, ShardedObject
+    from megatron.core.dist_checkpointing.mapping import LocalNonpersistentObject, ShardedObject
     from megatron.core.models.gpt import GPTModel as MCoreGPTModel
     from megatron.core.pipeline_parallel.schedules import get_forward_backward_func
     from megatron.core.transformer.utils import make_sharded_tensors_for_checkpoint
@@ -112,7 +115,7 @@ except (ImportError, ModuleNotFoundError):
 
 def skip_fp8_load(x):
     if isinstance(x, ShardedObject) and 'fused_attention' in x.key and '_extra_state' in x.key:
-        x = LocalNonpersitentObject(x.data)  # use the FP8 state from initialization, not from ckpt
+        x = LocalNonpersistentObject(x.data)  # use the FP8 state from initialization, not from ckpt
     return x
 
 
@@ -1014,7 +1017,7 @@ class MegatronNevaModel(MultimodalAdapterModelMixin, MegatronGPTModel):
                     else:
                         batch[k] = batch[k].cuda(non_blocking=True)
             else:
-                if parallel_state.is_pipeline_first_stage():
+                if parallel_state.is_pipeline_first_stage(ignore_virtual=False):
                     # First pipeline stage needs tokens, position_ids, and attention_mask
                     for k in batch.keys():
                         if self.get_attention_mask_from_fusion:
@@ -1029,7 +1032,7 @@ class MegatronNevaModel(MultimodalAdapterModelMixin, MegatronGPTModel):
                                 if k in ['tokens', 'position_ids', 'attention_mask', 'media', 'cu_seqlens']
                                 else None
                             )
-                elif parallel_state.is_pipeline_last_stage():
+                elif parallel_state.is_pipeline_last_stage(ignore_virtual=False):
                     # Last pipeline stage needs the labels, loss_mask, and attention_mask
                     for k in batch.keys():
                         if self.get_attention_mask_from_fusion:
@@ -1137,7 +1140,7 @@ class MegatronNevaModel(MultimodalAdapterModelMixin, MegatronGPTModel):
             # Advance inference sequence offset.
             if self.inference_params:
                 # if last stage, then (final) output is [b, s, h], otherwise it's [s, b, h]
-                if parallel_state.is_pipeline_last_stage():
+                if parallel_state.is_pipeline_last_stage(ignore_virtual=True):
                     self.inference_params.sequence_len_offset += output_tensor.size(1)
                 else:
                     self.inference_params.sequence_len_offset += output_tensor.size(0)
@@ -1156,7 +1159,7 @@ class MegatronNevaModel(MultimodalAdapterModelMixin, MegatronGPTModel):
         if not self.validation_step_outputs:
             return
 
-        if parallel_state.is_pipeline_last_stage():
+        if parallel_state.is_pipeline_last_stage(ignore_virtual=False):
             # only the last pipeline parallel stages return loss with their batch size
             if self.cfg.data.get('validation_drop_last', True):
                 averaged_loss = torch.stack(self.validation_step_outputs).mean()
@@ -1189,8 +1192,10 @@ class MegatronNevaModel(MultimodalAdapterModelMixin, MegatronGPTModel):
     def loss_func(self, loss_mask, output_tensor):
         losses = output_tensor.float()
         loss_mask = loss_mask.view(-1).float()
-        # TODO: add nemo version here
-        loss = torch.sum(losses.view(-1) * loss_mask) / loss_mask.sum()  # sequence level nll
+        valid_tokens = loss_mask.sum()
+        if valid_tokens < 0.5:  # no valid tokens
+            valid_tokens += 1.0
+        loss = torch.sum(losses.view(-1) * loss_mask) / valid_tokens  # sequence level nll
         return loss
 
     def setup(self, stage=None):

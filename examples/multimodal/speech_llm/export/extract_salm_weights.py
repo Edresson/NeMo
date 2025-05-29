@@ -1,4 +1,4 @@
-# Copyright (c) 2024, NVIDIA CORPORATION.  All rights reserved.
+# Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the 'License');
 # you may not use this file except in compliance with the License.
@@ -18,9 +18,9 @@ import os
 import tempfile
 
 import torch
+from lightning.pytorch.trainer.trainer import Trainer
 from megatron.core import dist_checkpointing
 from omegaconf import OmegaConf
-from pytorch_lightning.trainer.trainer import Trainer
 
 from nemo.collections.multimodal.speech_llm.modules.perception_modules import AudioPerceptionModule
 from nemo.collections.nlp.models.language_modeling.megatron_gpt_model import MegatronGPTModel
