@@ -1086,7 +1086,7 @@ class LhotseAudioQuestionAnswerDataset(torch.utils.data.Dataset):
             num_turns.append(1) # num turns for tts data is always 1
 
             # target text_start_step is the size of user_audio_with_prompt_and_padding minus 1 to avoid cut real speech
-            text_start_step = int(user_audio_with_prompt_and_padding.size(1) / self.codec_model_downsampling_factor / self.decoder_reduction_factor) - 1
+            text_start_step = int(user_audio_with_prompt_and_padding_output_sr.size(1) / self.codec_model_downsampling_factor / self.decoder_reduction_factor) - 1
             # target text_end_step is total audio len divided by self.codec_model_downsampling_factor / self.decoder_reduction_factor to get frame level len minus 1 to avoid remove real speech
             text_end_step = int(answer_audio_len / self.codec_model_downsampling_factor / self.decoder_reduction_factor) - 1
 
