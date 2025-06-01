@@ -496,8 +496,8 @@ class DiscriminatorHingedLossWithLeCam(Loss):
     def __init__(self, decay=0.99, lambda_rlc=0.3):
         """
         Discriminator loss = Hinge loss + LeCam regularization.
-        As implemented in https://github.com/google/lecam-gan/blob/f9af9485eda4637b25e694c142ce8e6992eb7243/stylegan2/lecam_loss.py
-        
+        As implemented as in https://arxiv.org/pdf/2104.03310
+
         Args:
             decay (float): EMA decay factor for the anchors.
             lambda_rlc (float): Weight for LeCam regularization.
@@ -531,6 +531,68 @@ class DiscriminatorHingedLossWithLeCam(Loss):
             loss_gen = torch.mean(F.relu(1.0 + d_gen))
             hinge_loss = (loss_real + loss_gen) / 2
             total_loss += hinge_loss
+
+            # Update EMA anchors
+            real_mean = d_real.mean().detach()
+            fake_mean = d_gen.mean().detach()
+
+            if not self.initialized:
+                self.alpha_real.copy_(real_mean)
+                self.alpha_fake.copy_(fake_mean)
+                self.initialized = True
+            else:
+                self.alpha_real.mul_(self.decay).add_((1 - self.decay) * real_mean)
+                self.alpha_fake.mul_(self.decay).add_((1 - self.decay) * fake_mean)
+
+            # LeCam regularization: ReLU-based penalty
+            rlc_real = torch.mean(torch.relu(d_real - self.alpha_fake) ** 2)
+            rlc_fake = torch.mean(torch.relu(self.alpha_real - d_gen) ** 2)
+            total_rlc += rlc_real + rlc_fake
+
+        n_scales = len(disc_scores_real)
+        loss = total_loss / n_scales + self.lambda_rlc * total_rlc / n_scales
+        return loss
+
+
+class DiscriminatorSquaredLossWithLeCam(Loss):
+    def __init__(self, decay=0.99, lambda_rlc=0.3):
+        """
+        Discriminator loss = Squared loss + LeCam regularization.
+        As implemented in https://arxiv.org/pdf/2104.03310
+
+        Args:
+            decay (float): EMA decay factor for the anchors.
+            lambda_rlc (float): Weight for LeCam regularization.
+        """
+        super().__init__()
+        self.decay = decay
+        self.lambda_rlc = lambda_rlc
+        self.initialized = False
+        self.register_buffer("alpha_real", torch.tensor(0.0))
+        self.register_buffer("alpha_fake", torch.tensor(0.0))
+
+    @property
+    def input_types(self):
+        return {
+            "disc_scores_real": [NeuralType(('B', 'C', 'T'), VoidType())],
+            "disc_scores_gen": [NeuralType(('B', 'C', 'T'), VoidType())],
+        }
+
+    @property
+    def output_types(self):
+        return {"loss": NeuralType(elements_type=LossType())}
+
+    @typecheck()
+    def forward(self, disc_scores_real, disc_scores_gen):
+        total_loss = 0.0
+        total_rlc = 0.0
+
+        for d_real, d_gen in zip(disc_scores_real, disc_scores_gen):
+            # Squared loss (LSGAN-style)
+            loss_real = torch.mean((1.0 - d_real) ** 2)
+            loss_gen = torch.mean(d_gen ** 2)
+            squared_loss = (loss_real + loss_gen) / 2
+            total_loss += squared_loss
 
             # Update EMA anchors
             real_mean = d_real.mean().detach()
