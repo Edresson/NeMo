@@ -714,11 +714,10 @@ class MMDLoss(Loss):
         num_codebooks: Number of codebooks.
         codebok_dim: Dimension of a single codebook code.
         kernel_radii: List of radii for Gaussian kernels
-        loss_scale: Scaling factor to apply to output loss. The default value 0.01 scales the loss to be on the same
-            order of magnitude as other training losses.
+        loss_scale: Scaling factor to apply to output loss.
     """
 
-    def __init__(self, num_codebooks, codebook_dim, kernel_radii=(0.1, 1, 5, 10, 20, 50), loss_scale=0.01):
+    def __init__(self, num_codebooks, codebook_dim, kernel_radii=(0.1, 1, 5, 10, 20, 50), loss_scale=1.0):
         super().__init__()
         self.num_codebooks = num_codebooks
         self.codebook_dim = codebook_dim
@@ -781,12 +780,12 @@ class MMDLoss(Loss):
         dxy = rx.t() + ry - 2.0 * zz
 
         loss = 0.0
-        coeff = -2.0 / B**2
-        denom = B * (B - 1)
+        coeff = -2.0 / N**2
+        denom = N * (N - 1)
         for r in self.kernel_radii:
-            loss += (torch.utils.checkpoint.checkpoint(self._exp_kernel, dxx, r) - B) / denom
+            loss += (torch.utils.checkpoint.checkpoint(self._exp_kernel, dxx, r) - N) / denom
             loss += coeff * torch.utils.checkpoint.checkpoint(self._exp_kernel, dxy, r)
-            loss += (torch.utils.checkpoint.checkpoint(self._exp_kernel, dyy, r) - B) / denom
+            loss += (torch.utils.checkpoint.checkpoint(self._exp_kernel, dyy, r) - N) / denom
 
         loss = loss.clamp(min=0)
         loss = self.loss_scale * loss
