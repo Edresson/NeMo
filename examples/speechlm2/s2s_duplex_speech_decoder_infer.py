@@ -26,7 +26,7 @@ torch.cuda.set_device(int(os.environ["LOCAL_RANK"]))
 
 
 @hydra_runner(config_path="conf", config_name="s2s_duplex_speech_decoder")
-def train(cfg):
+def inference(cfg):
     OmegaConf.resolve(cfg)
     torch.distributed.init_process_group(backend="nccl")
     torch.set_float32_matmul_precision("medium")
@@ -44,12 +44,12 @@ def train(cfg):
         source_sample_rate=cfg.data.source_sample_rate,
         target_sample_rate=cfg.data.target_sample_rate,
         input_roles=cfg.data.input_roles,
-        output_roles=cfg.data.output_roles
+        output_roles=cfg.data.output_roles,
     )
     datamodule = DataModule(cfg.data, tokenizer=model.tokenizer, dataset=dataset)
 
-    trainer.fit(model, datamodule)
+    trainer.validate(model, datamodule)
 
 
 if __name__ == "__main__":
-    train()
+    inference()
