@@ -1708,12 +1708,17 @@ class DuplexS2SSpeechDecoderModel(LightningModule, HFHubMixin):
             dist.all_reduce(T_tensor, op=dist.ReduceOp.MAX)
             T = int(T_tensor.item())
             if T > T_local:
-                last_frame = source_encoded[:, T_local - 1 : T_local, :]  # (B,1,H)
-                pad = last_frame.repeat(1, T - T_local, 1)  # (B, T-T_local, H)
-                source_encoded = torch.cat([source_encoded, pad], dim=1)
-                asr_emb = torch.cat([asr_emb, pad], dim=1)
+
+                last_frame_source = source_encoded[:, T_local - 1: T_local, :]
+                pad_source = last_frame_source.repeat(1, T - T_local, 1)
+                source_encoded = torch.cat([source_encoded, pad_source], dim=1)
+                last_frame_asr = asr_emb[:, T_local - 1: T_local, :]
+                pad_asr = last_frame_asr.repeat(1, T - T_local, 1)
+                asr_emb = torch.cat([asr_emb, pad_asr], dim=1)
                 if self.cfg.get("use_eou_decoder", None):
-                    eou_emb = torch.cat([eou_emb, pad], dim=1)
+                    last_frame_eou = eou_emb[:, T_local - 1: T_local, :]
+                    pad_eou = last_frame_eou.repeat(1, T - T_local, 1)
+                    eou_emb = torch.cat([eou_emb, pad_eou], dim=1)
         else:
             T = T_local
 
