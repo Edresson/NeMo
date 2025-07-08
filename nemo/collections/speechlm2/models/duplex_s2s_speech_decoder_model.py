@@ -399,14 +399,6 @@ class DuplexS2SSpeechDecoderModel(LightningModule, HFHubMixin):
         if self.cfg.get("pretrained_eou_from_s2s", None):
             self.init_eou_from_another_s2s_checkpoint(self.cfg.pretrained_eou_from_s2s)
 
-        self.embed_audio_tokens = torch.nn.ModuleList(
-            [
-                torch.nn.Embedding(self.speech_vocab_size, self.embed_tokens.embedding_dim)
-                for _ in range(self._num_codebooks)
-            ]
-        )
-        self.audio_head = torch.nn.Linear(self.llm.config.hidden_size, self.speech_vocab_size * self._num_codebooks)
-
         # cached for quicker audio decoding
         self.register_buffer(
             "_control_codes",
@@ -2016,7 +2008,7 @@ class DuplexS2SSpeechDecoderModel(LightningModule, HFHubMixin):
 
                 parallelize_module(transformer_block, tp_mesh, plan)
 
-            for m in (self.lm_head, self.audio_head):
+            for m in (self.lm_head):
                 parallelize_module(
                     m,
                     tp_mesh,
