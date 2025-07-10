@@ -57,7 +57,7 @@ class ASRBLEU:
 
     def update(
         self, name: str, refs: list[str], pred_audio: torch.Tensor, pred_audio_lens: torch.Tensor = None
-    ) -> None:
+    ) -> list[str]:
         if self.asr is None:
             self.reset()
 
@@ -70,20 +70,23 @@ class ASRBLEU:
                 batch_size=pred_audio.shape[0],
                 verbose=False,
             )
-
+        asr_hyps_texts = []
         for ref, asr_hyp in zip(refs, asr_hyps):
             asr_hyp = asr_hyp.text
-            self._refs[name].append([self.normalizer(ref)])
+            self._refs[name].append(self.normalizer(ref))
             self._hyps[name].append(self.normalizer(asr_hyp))
             if self.verbose:
                 asrb = sacrebleu.sentence_bleu(asr_hyp, [ref]).score
                 logging.info(f"[REF]\t{ref}\n[ASR]\t{asr_hyp} [{asrb:.2f}]")
+            asr_hyps_texts.append(asr_hyp)
+
+        return asr_hyps_texts
 
     def compute(self) -> dict[str, torch.Tensor]:
         """Computes the final score and deallocates ASR and partial results."""
         corpus_metric = {}
         for name in self._refs.keys():
-            metric = torch.tensor(sacrebleu.corpus_bleu(self._hyps[name], self._refs[name]).score)
+            metric = torch.tensor(sacrebleu.corpus_bleu(self._hyps[name], [self._refs[name]]).score)
             corpus_metric[f"asr_bleu_{name}"] = metric
         corpus_metric["asr_bleu"] = torch.stack(list(corpus_metric.values())).mean()
         self._refs.clear()
