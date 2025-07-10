@@ -59,6 +59,48 @@ from nemo.core.neural_types import AudioSignal, LabelsType, LengthsType, NeuralT
 from nemo.utils import logging
 
 
+def delay_eos(tokens, eos_token_id, pad_token_id, shift=10):
+    """
+    Delays each EOS token by `shift` steps forward. Replaces original EOS with PAD.
+    Skips move if it would go out of bounds or overwrite another EOS/PAD.
+    Safe for GPU execution.
+    """
+    B, T = tokens.shape
+    tokens = tokens.clone()
+    device = tokens.device
+
+    # Find all EOS positions
+    eos_mask = tokens == eos_token_id
+    if not eos_mask.any():
+        return tokens
+
+    # Flattened indices of EOS tokens
+    eos_indices = eos_mask.nonzero(as_tuple=False)  # [N, 2]
+    b_idx = eos_indices[:, 0]  # [N]
+    eos_pos = eos_indices[:, 1]  # [N]
+    new_pos = eos_pos + shift  # [N]
+
+    # Filter: new position must be in bounds and not overwrite EOS or PAD
+    valid = (new_pos < T)
+    if valid.any():
+        b_idx = b_idx[valid]
+        old_pos = eos_pos[valid]
+        new_pos = new_pos[valid]
+
+        # Now, check overwrite safety in new positions
+        target_vals = tokens[b_idx, new_pos]
+        safe = (target_vals != eos_token_id)
+
+        if safe.any():
+            b_idx = b_idx[safe]
+            old_pos = old_pos[safe]
+            new_pos = new_pos[safe]
+            # Move EOS token: clear original, set new
+            tokens[b_idx, old_pos] = pad_token_id
+            tokens[b_idx, new_pos] = eos_token_id
+    return tokens
+
+
 def generate_multiturn_speaking_mask(input_ids: torch.Tensor, bos_token_id: int = 0, eos_token_id: int = 1):
     """
     Efficient, batched speaking mask generator that marks 1 between <bos> and <eos> pairs.
@@ -399,6 +441,14 @@ class DuplexS2SSpeechDecoderModel(LightningModule, HFHubMixin):
         if self.cfg.get("pretrained_eou_from_s2s", None):
             self.init_eou_from_another_s2s_checkpoint(self.cfg.pretrained_eou_from_s2s)
 
+        self.embed_audio_tokens = torch.nn.ModuleList(
+            [
+                torch.nn.Embedding(self.speech_vocab_size, self.embed_tokens.embedding_dim)
+                for _ in range(self._num_codebooks)
+            ]
+        )
+        self.audio_head = torch.nn.Linear(self.llm.config.hidden_size, self.speech_vocab_size * self._num_codebooks)
+
         # cached for quicker audio decoding
         self.register_buffer(
             "_control_codes",
@@ -579,16 +629,20 @@ class DuplexS2SSpeechDecoderModel(LightningModule, HFHubMixin):
                 # if EOU is zero, allows text channel only to assume, zero, eou or bos
                 target_text_tokens[:, -1] = torch.where(should_pad, self.text_pad_id, target_text_tokens[:, -1])
         else:
-            # drop text bos/eos
-            if self.cfg.get("drop_text_bos_prob", None) and random.random() < self.cfg.drop_text_bos_prob:
-                target_text_tokens = torch.where(
-                    target_text_tokens == self.text_bos_id, self.text_pad_id, target_text_tokens
-                )
+            # Drop BOS tokens with per-token probability (augmentation)
+            drop_bos_prob = getattr(self.cfg, "drop_text_bos_prob", 0.0)
+            if drop_bos_prob > 0.0:
+                bos_mask = (target_text_tokens == self.text_bos_id)
+                # Generate random mask only for BOS positions
+                drop_bos_mask = torch.rand_like(target_text_tokens, dtype=torch.float) < drop_bos_prob
+                target_text_tokens = torch.where(bos_mask & drop_bos_mask, self.text_pad_id, target_text_tokens)
 
-            if self.cfg.get("drop_text_eos_prob", None) and random.random() < self.cfg.drop_text_eos_prob:
-                target_text_tokens = torch.where(
-                    target_text_tokens == self.text_eos_id, self.text_pad_id, target_text_tokens
-                )
+            # Drop EOS tokens with per-token probability (augmentation)
+            drop_eos_prob = getattr(self.cfg, "drop_text_eos_prob", 0.0)
+            if drop_eos_prob > 0.0:
+                eos_mask = (target_text_tokens == self.text_eos_id)
+                drop_eos_mask = torch.rand_like(target_text_tokens, dtype=torch.float) < drop_eos_prob
+                target_text_tokens = torch.where(eos_mask & drop_eos_mask, self.text_pad_id, target_text_tokens)
 
         audio_logits, _ = self.speech_generation(
             out['last_hidden_state'].transpose(0, 1),
@@ -870,6 +924,9 @@ class DuplexS2SSpeechDecoderModel(LightningModule, HFHubMixin):
             )
             target_tokens = torch.cat([target_tokens[:, self.advance_text_channel_by :], pad], dim=-1)
             # make sure that eos/bos is in the place (it can cut tokens from the first advance_text_channel_by tokens and this will breaks everything)
+
+        if self.cfg.get("delay_text_eos_by", None):
+            target_tokens = delay_eos(target_tokens, self.text_eos_id, self.text_pad_id, shift=self.cfg.delay_text_eos_by)
 
         input_ids = torch.cat([target_codes, target_tokens[..., None]], dim=-1)
         if self._use_tp:
@@ -1592,9 +1649,7 @@ class DuplexS2SSpeechDecoderModel(LightningModule, HFHubMixin):
                     user_audio_sr=self.source_sample_rate,
                     eou_pred=(
                         results["gen_eou"]
-                        if self.cfg.get("use_eou_decoder", None)
-                        or self.cfg.get("llm_predict_eou", None)
-                        or self.cfg.get("inference_use_external_eou_predictor", None)
+                        if "gen_eou" in results
                         else None
                     ),
                     fps=self.source_fps,
@@ -1916,7 +1971,7 @@ class DuplexS2SSpeechDecoderModel(LightningModule, HFHubMixin):
         if (
             self.cfg.get("use_eou_decoder", None)
             or self.cfg.get("llm_predict_eou", None)
-            or self.cfg.get("inference_use_external_eou_predictor", None)
+            or self.cfg.get("inference_use_external_eou_predictor", None) or self.cfg.get("inference_eou_from_bos_eos", None)
         ):
             ans["gen_eou"] = gen_eou
 
@@ -2008,7 +2063,7 @@ class DuplexS2SSpeechDecoderModel(LightningModule, HFHubMixin):
 
                 parallelize_module(transformer_block, tp_mesh, plan)
 
-            for m in (self.lm_head):
+            for m in (self.lm_head, self.audio_head):
                 parallelize_module(
                     m,
                     tp_mesh,
