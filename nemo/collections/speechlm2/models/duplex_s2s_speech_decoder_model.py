@@ -630,6 +630,9 @@ class DuplexS2SSpeechDecoderModel(LightningModule, HFHubMixin):
                 should_pad = (eou == 0).squeeze(-1) & not_special
                 # if EOU is zero, allows text channel only to assume, zero, eou or bos
                 target_text_tokens[:, -1] = torch.where(should_pad, self.text_pad_id, target_text_tokens[:, -1])
+
+            if self.cfg.get('convert_pad_to_extra_id_on_speech_decoder', None):
+                target_text_tokens[target_text_tokens == self.text_pad_id] = self.tokenizer.tokenizer._tokenizer.token_to_id("<|endoftext|>") # <|endoftext|> token id
         else:
             # Drop BOS tokens with per-token probability (augmentation)
             drop_bos_prob = getattr(self.cfg, "drop_text_bos_prob", 0.0)
