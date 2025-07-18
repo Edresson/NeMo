@@ -9,7 +9,8 @@ from transformers.models.mimi.modeling_mimi import MimiEncoder, MimiTransformerM
 from nemo.core.classes.module import NeuralModule
 from nemo.collections.tts.parts.utils.helpers import get_mask_from_lengths
 
-
+from nemo.collections.common.parts.utils import ClampActivation
+from nemo.collections.tts.modules.audio_codec_modules import CodecActivation, CausalConv1dNorm
 
 
 
@@ -68,6 +69,26 @@ class ConvNeXtBlock(nn.Module):
         x = residual + x
         return x
 
+class TemporalSmoothingHead(nn.Module):
+    def __init__(self, in_channels=882, kernel_size=5, out_kernel_size=3, pad_mode="zeros", output_activation="clamp", activation="half_snake"):
+        super().__init__()
+        
+        self.pre_conv = CausalConv1dNorm(in_channels=in_channels, out_channels=in_channels, kernel_size=kernel_size, pad_mode=pad_mode)
+        self.pre_activation = CodecActivation(activation, channels=in_channels)
+        self.post_conv = CausalConv1dNorm(in_channels=in_channels, out_channels=in_channels, kernel_size=out_kernel_size, pad_mode=pad_mode)
+        if output_activation == "tanh":
+            self.out_activation = nn.Tanh()
+        elif output_activation == "clamp":
+            self.out_activation = ClampActivation()
+
+    def forward(self, x, x_len):
+        out = x.transpose(1, 2)
+        out = self.pre_conv(inputs=out, input_len=x_len)
+        out = self.pre_activation(out)
+        # [B, 1, T_audio]
+        out = self.post_conv(inputs=out, input_len=x_len)
+        out = self.out_activation(out)
+        return out.transpose(1, 2)
 
 from contextlib import contextmanager
 @contextmanager
@@ -170,6 +191,7 @@ class ReshapeTransformerDecoder(NeuralModule):
         attn_implementation: str = "eager",
         use_conv_pos: bool = False,
         num_pos_conv_blocks: int = 1,
+        use_temporal_smoth_head: bool = False,
     ):
         super().__init__()
 
@@ -177,6 +199,7 @@ class ReshapeTransformerDecoder(NeuralModule):
         self.audio_proj_size = audio_proj_size
         self.is_causal = is_causal
         self.use_conv_pos = use_conv_pos
+        self.use_temporal_smoth_head = use_temporal_smoth_head
 
         self.config = MimiConfig()
         self.config._attn_implementation = attn_implementation
@@ -205,6 +228,8 @@ class ReshapeTransformerDecoder(NeuralModule):
             ]
         )
 
+        if self.use_temporal_smoth_head:
+            self.temporal_smoth_head = TemporalSmoothingHead(d_model)
 
     def forward(self, inputs, input_len):
         if self.is_causal:
@@ -222,6 +247,9 @@ class ReshapeTransformerDecoder(NeuralModule):
             for conv_block in self.conv_pos:
                 out = conv_block(out)
             out = out.transpose(1, 2)
+
+        if self.use_temporal_smoth_head:
+            out = self.temporal_smoth_head(out, input_len)
 
         out = self.out_projection(out)
         audio = self.out_projection_no_bias(out)

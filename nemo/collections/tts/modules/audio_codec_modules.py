@@ -877,6 +877,7 @@ class ResidualCouplingBlock(NeuralModule):
                 x = flow(x, x_mask, g=g, reverse=reverse)
             return x
 
+
     def forward_kld(self, x, x_len, g=None):
         """Estimates forward KL divergence, see [arXiv 1912.02762](https://arxiv.org/abs/1912.02762)
 

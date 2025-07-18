@@ -106,6 +106,7 @@ class AudioCodecModel(ModelPT):
         self.grad_clip_value = cfg.get("grad_clip_value", 0.0)
 
         # Discriminator updates
+        self.disc_update_start_step = cfg.get("disc_update_start_step", 0)
         self.disc_updates_per_period = cfg.get("disc_updates_per_period", 1)
         self.disc_update_period = cfg.get("disc_update_period", 1)
         if self.disc_updates_per_period > self.disc_update_period:
@@ -664,7 +665,7 @@ class AudioCodecModel(ModelPT):
             "lr": optim_gen.param_groups[0]['lr'],
         }
 
-        if self.should_update_disc(batch_idx):
+        if self.should_update_disc(batch_idx) and self.global_step > self.disc_update_start_step:
             # Train discriminator
             disc_scores_real, disc_scores_gen, _, _ = self.discriminator(
                 audio_real=audio, audio_gen=audio_gen.detach()
