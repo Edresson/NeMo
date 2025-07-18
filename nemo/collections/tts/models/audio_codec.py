@@ -666,6 +666,7 @@ class AudioCodecModel(ModelPT):
         }
 
         if self.should_update_disc(batch_idx) and self.global_step > self.disc_update_start_step:
+            print("hereeee")
             # Train discriminator
             disc_scores_real, disc_scores_gen, _, _ = self.discriminator(
                 audio_real=audio, audio_gen=audio_gen.detach()
