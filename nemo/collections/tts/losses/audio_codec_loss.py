@@ -113,6 +113,50 @@ class TimeDomainLoss(Loss):
         return loss
 
 
+class PowerLawWaveformLoss(Loss):
+    """
+    Computes power-law compressed L1 loss between real and generated waveforms.
+    Applies non-linear compression to emphasize quiet components of the waveform.
+    """
+    def __init__(self, p: float = 0.3, eps: float = 1e-7):
+        """
+        Args:
+            p (float): Power-law exponent (0 < p < 1). Values closer to 0 emphasize quiet regions more.
+            eps (float): Small constant to avoid numerical issues.
+        """
+        super(PowerLawWaveformLoss, self).__init__()
+        self.p = p
+        self.eps = eps
+
+    @property
+    def input_types(self):
+        return {
+            "audio_real": NeuralType(('B', 'T'), AudioSignal()),
+            "audio_gen": NeuralType(('B', 'T'), AudioSignal()),
+            "audio_len": NeuralType(tuple('B'), LengthsType()),
+        }
+
+    @property
+    def output_types(self):
+        return {
+            "loss": NeuralType(elements_type=LossType()),
+        }
+
+    @typecheck()
+    def forward(self, audio_real, audio_gen, audio_len):
+        # [B, T] -> [B, 1, T] for consistency
+        audio_real = rearrange(audio_real, "B T -> B 1 T")
+        audio_gen = rearrange(audio_gen, "B T -> B 1 T")
+
+        # Apply power-law compression
+        real_p = torch.sign(audio_real) * (torch.abs(audio_real) + self.eps) ** self.p
+        gen_p = torch.sign(audio_gen) * (torch.abs(audio_gen) + self.eps) ** self.p
+
+        # Compute L1 loss
+        loss = torch.mean(torch.abs(real_p - gen_p))
+        return loss
+
+
 class MultiResolutionMelLoss(Loss):
     """
     Multi-resolution log mel spectrogram loss.

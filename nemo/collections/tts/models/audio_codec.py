@@ -34,6 +34,7 @@ from nemo.collections.tts.losses.audio_codec_loss import (
     TimeDomainLoss,
     AudioTokenLoss,
     MaskedMSELoss,
+    PowerLawWaveformLoss,
 )
 from nemo.collections.tts.modules.common import GaussianDropout
 from nemo.collections.tts.data.vocoder_dataset import create_vocoder_dataset
@@ -207,8 +208,10 @@ class AudioCodecModel(ModelPT):
         # Time domain loss setup
         self.time_domain_loss_scale = cfg.get("time_domain_loss_scale", 1.0)
         self.si_sdr_loss_scale = cfg.get("si_sdr_loss_scale", 0.0)
+        self.power_law_wav_loss_scale = cfg.get("power_law_wav_loss_scale", 0.0)
         self.time_domain_loss_fn = TimeDomainLoss()
         self.si_sdr_loss_fn = SISDRLoss()
+        self.power_law_wav_loss_fn = PowerLawWaveformLoss()
 
         # Discriminator loss setup
         self.gen_loss_scale = cfg.get("gen_loss_scale", 1.0)
@@ -704,10 +707,16 @@ class AudioCodecModel(ModelPT):
             metrics["g_loss_time_domain"] = loss_time_domain
             generator_losses.append(self.time_domain_loss_scale * loss_time_domain)
 
+        if self.power_law_wav_loss_scale:
+            loss_power_law_wav = self.power_law_wav_loss_fn(audio_real=audio, audio_gen=audio_gen, audio_len=audio_len)
+            metrics["g_loss_power_law_wav"] = loss_power_law_wav
+            generator_losses.append(self.power_law_wav_loss_scale * loss_power_law_wav)
+
         if self.si_sdr_loss_scale:
             loss_si_sdr = self.si_sdr_loss_fn(audio_real=audio, audio_gen=audio_gen, audio_len=audio_len)
             metrics["g_loss_si_sdr"] = loss_si_sdr
             generator_losses.append(self.si_sdr_loss_scale * loss_si_sdr)
+        
 
         _, disc_scores_gen, fmaps_real, fmaps_gen = self.discriminator(audio_real=audio, audio_gen=audio_gen)
 
