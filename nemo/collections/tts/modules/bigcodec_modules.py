@@ -43,9 +43,12 @@ class SpecDiscriminator(nn.Module):
                  max_downsample_channels=512,
                  downsample_scales=(2, 2, 2),
                  use_weight_norm=True,
+                 spec_scale_pow=0.0,
                  ):
         super().__init__()
         self.use_weight_norm = use_weight_norm
+        self.spec_scale_pow = spec_scale_pow
+
         if stft_params is None:
             stft_params = {
                 'fft_sizes': [1024, 2048, 512],
@@ -82,6 +85,10 @@ class SpecDiscriminator(nn.Module):
             spec_real = stft(audio_real.squeeze(1), self.stft_params['fft_sizes'][i], self.stft_params['hop_sizes'][i],
                         self.stft_params['win_lengths'][i],
                         window=getattr(torch, self.stft_params['window'])(self.stft_params['win_lengths'][i])).transpose(1, 2).unsqueeze(1) # [B, 1, F, T]
+
+            if self.spec_scale_pow != 0.0:
+                spec_real = spec_real * torch.pow(spec_real.abs()+1e-6, self.spec_scale_pow)
+
             fmap_real = disc(spec_real)
             score_real = rearrange(fmap_real[-1], "B 1 T C -> B C T")
             scores_real.append(score_real)
