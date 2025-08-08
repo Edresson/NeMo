@@ -227,12 +227,21 @@ class AudioCodecModel(ModelPT):
         else:
             raise ValueError(f'Unknown feature loss type {feature_loss_type}.')
 
+        self.mmd_loss_start_epoch = cfg.get("mmd_loss_start_epoch", 0)
+
         if "mmd_loss" in cfg:
             self.mmd_loss_fn = instantiate(cfg.mmd_loss)
             self.mmd_loss_scale = cfg.get("mmd_loss_scale", 1.0)
         else:
             self.mmd_loss_fn = None
             self.mmd_loss_scale = None
+            
+        if "mmd_time_loss" in cfg:
+            self.mmd_time_loss_fn = instantiate(cfg.mmd_time_loss)
+            self.mmd_time_loss_scale = cfg.get("mmd_time_loss_scale", 1.0)
+        else:
+            self.mmd_time_loss_fn = None
+            self.mmd_time_loss_scale = None
 
         # Codebook loss setup
         if self.vector_quantizer:
@@ -735,9 +744,17 @@ class AudioCodecModel(ModelPT):
             generator_losses.append(self.commit_loss_scale * commit_loss)
 
         if self.mmd_loss_scale:
-            loss_mmd = self.mmd_loss_fn(codes=codes)
+            loss_mmd = self.mmd_loss_fn(inputs=codes)
             metrics["g_loss_mmd"] = loss_mmd
-            generator_losses.append(self.mmd_loss_scale * loss_mmd)
+
+            if self.current_epoch >= self.mmd_loss_start_epoch:
+                generator_losses.append(self.mmd_loss_scale * loss_mmd)
+
+        if self.mmd_time_loss_scale:
+            loss_mmd_time = self.mmd_time_loss_fn(inputs=codes)
+            metrics["g_loss_mmd_time"] = loss_mmd_time
+            if self.current_epoch >= self.mmd_loss_start_epoch:
+                generator_losses.append(self.mmd_time_loss_scale * loss_mmd_time)
 
         if distil_loss:
             metrics["g_loss_distil"] = distil_loss * self.distil_loss_scale
