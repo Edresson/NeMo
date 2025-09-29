@@ -818,7 +818,16 @@ class DuplexS2SExternalSpeechDecoderModel(LightningModule, HFHubMixin):
         input_embeds *= self.cfg.get("duplex_user_channel_weight", 1.0)
 
         # This cache is for self.llm
-        cache = DynamicCache()
+        if 'Nemotron' in self.cfg.pretrained_llm:
+            # For Nemotron, due to cache issues, we disable cache and use full history mode
+            cache = None
+            s2t_use_cache = False
+            logging.info("Using no-cache mode for Nemotron (full history each step)")
+        else:
+            # Standard cache for other models
+            cache = DynamicCache()
+            s2t_use_cache = True
+
         gen_text = torch.empty(B, T, device=self.device, dtype=torch.long)
 
         # First step, use speech_delay token
@@ -861,10 +870,16 @@ class DuplexS2SExternalSpeechDecoderModel(LightningModule, HFHubMixin):
             last_emb = self.embed_tokens(gen_text[:, t - 1])
             input_embeds[:, t] += last_emb
 
-            ans = self(
-                input_embeds[:, t : t + 1],
-                cache=ans["cache"]
-            )
+            if s2t_use_cache:
+                ans = self(
+                    input_embeds[:, t : t + 1],
+                    cache=ans["cache"]
+                )
+            else:
+                ans = self(
+                    input_embeds[:, :t + 1],
+                )
+
             gen_text[:, t] = ans["text_logits"][:, -1].argmax(dim=-1)
             
             # do inference on external TTS model
