@@ -805,7 +805,7 @@ class DuplexEARTTS(LightningModule, HFHubMixin):
             self.tokenizer.bos_token = '<|im_start|>'
             self.tokenizer.eos_token = '<|im_end|>'
 
-        elif 'Nemotron' in self.cfg.pretrained_llm:
+        elif 'Nemotron' in self.cfg.pretrained_lm_name:
             # ====== NEMOTRON-SPECIFIC HANDLING ======
             self.tokenizer.bos_token = '<s>'
             self.tokenizer.eos_token = '</s>'
