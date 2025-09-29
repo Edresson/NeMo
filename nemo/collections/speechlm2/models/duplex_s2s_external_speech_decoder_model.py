@@ -214,7 +214,14 @@ class DuplexS2SExternalSpeechDecoderModel(LightningModule, HFHubMixin):
         # However, for S2S we need to access the activations before LM head directly
         # to feed them to the audio codec head.
         self.tokenizer = AutoTokenizer(self.cfg.pretrained_llm, use_fast=True)
-        if 'Qwen2.5' in self.cfg.pretrained_llm:
+
+        if 'Nemotron' in self.cfg.pretrained_llm:
+            # ====== NEMOTRON-SPECIFIC HANDLING ======
+            self.tokenizer.bos_token = '<s>'
+            self.tokenizer.eos_token = '</s>'
+            self.tokenizer.pad_token = '<SPECIAL_12>'
+
+        elif 'Qwen2.5' in self.cfg.pretrained_llm:
             # For Qwen, '<|im_start|>' is a common choice for a BOS token.
             # You can check your tokenizer's vocabulary for the best candidate.
             logging.warning("Tokenizer does not have a `bos_token`. Setting it to '<|im_start|>'.")
@@ -224,12 +231,16 @@ class DuplexS2SExternalSpeechDecoderModel(LightningModule, HFHubMixin):
                 self.tokenizer.pad_token = '<|extra_1|>'
 
         llm = load_pretrained_hf(self.cfg.pretrained_llm, pretrained_weights=self.cfg.pretrained_weights).train()
-        self.llm = llm.model  # fetch PretrainedBaseModel from model "ForCausalLM"
+
+        self.llm = getattr(llm, self.cfg.get("base_model_name", "model")) # fetch PretrainedBaseModel from model "ForCausalLM"
         self.lm_head = llm.lm_head
+
         # Note: we have to "move out" the token embedding outside of LLM to avoid
         #       messing up FSDP/TP hooks.
-        self.embed_tokens = self.llm.embed_tokens
-        del self.llm.embed_tokens
+        embed_tokens_name = self.cfg.get("embed_tokens_name", "embed_tokens")
+        self.embed_tokens = getattr(self.llm, embed_tokens_name)
+        delattr(self.llm, embed_tokens_name)
+
         maybe_install_lora(self)
 
         # Load the pretrained streaming ASR model and copy its parameters into the audio perception module.

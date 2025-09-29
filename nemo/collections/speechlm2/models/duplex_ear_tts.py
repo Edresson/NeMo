@@ -805,6 +805,11 @@ class DuplexEARTTS(LightningModule, HFHubMixin):
             self.tokenizer.bos_token = '<|im_start|>'
             self.tokenizer.eos_token = '<|im_end|>'
 
+        elif 'Nemotron' in self.cfg.pretrained_llm:
+            # ====== NEMOTRON-SPECIFIC HANDLING ======
+            self.tokenizer.bos_token = '<s>'
+            self.tokenizer.eos_token = '</s>'
+            self.tokenizer.pad_token = '<SPECIAL_12>'
 
         # cached for quicker audio decoding
         self.register_buffer(
@@ -1410,9 +1415,9 @@ class DuplexEARTTS(LightningModule, HFHubMixin):
         """Get default generation config for EAR-TTS."""
         return {
             "num_iter": 8,
-            "guidance_scale": 0.5 if guidance_enabled else None,
-            "top_p_or_k": 0.8,
-            "noise_scale": 0.8,
+            "guidance_scale": self.cfg.get("inference_guidance_scale", 0.5) if guidance_enabled else None,
+            "top_p_or_k": self.cfg.get("inference_top_p_or_k", 0.8),
+            "noise_scale": self.cfg.get("inference_noise_scale", 0.8),
             "eos_threshold": -3.0,
         }
 
@@ -1448,6 +1453,7 @@ class DuplexEARTTS(LightningModule, HFHubMixin):
             speaker_audio=speaker_audio,
             speaker_audio_lens=speaker_audio_lens,
             next_subword_ids=next_subword_ids,
+            guidance_enabled=self.cfg.get("inference_guidance_enabled", True)
         )
         return audio, audio_len, speaker_audio, speaker_audio_lens
 
@@ -1601,18 +1607,20 @@ class DuplexEARTTS(LightningModule, HFHubMixin):
                             batch_size=target_audio.shape[0],
                             verbose=False,
                         )
-                        dataset_batch["target_texts"] = [asr_hyp.text for asr_hyp in target_asr_texts]
+                        metric_text = [asr_hyp.text for asr_hyp in target_asr_texts]
+                    else:
+                        metric_text = dataset_batch["target_texts"]
 
                     asr_hyps = self.asr_bleu.update(
                         name=name,
-                        refs=dataset_batch["target_texts"],
+                        refs=metric_text,
                         pred_audio=metric_audio_pred,
                         pred_audio_lens=metric_audio_pred_lens,
                     )
 
                     self.intelligibility.update(
                         name=name,
-                        refs=dataset_batch["target_texts"],
+                        refs=metric_text,
                         pred_audio=metric_audio_pred,
                         pred_audio_lens=metric_audio_pred_lens,
                         asr_hyps=asr_hyps,
@@ -1633,7 +1641,7 @@ class DuplexEARTTS(LightningModule, HFHubMixin):
                     self.results_logger.update(
                         name=name,
                         refs=dataset_batch["target_texts"],
-                        hyps=dataset_batch["target_texts"],
+                        hyps=metric_text,
                         asr_hyps=asr_hyps,
                         samples_id=dataset_batch['sample_id'],
                         pred_audio=results["audio"],
@@ -1799,28 +1807,6 @@ class DuplexEARTTS(LightningModule, HFHubMixin):
 
         return init_inputs
 
-
-    def init_model_for_ar_inference(
-        self,
-        speaker_audio: torch.Tensor,
-        speaker_audio_lens: torch.Tensor,
-        system_prompt: str = None,
-        user_prompt: str = None,
-        guidance_enabled: bool = True,
-        generation_config: dict = None
-    )-> dict[dict, torch.Tensor]:
-        init_inputs = self.get_init_inputs(speaker_audio, speaker_audio_lens, system_prompt=system_prompt, user_prompt=user_prompt)
-
-        if generation_config is None:
-            generation_config = self._get_generation_config(guidance_enabled)
-
-        init_inputs.update({"use_cache": True, "past_key_values": None, "guidance_enabled": guidance_enabled})
-        # warmup the model and generate the very first audio token
-        outputs = self.tts_model(**init_inputs)
-        code, _, _ = self.tts_model.generate_step(outputs.hidden_states[:, -1:], **generation_config)
-        past_key_values = outputs.past_key_values
-        return init_inputs, code, past_key_values
-
     @torch.no_grad()
     def offline_inference(
         self,
@@ -1859,6 +1845,7 @@ class DuplexEARTTS(LightningModule, HFHubMixin):
 
         if generation_config is None:
             generation_config = self._get_generation_config(guidance_enabled)
+            logging.info(f"Doing inference using the following config: {generation_config} !")
 
         init_inputs.update({"use_cache": True, "past_key_values": None, "guidance_enabled": guidance_enabled})
 
