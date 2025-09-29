@@ -213,7 +213,7 @@ class DuplexS2SExternalSpeechDecoderModel(LightningModule, HFHubMixin):
         # pretrained LM head weights.
         # However, for S2S we need to access the activations before LM head directly
         # to feed them to the audio codec head.
-        self.tokenizer = AutoTokenizer(self.cfg.pretrained_llm, use_fast=True)
+        self.tokenizer = AutoTokenizer(self.cfg.pretrained_llm, use_fast=True, trust_remote_code=True)
 
         if 'Nemotron' in self.cfg.pretrained_llm:
             # ====== NEMOTRON-SPECIFIC HANDLING ======
