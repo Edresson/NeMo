@@ -230,7 +230,7 @@ class DuplexS2SExternalSpeechDecoderModel(LightningModule, HFHubMixin):
             if self.cfg.get("use_extra_id_for_pad", False):
                 self.tokenizer.pad_token = '<|extra_1|>'
 
-        llm = load_pretrained_hf(self.cfg.pretrained_llm, pretrained_weights=self.cfg.pretrained_weights).train()
+        llm = load_pretrained_hf(self.cfg.pretrained_llm, pretrained_weights=self.cfg.pretrained_weights, trust_remote_code=True).train()
 
         self.llm = getattr(llm, self.cfg.get("base_model_name", "model")) # fetch PretrainedBaseModel from model "ForCausalLM"
         self.lm_head = llm.lm_head
