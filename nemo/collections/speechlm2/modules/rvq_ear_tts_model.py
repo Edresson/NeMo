@@ -1391,6 +1391,7 @@ class RVQEARTTSModel(PreTrainedModel):
         subword_ids: Tensor | None,
         subword_mask: Tensor | None,
         uncond_dec_flag: Tensor,
+        asr_speech_tokens_emb: Tensor | None,
     ) -> Tensor:
         """Computes the final conditioning tensor by combining all sources."""
         cond = torch.zeros((1, 1, self.hidden_size), device=uncond_dec_flag.device)
@@ -1405,6 +1406,9 @@ class RVQEARTTSModel(PreTrainedModel):
             # at least one value should be true, otherwise we can completly skip it to avoid errors
             if subword_mask is not None and subword_mask.any():
                 cond = cond + self.embed_subword(subword_ids, subword_mask)
+
+        if asr_speech_tokens_emb is not None:
+            cond = cond + asr_speech_tokens_emb
 
         # Replace with null embedding for unconditional generation
         cond = torch.where(uncond_dec_flag, self.null_emb, cond)
@@ -1584,13 +1588,13 @@ class RVQEARTTSModel(PreTrainedModel):
                 subword_ids = torch.cat([subword_ids] * 2, 0)
                 if subword_mask is not None:
                     subword_mask = torch.cat([subword_mask] * 2, 0)
+            if asr_speech_tokens_emb is not None:
+                asr_speech_tokens_emb = torch.cat([asr_speech_tokens_emb] * 2, 0)
+
             uncond_dec_flag = torch.cat([uncond_dec_flag, torch.ones_like(uncond_dec_flag)], 0)
 
         # Prepare conditioning
-        cond = self._prepare_conditioning(context_hidden_state, subword_ids, subword_mask, uncond_dec_flag)
-
-        if asr_speech_tokens_emb is not None:
-            cond = cond + asr_speech_tokens_emb
+        cond = self._prepare_conditioning(context_hidden_state, subword_ids, subword_mask, uncond_dec_flag, asr_speech_tokens_emb=asr_speech_tokens_emb)
 
         # Main backbone pass
         backbone_outputs = self.backbone(

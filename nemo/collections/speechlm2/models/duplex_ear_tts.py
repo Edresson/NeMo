@@ -1188,13 +1188,12 @@ class DuplexEARTTS(LightningModule, HFHubMixin):
                 desc_mask.unsqueeze(-1),                    # (B, T, 1) for broadcasting
                 torch.full_like(target_asr_speech_tokens, self.asr_speech_tokens_pad_id),  # fill with pad id
                 target_asr_speech_tokens
-            )
-
+            ).squeeze(-1)
             # shift inputs adding pad token
             input_asr_speech_tokens = torch.cat(
                 [
                     torch.full(
-                        [target_asr_speech_tokens.shape[0], 1, target_asr_speech_tokens.shape[-1]],
+                        [target_asr_speech_tokens.shape[0], 1],
                         fill_value=self.asr_speech_tokens_pad_id, # we can use pad here, because the RVQ embedding has a BOS token, so the model can reuse that one
                         device=self.device,
                         dtype=torch.long,
@@ -1203,6 +1202,7 @@ class DuplexEARTTS(LightningModule, HFHubMixin):
                 ],
                 dim=1,
             )
+
             asr_speech_tokens_emb = self.asr_speech_tokens_emb(input_asr_speech_tokens)
         else:
             asr_speech_tokens_emb = None
@@ -1407,9 +1407,8 @@ class DuplexEARTTS(LightningModule, HFHubMixin):
                 reduction="none"
             ) * inputs["audio_mask"]).sum() / inputs["audio_mask"].sum().clamp_min(1) * self.cfg.get("asr_tok_loss_scale", 1.0)
             loss_dict["asr_tok_loss"] = asr_tok_loss
-            print("asr_tok_loss", asr_tok_loss)
             loss += asr_tok_loss
-        
+
         num_frames = inputs["output_lens"].sum()
         B, T = inputs["code"].shape[:2]
         ans = {
@@ -1893,13 +1892,13 @@ class DuplexEARTTS(LightningModule, HFHubMixin):
                 desc_mask.unsqueeze(-1).bool(),                    # (B, T, 1) for broadcasting
                 torch.full_like(target_asr_speech_tokens, self.asr_speech_tokens_pad_id),  # fill with pad id
                 target_asr_speech_tokens
-            )
+            ).squeeze(-1)
 
             # shift inputs adding pad token
             input_asr_speech_tokens = torch.cat(
                 [
                     torch.full(
-                        [target_asr_speech_tokens.shape[0], 1, target_asr_speech_tokens.shape[-1]],
+                        [target_asr_speech_tokens.shape[0], 1],
                         fill_value=self.asr_speech_tokens_pad_id, # we can use pad here, because the RVQ embedding has a BOS token, so the model can reuse that one
                         device=self.device,
                         dtype=torch.long,
@@ -1980,7 +1979,14 @@ class DuplexEARTTS(LightningModule, HFHubMixin):
 
         # get current asr speech token
         if self.cfg.get("use_asr_speech_tokens", False):
-            cur_asr_speech_tokens = self.asr_speech_tokens_head(outputs.hidden_states)
+            if guidance_enabled and self.cfg.get("asr_speech_tokens_use_guidance", True):
+                hidden_states, uncond_hidden_states = outputs.hidden_states.chunk(2, dim=0)
+                logits = self.asr_speech_tokens_head(hidden_states + (generation_config["guidance_scale"] * (hidden_states - uncond_hidden_states)))
+            else:
+                hidden_states, _ = outputs.hidden_states.chunk(2, dim=0)
+                logits = self.asr_speech_tokens_head(hidden_states)
+
+            cur_asr_speech_tokens = logits.argmax(dim=-1)[:, -1].unsqueeze(-1)
 
         # use the text tokens to stop generation
         max_steps = next_subword_ids.size(-1)
@@ -2018,6 +2024,8 @@ class DuplexEARTTS(LightningModule, HFHubMixin):
 
             if self.cfg.get("use_asr_speech_tokens", False):
                 asr_speech_tokens_emb = self.asr_speech_tokens_emb(cur_asr_speech_tokens)
+            else:
+                asr_speech_tokens_emb = None
 
             if self.cfg.tts_config.context_hidden_size is not None:
                 # get context_hidden_state it is always one step behind current_subword_id
@@ -2063,9 +2071,15 @@ class DuplexEARTTS(LightningModule, HFHubMixin):
             # ToDo: check why it is -1
             gen_audio_codes[:, i-1] = code.squeeze(1)
 
-
             if self.cfg.get("use_asr_speech_tokens", False):
-                cur_asr_speech_tokens = self.asr_speech_tokens_head(outputs.hidden_states)
+                if guidance_enabled and self.cfg.get("asr_speech_tokens_use_guidance", True):
+                    hidden_states, uncond_hidden_states = outputs.hidden_states.chunk(2, dim=0)
+                    logits = self.asr_speech_tokens_head(hidden_states + (generation_config["guidance_scale"] * (hidden_states - uncond_hidden_states)))
+                else:
+                    hidden_states, _ = outputs.hidden_states.chunk(2, dim=0)
+                    logits = self.asr_speech_tokens_head(hidden_states)
+
+                cur_asr_speech_tokens = logits.argmax(dim=-1)[:, -1].unsqueeze(-1)
 
             # force silence as next token 
             if self.cfg.get('inference_force_speech_silence_on_eos', None):
