@@ -1491,6 +1491,7 @@ class RVQEARTTSModel(PreTrainedModel):
         generation_config: dict[str, Any] | None = None,
         teacher_forcing_inference: bool = False,
         ignore_eos_flag_stop: bool = False,
+        asr_speech_tokens_emb: Tensor | None = None,
     ) -> RVQEARTTSOutput:
         """
         Performs a forward pass handling training, generation, or single-step inference.
@@ -1588,6 +1589,9 @@ class RVQEARTTSModel(PreTrainedModel):
         # Prepare conditioning
         cond = self._prepare_conditioning(context_hidden_state, subword_ids, subword_mask, uncond_dec_flag)
 
+        if asr_speech_tokens_emb is not None:
+            cond = cond + asr_speech_tokens_emb
+
         # Main backbone pass
         backbone_outputs = self.backbone(
             inputs_embeds=code_embeds + cond,
@@ -1633,6 +1637,7 @@ class RVQEARTTSModel(PreTrainedModel):
                     codes=generated_codes,
                     lm_logits=lm_logits,
                     eos_flag=eos_flag,
+                    hidden_states=hidden_states,
                 )
 
     @torch.no_grad()
