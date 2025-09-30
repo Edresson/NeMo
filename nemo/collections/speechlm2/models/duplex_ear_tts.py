@@ -1405,9 +1405,9 @@ class DuplexEARTTS(LightningModule, HFHubMixin):
                 asr_tok_logits.transpose(1, 2), 
                 inputs["target_asr_speech_tokens"], 
                 reduction="none"
-            ) * inputs["audio_mask"]).sum() / inputs["audio_mask"].sum().clamp_min(1) * self.cfg.get("asr_tok_loss_scale", 1.0)
+            ) * inputs["audio_mask"]).sum() / inputs["audio_mask"].sum().clamp_min(1)
             loss_dict["asr_tok_loss"] = asr_tok_loss
-            loss += asr_tok_loss
+            loss += asr_tok_loss * self.cfg.get("asr_tok_loss_scale", 1.0)
 
         num_frames = inputs["output_lens"].sum()
         B, T = inputs["code"].shape[:2]
