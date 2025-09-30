@@ -36,8 +36,10 @@ def inference(cfg):
     OmegaConf.save(cfg, log_dir / "exp_config.yaml")
 
     with trainer.init_module():
-        model_config = OmegaConf.to_container(cfg, resolve=True)
-        model = DuplexS2SExternalSpeechDecoderModel(model_config)
+        model = DuplexS2SExternalSpeechDecoderModel.from_pretrained(cfg.ckpt_path)
+
+    # set validation output path
+    model.validation_save_path = os.path.join(cfg.exp_manager.explicit_log_dir, "validation_logs")
 
     dataset = DuplexS2SDataset(
         tokenizer=model.tokenizer,
@@ -48,11 +50,6 @@ def inference(cfg):
         output_roles=cfg.data.output_roles
     )
     datamodule = DataModule(cfg.data, tokenizer=model.tokenizer, dataset=dataset)
-    # export file to huggingface
-    hf_export_dir = model_config.get("hf_export_dir", None)
-    if hf_export_dir:
-        model.save_pretrained(hf_export_dir, config=model_config)
-        print("Hugging face compatible checkpoint saved at:", hf_export_dir)
 
     trainer.validate(model, datamodule)
 

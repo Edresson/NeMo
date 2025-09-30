@@ -191,7 +191,7 @@ class DuplexS2SExternalSpeechDecoderModel(LightningModule, HFHubMixin):
         self.save_hyperparameters()
         # convert dict to config
         cfg = DictConfig(cfg)
-
+        self.full_cfg = cfg
         self.cfg = cfg.model
         self.target_sample_rate = cfg.data.target_sample_rate
         self.source_sample_rate = cfg.data.source_sample_rate
@@ -1068,8 +1068,8 @@ class DuplexS2SExternalSpeechDecoderModel(LightningModule, HFHubMixin):
 
     def load_state_dict(self, state_dict, strict: bool = True):
         try:
-            super().load_state_dict(state_dict, strict=strict)
+            return super().load_state_dict(state_dict, strict=strict)
         except RuntimeError as e:
             logging.info(f"Error loading model state_dict !! Retrying with partial initialization!")
             model_dict = set_model_dict_for_partial_init(state_dict, self.state_dict())
-            super().load_state_dict(model_dict, strict=False)
+            return super().load_state_dict(model_dict, strict=False)
