@@ -51,6 +51,7 @@ def train(cfg):
         add_audio_prompt_after_description=cfg.data.add_audio_prompt_after_description,
         audio_prompt_duration=cfg.data.audio_prompt_duration,
         num_delay_speech_tokens=cfg.model.get("num_delay_speech_tokens", 0),
+        normalize_text=cfg.data.get("normalize_text", False),
     )
     datamodule = DataModule(cfg.data, tokenizer=model.tokenizer, dataset=dataset)
 

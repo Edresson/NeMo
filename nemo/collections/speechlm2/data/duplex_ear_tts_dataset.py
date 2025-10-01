@@ -168,6 +168,7 @@ class DuplexEARTTSDataset(torch.utils.data.Dataset):
         add_audio_prompt_after_description: bool = False,
         audio_prompt_duration: float = 3.0,
         num_delay_speech_tokens: int = 0,
+        normalize_text: bool = False,
     ):
         self.tokenizer = tokenizer
         self.frame_length = frame_length
@@ -178,6 +179,7 @@ class DuplexEARTTSDataset(torch.utils.data.Dataset):
         self.add_description = add_description
         self.p_drop_description = p_drop_description
         self.add_text_bos_and_eos_in_each_turn = add_text_bos_and_eos_in_each_turn
+        self.normalize_text = normalize_text
         self.add_audio_prompt_after_description = add_audio_prompt_after_description
         self.audio_prompt_duration = audio_prompt_duration
         self.num_delay_speech_tokens = num_delay_speech_tokens
@@ -240,10 +242,10 @@ class DuplexEARTTSDataset(torch.utils.data.Dataset):
             cuts.resample(self.target_sample_rate), recording_field="target_audio"
         )
         input_text_tokens, target_token_lens = collate_token_channel(
-            cuts, self.tokenizer, self.frame_length, roles=self.output_roles, add_text_bos_and_eos_in_each_turn=self.add_text_bos_and_eos_in_each_turn,
+            cuts, self.tokenizer, self.frame_length, roles=self.output_roles, add_text_bos_and_eos_in_each_turn=self.add_text_bos_and_eos_in_each_turn, normalize_text=self.normalize_text,
         )
         source_tokens, source_token_lens = collate_token_channel(
-            cuts, self.tokenizer, self.frame_length, roles=self.input_roles, add_text_bos_and_eos_in_each_turn=self.add_text_bos_and_eos_in_each_turn,
+            cuts, self.tokenizer, self.frame_length, roles=self.input_roles, add_text_bos_and_eos_in_each_turn=self.add_text_bos_and_eos_in_each_turn, normalize_text=self.normalize_text,
         )
 
         # if context audio is available use it, otherwise use a random turn
@@ -469,15 +471,28 @@ def collate_token_channel(
     frame_length: Seconds,
     roles: set[str],
     add_text_bos_and_eos_in_each_turn: bool = True,
+    normalize_text: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     pad_id = get_pad_id(tokenizer)
     tokens = [
-        build_token_channel(c, tokenizer=tokenizer, frame_length=frame_length, roles=roles, pad_id=pad_id, add_text_bos_and_eos_in_each_turn=add_text_bos_and_eos_in_each_turn)
+        build_token_channel(c, tokenizer=tokenizer, frame_length=frame_length, roles=roles, pad_id=pad_id, add_text_bos_and_eos_in_each_turn=add_text_bos_and_eos_in_each_turn, normalize_text=normalize_text)
         for c in cuts
     ]
     token_lens = torch.tensor([len(tt) for tt in tokens])
     tokens = collate_vectors(tokens, padding_value=pad_id)
     return tokens, token_lens
+
+def normalize_text_fn(text: str) -> str:
+    # Convert to lowercase
+    text = text.lower()
+    text = re.sub(r'[\[\]\{\}\(\)\*\#]', '', text)
+    # Collapse multiple spaces/newlines/tabs into a single space
+    text = re.sub(r'\s+', ' ', text)
+    # Remove any leading/trailing spaces first
+    text = text.strip()
+    # Add exactly one space at the beginning
+    text = ' ' + text
+    return text
 
 
 def build_token_channel(
@@ -487,6 +502,7 @@ def build_token_channel(
     roles: set[str],
     pad_id: int = -1,
     add_text_bos_and_eos_in_each_turn: bool = True,
+    normalize_text: bool = False,
 ) -> torch.Tensor:
     diagnostic = f"Extra info: {cut.id=}"
     if getattr(cut, "shard_origin", None) is not None:
@@ -496,10 +512,14 @@ def build_token_channel(
     tokens = torch.ones(total, dtype=torch.long) * pad_id
     for supervision in cut.supervisions:
         if supervision.speaker in roles:
+            text = supervision.text
+            if normalize_text:
+                text = normalize_text_fn(text)
+
             if add_text_bos_and_eos_in_each_turn:
-                text_ids = torch.as_tensor([tokenizer.bos] + tokenizer.text_to_ids(supervision.text))
+                text_ids = torch.as_tensor([tokenizer.bos] + tokenizer.text_to_ids(text))
             else:
-                text_ids = torch.as_tensor(tokenizer.text_to_ids(supervision.text))
+                text_ids = torch.as_tensor(tokenizer.text_to_ids(text))
 
             # Determine the frame offset for the start of the supervision to insert the text tokens.
             pos = compute_num_frames(supervision.start, frame_length, cut.sampling_rate)

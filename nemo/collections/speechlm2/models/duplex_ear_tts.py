@@ -76,6 +76,7 @@ from types import SimpleNamespace
 
 from nemo.collections.speechlm2.modules.rvq_ear_tts_model import RVQEARTTSModel, RVQEARTTSConfig, build_vocabs, SubwordFlagEmbedding
 from nemo.collections.speechlm2.modules.rvq_ear_tts_vae import RVQVAEModel
+from nemo.collections.speechlm2.data.duplex_ear_tts_dataset import normalize_text_fn
 
 def generate_multiturn_speaking_mask(input_ids: torch.Tensor, bos_token_id: int = 0, eos_token_id: int = 1):
     """
@@ -780,6 +781,7 @@ class DuplexEARTTS(LightningModule, HFHubMixin):
         self.cfg = cfg.model
         self.target_sample_rate = cfg.data.target_sample_rate
         self.source_sample_rate = cfg.data.source_sample_rate
+        self.normalize_text = cfg.data.get("normalize_text", False)
 
         self.validation_save_path = os.path.join(cfg.exp_manager.explicit_log_dir, "validation_logs")
 
@@ -1501,7 +1503,7 @@ class DuplexEARTTS(LightningModule, HFHubMixin):
             "eos_threshold": -3.0,
         }
 
-    def offline_inference_with_custom_sentences(self, test_sentences: torch.Tensor, inference_speaker_reference: torch.Tensor, speech_text_ratio: float = 2.5):
+    def offline_inference_with_custom_sentences(self, test_sentences: torch.Tensor, inference_speaker_reference: torch.Tensor, speech_text_ratio: float = 3.5):
         B = len(test_sentences)
         # load and get speaker reference
         speaker_audio, sr = torchaudio.load(inference_speaker_reference)
@@ -1511,10 +1513,16 @@ class DuplexEARTTS(LightningModule, HFHubMixin):
         speaker_audio_lens = torch.tensor([speaker_audio.size(1)], device=self.device).long().repeat(B)
 
         # Tokenize sentences
-        tokenized = [
-            torch.as_tensor([self.tokenizer.bos] + self.tokenizer.text_to_ids(text), dtype=torch.long, device=self.device)
-            for text in test_sentences
-        ]
+        if self.normalize_text:
+            tokenized = [
+                torch.as_tensor([self.tokenizer.bos] + self.tokenizer.text_to_ids(normalize_text_fn(text)), dtype=torch.long, device=self.device)
+                for text in test_sentences
+            ]
+        else:
+            tokenized = [
+                torch.as_tensor([self.tokenizer.bos] + self.tokenizer.text_to_ids(text), dtype=torch.long, device=self.device)
+                for text in test_sentences
+            ]
 
         # Get max length and target length
         max_len = max(len(t) for t in tokenized)
