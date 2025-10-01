@@ -1204,8 +1204,18 @@ class DuplexEARTTS(LightningModule, HFHubMixin):
                 ],
                 dim=1,
             )
-
             asr_speech_tokens_emb = self.asr_speech_tokens_emb(input_asr_speech_tokens)
+
+            if self.cfg.get("predict_first_asr_speech_tokens"):
+                delay = self.cfg.get("semantic_to_acoustic_delay", 2)
+                padded_codes = torch.full(
+                    (target_codes_aligned.size(0), delay, target_codes_aligned.size(-1)),
+                    self.speech_pad_id,
+                    dtype=target_codes_aligned.dtype,
+                    device=target_codes_aligned.device
+                )
+                # Prepend pad tokens and remove the last `delay` tokens to keep the same length
+                target_codes_aligned = torch.cat([padded_codes, target_codes_aligned[:, :-delay]], dim=1)
         else:
             asr_speech_tokens_emb = None
             target_asr_speech_tokens = None
@@ -1916,6 +1926,17 @@ class DuplexEARTTS(LightningModule, HFHubMixin):
                 dim=1,
             )
             asr_speech_tokens_emb = self.asr_speech_tokens_emb(input_asr_speech_tokens)
+            
+            if self.cfg.get("predict_first_asr_speech_tokens"):
+                delay = self.cfg.get("semantic_to_acoustic_delay", 2)
+                padded_codes = torch.full(
+                    (code.size(0), delay, code.size(-1)),
+                    self.speech_pad_id,
+                    dtype=code.dtype,
+                    device=code.device
+                )
+                # Prepend pad tokens and remove the last `delay` tokens to keep the same length
+                code = torch.cat([padded_codes, code[:, :-delay]], dim=1)
         else:
             asr_speech_tokens_emb = None
 
