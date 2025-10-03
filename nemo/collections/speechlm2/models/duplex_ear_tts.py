@@ -1382,6 +1382,11 @@ class DuplexEARTTS(LightningModule, HFHubMixin):
                 inputs["subword_mask"] = torch.full_like(inputs["subword_mask"], 0.0)
                 drop_semantic_loss = True
 
+        # drop subword id if using semantic token as input 
+        if self.cfg.get("use_asr_speech_tokens", False) and self.cfg.get("only_semantic_to_speech", False):
+            inputs["subword_ids"] = torch.full_like(inputs["subword_ids"], self.text_pad_id)
+            inputs["subword_mask"] = torch.full_like(inputs["subword_mask"], 0.0)
+            
         tts_output = self.tts_model(
             code=inputs["code"],
             audio_mask=inputs["audio_mask"],
@@ -1421,9 +1426,8 @@ class DuplexEARTTS(LightningModule, HFHubMixin):
             loss += char_loss
 
         if self.cfg.get("use_asr_speech_tokens", False):
-            if drop_semantic_loss:
+            if drop_semantic_loss or self.cfg.get("only_semantic_to_speech", False):
                 loss_dict["asr_tok_loss"] = 0.0
-                print("Semantic loss dropped!")
             else:
                 asr_tok_logits = self.asr_speech_tokens_head(tts_output.hidden_states)
                 asr_tok_loss = (
@@ -1436,7 +1440,6 @@ class DuplexEARTTS(LightningModule, HFHubMixin):
 
                 loss_dict["asr_tok_loss"] = asr_tok_loss
                 loss += asr_tok_loss * self.cfg.get("asr_tok_loss_scale", 1.0)
-                print("Semantic loss computed!", asr_tok_loss)
 
         num_frames = inputs["output_lens"].sum()
         B, T = inputs["code"].shape[:2]
@@ -1685,6 +1688,14 @@ class DuplexEARTTS(LightningModule, HFHubMixin):
                     for i, l in enumerate(dataset_batch["desc_plus_audio_prompt_lens"])
                 ])
 
+                if self.cfg.get("use_asr_speech_tokens", False) and self.cfg.get("only_semantic_to_speech", False):
+                    inp_asr_speech_tokens = torch.stack([
+                        inputs["target_asr_speech_tokens"][i, l-1:]  # slice each element
+                        for i, l in enumerate(dataset_batch["desc_plus_audio_prompt_lens"])
+                    ])
+                else:
+                    inp_asr_speech_tokens = None
+
                 # remove prompt padding from the user audio as autoregressive inference does not return the prompt
                 dataset_batch["source_audio"] = dataset_batch["source_audio"][:, -int(next_subword_ids.size(-1)*self.source_samples_per_frame):]
 
@@ -1693,6 +1704,7 @@ class DuplexEARTTS(LightningModule, HFHubMixin):
                     speaker_audio_lens=dataset_batch["speaker_reference_audio_lens"],
                     next_subword_ids=next_subword_ids,
                     formatter=dataset_batch["formatter"][0],
+                    inp_asr_speech_tokens=inp_asr_speech_tokens,
                     # init_inputs=init_inputs,
                 )
 
@@ -1981,6 +1993,7 @@ class DuplexEARTTS(LightningModule, HFHubMixin):
         guidance_enabled: bool = True,
         generation_config: dict = None,
         init_inputs: dict = None,
+        inp_asr_speech_tokens: torch.Tensor = None,
     ) -> dict[str, torch.Tensor]:
         """
         Autoregressive prediction.
@@ -2025,14 +2038,17 @@ class DuplexEARTTS(LightningModule, HFHubMixin):
 
         # get current asr speech token
         if self.cfg.get("use_asr_speech_tokens", False):
-            if guidance_enabled and self.cfg.get("asr_speech_tokens_use_guidance", True):
-                hidden_states, uncond_hidden_states = outputs.hidden_states.chunk(2, dim=0)
-                logits = self.asr_speech_tokens_head(hidden_states + (generation_config["guidance_scale"] * (hidden_states - uncond_hidden_states)))
-            else:
-                hidden_states, _ = outputs.hidden_states.chunk(2, dim=0)
-                logits = self.asr_speech_tokens_head(hidden_states)
+            if self.cfg.get("only_semantic_to_speech", False):
+                cur_asr_speech_tokens = inp_asr_speech_tokens[:, 0].unsqueeze(-1)
+            else:    
+                if guidance_enabled and self.cfg.get("asr_speech_tokens_use_guidance", True):
+                    hidden_states, uncond_hidden_states = outputs.hidden_states.chunk(2, dim=0)
+                    logits = self.asr_speech_tokens_head(hidden_states + (generation_config["guidance_scale"] * (hidden_states - uncond_hidden_states)))
+                else:
+                    hidden_states, _ = outputs.hidden_states.chunk(2, dim=0)
+                    logits = self.asr_speech_tokens_head(hidden_states)
 
-            cur_asr_speech_tokens = logits.argmax(dim=-1)[:, -1].unsqueeze(-1)
+                cur_asr_speech_tokens = logits.argmax(dim=-1)[:, -1].unsqueeze(-1)
 
         # use the text tokens to stop generation
         max_steps = next_subword_ids.size(-1)
@@ -2069,6 +2085,8 @@ class DuplexEARTTS(LightningModule, HFHubMixin):
             current_subword_id = next_subword_ids[:, i].unsqueeze(-1)
 
             if self.cfg.get("use_asr_speech_tokens", False):
+                if self.cfg.get("only_semantic_to_speech", False):
+                    cur_asr_speech_tokens = inp_asr_speech_tokens[:, i].unsqueeze(-1)
                 asr_speech_tokens_emb = self.asr_speech_tokens_emb(cur_asr_speech_tokens)
             else:
                 asr_speech_tokens_emb = None
@@ -2117,7 +2135,7 @@ class DuplexEARTTS(LightningModule, HFHubMixin):
             # ToDo: check why it is -1
             gen_audio_codes[:, i-1] = code.squeeze(1)
 
-            if self.cfg.get("use_asr_speech_tokens", False):
+            if self.cfg.get("use_asr_speech_tokens", False) and not self.cfg.get("only_semantic_to_speech", False):
                 if guidance_enabled and self.cfg.get("asr_speech_tokens_use_guidance", True):
                     hidden_states, uncond_hidden_states = outputs.hidden_states.chunk(2, dim=0)
                     logits = self.asr_speech_tokens_head(hidden_states + (generation_config["guidance_scale"] * (hidden_states - uncond_hidden_states)))
