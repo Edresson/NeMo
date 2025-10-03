@@ -1373,6 +1373,15 @@ class DuplexEARTTS(LightningModule, HFHubMixin):
                 chars_target[(chars_target == self.text_bos_id) | (chars_target == self.text_eos_id)| (chars_target == self.text_pad_id)] = self.subword_padding_idx
                 inputs["subword_ids"] = chars_target
 
+        # Drop subword ids to force the model to use semantic tokens
+        drop_semantic_loss = False
+        if self.cfg.get("use_asr_speech_tokens", False) and self.cfg.get("drop_bpe_inp_and_semantic_loss_prob", 0.0):
+            drop_prob = self.cfg.get("drop_bpe_inp_and_semantic_loss_prob", 0.0)
+            if torch.rand(1, device=self.device) < drop_prob:
+                inputs["subword_ids"] = torch.full_like(inputs["subword_ids"], self.text_pad_id)
+                inputs["subword_mask"] = torch.full_like(inputs["subword_mask"], 0.0)
+                drop_semantic_loss = True
+
         tts_output = self.tts_model(
             code=inputs["code"],
             audio_mask=inputs["audio_mask"],
@@ -1412,14 +1421,22 @@ class DuplexEARTTS(LightningModule, HFHubMixin):
             loss += char_loss
 
         if self.cfg.get("use_asr_speech_tokens", False):
-            asr_tok_logits = self.asr_speech_tokens_head(tts_output.hidden_states)
-            asr_tok_loss = (F.cross_entropy(
-                asr_tok_logits.transpose(1, 2), 
-                inputs["target_asr_speech_tokens"], 
-                reduction="none"
-            ) * inputs["audio_mask"]).sum() / inputs["audio_mask"].sum().clamp_min(1)
-            loss_dict["asr_tok_loss"] = asr_tok_loss
-            loss += asr_tok_loss * self.cfg.get("asr_tok_loss_scale", 1.0)
+            if drop_semantic_loss:
+                loss_dict["asr_tok_loss"] = 0.0
+                print("Semantic loss dropped!")
+            else:
+                asr_tok_logits = self.asr_speech_tokens_head(tts_output.hidden_states)
+                asr_tok_loss = (
+                    F.cross_entropy(
+                        asr_tok_logits.transpose(1, 2),
+                        inputs["target_asr_speech_tokens"],
+                        reduction="none"
+                    ) * inputs["audio_mask"]
+                ).sum() / inputs["audio_mask"].sum().clamp_min(1)
+
+                loss_dict["asr_tok_loss"] = asr_tok_loss
+                loss += asr_tok_loss * self.cfg.get("asr_tok_loss_scale", 1.0)
+                print("Semantic loss computed!", asr_tok_loss)
 
         num_frames = inputs["output_lens"].sum()
         B, T = inputs["code"].shape[:2]
