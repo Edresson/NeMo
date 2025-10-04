@@ -2018,6 +2018,12 @@ class DuplexEARTTS(LightningModule, HFHubMixin):
 
         init_inputs = self.get_init_inputs(speaker_audio, speaker_audio_lens, system_prompt=system_prompt, user_prompt=user_prompt)
 
+        if self.cfg.get("use_asr_speech_tokens", False) and self.cfg.get("only_semantic_to_speech", False):
+            # set mask to zero and subword ids to self.text_pad_id as in training
+            init_inputs["subword_mask"] = torch.full_like(init_inputs["subword_mask"], 0.0)
+            init_inputs["subword_ids"] = torch.full_like(init_inputs["subword_ids"], self.text_pad_id)
+            next_subword_ids = torch.full_like(next_subword_ids, self.text_pad_id)
+
         if generation_config is None:
             generation_config = self._get_generation_config(guidance_enabled)
             logging.info(f"Doing inference using the following config: {generation_config} !")
@@ -2113,6 +2119,10 @@ class DuplexEARTTS(LightningModule, HFHubMixin):
 
             if self.cfg.tts_config.get("use_char_tokenizer", False):
                 current_subword_id = char_ids[:, i].unsqueeze(-1)
+
+            if self.cfg.get("use_asr_speech_tokens", False) and self.cfg.get("only_semantic_to_speech", False):
+                # set mask to zero and subword ids to self.text_pad_id as in training
+                current_subword_mask = torch.full_like(current_subword_mask, 0.0)
 
             # get subword_ids
             inputs = {
