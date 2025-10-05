@@ -4,6 +4,23 @@ from nemo.collections.asr.modules import ConformerEncoder
 from nemo.core.classes.common import typecheck
 from nemo.collections.tts.modules.audio_codec_modules import FiniteScalarQuantizer
 
+from contextlib import contextmanager
+@contextmanager
+def fp32_precision():
+    """
+    Workaround for precision related issues when training with bf16-true PyTorch Lightning precision setting.
+    In bf16-true, PTL changes PyTorch's default dtype, which may break implicit assumptions for some models.
+    This context manager restores default float32 precision and runs the computation in float32 autocast context.
+    """
+    default_dtype = torch.get_default_dtype()
+    torch.set_default_dtype(torch.float32)
+    try:
+        with torch.amp.autocast(device_type="cuda" if torch.cuda.is_available() else "cpu", dtype=torch.float32):
+            yield
+    finally:
+        torch.set_default_dtype(default_dtype)
+
+
 class ConformerEncoderWithFSQ(ConformerEncoder):
     """
     A ConformerEncoder extension that adds a Finite Scalar Quantizer (FSQ)
@@ -32,7 +49,8 @@ class ConformerEncoderWithFSQ(ConformerEncoder):
         self.use_fsq = quantizer_levels is not None
         if self.use_fsq:
             bottleneck_dim = len(quantizer_levels)
-            out_dim = self._feat_out  # use feat_out if provided, else d_model
+            # out_dim = self._feat_out  # use feat_out if provided, else d_model
+            out_dim = self._feat_out if self._feat_out != -1 else self.d_model
 
             # Bottleneck projection → Quantizer → Projection back
             self.quantizer_bottleneck = nn.Linear(out_dim, bottleneck_dim)
@@ -67,10 +85,17 @@ class ConformerEncoderWithFSQ(ConformerEncoder):
 
         encoded, encoded_len = outputs[:2]
         other = outputs[2:]
-
+    
         # Apply quantization: Linear → FSQ → Linear
         z = self.quantizer_bottleneck(encoded.transpose(1, 2))
-        z_q, _ = self.vector_quantizer(inputs=z.transpose(1, 2), input_len=None)
-        encoded_quantized = self.quantizer_projection(z_q.transpose(1, 2)).transpose(1, 2)
+        dtype = z.dtype
+        # keep finite scalar quantization on FP32
+        with fp32_precision():
+            # add tanh to avoid overflow
+            z = torch.tanh(z)
+            z_q, _ = self.vector_quantizer(inputs=z.transpose(1, 2), input_len=None)
+        # make sure that it is runing in the right dtype
+        z_q = z_q.transpose(1, 2).to(dtype)
+        encoded_quantized = self.quantizer_projection(z_q).transpose(1, 2)
 
         return (encoded_quantized, encoded_len, *other)
