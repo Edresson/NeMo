@@ -398,6 +398,8 @@ class RVQEARTTSConfig(Config):
     use_cumulative_word_emb: bool = False
     use_phonemes: bool = False
     use_char_tokenizer: bool = False
+    ignore_cas_enc: bool = False
+    use_inp_code_aug: bool = False
 
     p_uncond: float = 0.1
     label_smoothing: float = 0.01
@@ -1090,6 +1092,35 @@ class CumulativeWordEmbedding(nn.Module):
                 return cum_embeds.to(out_dtype)
 
 
+class SubwordEmbedding(nn.Module):
+    """
+    Produces subword embeddings from a Hugging Face tokenizer vocabulary.
+    No special handling for OOVs or padding — assumes token_ids are valid.
+    """
+    def __init__(self, model_name: str, d_model: int):
+        super().__init__()
+        self.tokenizer = AutoTokenizer.from_pretrained(model_name)
+
+        # Get vocab size from tokenizer
+        vocab_dict = self.tokenizer.get_vocab()
+        self.vocab_size = max(vocab_dict.values()) + 1  # +1 for safety
+        self.d_model = d_model
+
+        # Subword embedding table
+        init_std = d_model ** -0.5
+        self.subword_emb = nn.Embedding(self.vocab_size, d_model)
+        nn.init.normal_(self.subword_emb.weight, mean=0.0, std=init_std)
+
+    def forward(self, token_ids: torch.LongTensor, subword_mask: torch.tensor = None):
+        """
+        token_ids: (B, T)
+        subword_mask: (B, T)
+        Returns:
+            subword_embeds: (B, T, d_model)
+        """
+        return self.subword_emb(token_ids)
+
+
 class CharAwareSubwordEncoder(nn.Module):
     """
     An encoder that creates subword embeddings from character-level embeddings.
@@ -1262,6 +1293,38 @@ class CharAwareSubwordEncoder(nn.Module):
         return subword_embeds
 
 
+def random_prev_token_dropout(dropped_code: torch.Tensor, dropout_prob: float, codebook_size: int):
+    """
+    Randomly replace previous tokens with random codebook tokens to improve robustness,
+    avoiding tokens equal to `codebook_size` (e.g., padding). Also counts dropped tokens.
+    
+    Args:
+        dropped_code: Tensor of shape (B, T, C)
+        dropout_prob: probability to replace a token
+        codebook_size: maximum code ID for the tokens (exclusive)
+    
+    Returns:
+        dropped_code_out: Tensor of same shape as dropped_code
+    """
+    B, T, C = dropped_code.shape
+    device = dropped_code.device
+    dtype = dropped_code.dtype
+
+    # Only consider tokens < codebook_size for dropout
+    valid_mask = dropped_code < codebook_size  # True for valid tokens
+    dropout_mask = (torch.rand((B, T, 1), device=device) < dropout_prob) & valid_mask.any(dim=-1, keepdim=True)
+
+    # Sample random token IDs from 0 to codebook_size-1
+    random_tokens = torch.randint(0, codebook_size, (B, T, C), device=device, dtype=dtype)
+
+    # Apply dropout only for valid positions
+    dropped_code_out = torch.where(dropout_mask, random_tokens, dropped_code)
+
+    # Count how many tokens were dropped
+    # num_dropped = (dropout_mask & (dropped_code_out != dropped_code)).sum().item()
+    return dropped_code_out
+
+
 class RVQEARTTSModel(PreTrainedModel):
     """
     The main RVQEARTTS model, which can be used for both training and inference.
@@ -1310,11 +1373,15 @@ class RVQEARTTSModel(PreTrainedModel):
             if self.config.context_hidden_size
             else None
         )
-        self.embed_subword = (
-            CharAwareSubwordEncoder(out_size=self.hidden_size, use_phonemes=self.config.use_phonemes, use_char_tokenizer=self.config.use_char_tokenizer, use_subword_flag_emb=self.config.use_subword_flag_emb, use_bos_eos_emb=self.config.use_bos_eos_emb, use_cumulative_word_emb=self.config.use_cumulative_word_emb, **self.config.cas_config)
-            if self.config.cas_config
-            else None
-        )
+
+        if self.config.cas_config is not None and self.config.get("ignore_cas_enc", False):
+            self.embed_subword = SubwordEmbedding(model_name=self.config.cas_config.pretrained_tokenizer_name, d_model=self.hidden_size)
+        else:
+            self.embed_subword = (
+                CharAwareSubwordEncoder(out_size=self.hidden_size, use_phonemes=self.config.use_phonemes, use_char_tokenizer=self.config.use_char_tokenizer, use_subword_flag_emb=self.config.use_subword_flag_emb, use_bos_eos_emb=self.config.use_bos_eos_emb, use_cumulative_word_emb=self.config.use_cumulative_word_emb, **self.config.cas_config)
+                if self.config.cas_config
+                else None
+            )
 
         # Prediction Heads
         if not self.config.disable_eos_prediction:
@@ -1530,6 +1597,15 @@ class RVQEARTTSModel(PreTrainedModel):
                     self.prepare_training_inputs(code)
                 )
                 uncond_dec_flag = torch.rand(code.size(0), 1, 1, device=code.device) < self.config.p_uncond
+                if self.config.get("use_inp_code_aug", False):
+                    dropped_code = dropped_code.clone()
+                    # 50% of sequences will be augmented
+                    apply_dropout = torch.rand(dropped_code.size(0), device=dropped_code.device) < 0.6
+                    dropped_code[apply_dropout] = random_prev_token_dropout(
+                        dropped_code[apply_dropout],
+                        dropout_prob=0.4,
+                        codebook_size=self.config.codebook_size
+                    )
             else:
                 dropped_code = code
                 uncond_dec_flag = torch.zeros(code.size(0), 1, 1, device=code.device, dtype=torch.bool)
@@ -1569,7 +1645,6 @@ class RVQEARTTSModel(PreTrainedModel):
                     self.embed_code(self.depthsum_embedding(F.pad(dropped_code[:, :-1], [0, 0, 1, 0])))
                     + (audio_mask & (~F.pad(audio_mask[:, :-1], [1, 0]))).unsqueeze(-1) * self.bos_emb
                 )
-
 
         else:  # Inference
             code_embeds = self.embed_code(self.depthsum_embedding(code))
