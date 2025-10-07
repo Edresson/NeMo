@@ -30,17 +30,22 @@ from nemo.utils import logging
 from nemo.collections.speechlm2.modules.ear_tts_commons import SCRIPT_PLACEHOLDER
 
 
-def sample_audio_segments_repeat(prompt_audio: torch.Tensor, 
-                                 prompt_audio_lens: torch.Tensor, 
-                                 n_sample: int) -> torch.Tensor:
+def sample_audio_segments_repeat(
+    prompt_audio: torch.Tensor,
+    prompt_audio_lens: torch.Tensor,
+    n_sample: int,
+    sample: bool = True,
+) -> torch.Tensor:
     """
-    Randomly sample audio segments of length n_sample.
-    If the audio is shorter than n_sample, repeat it until filled.
+    Extract audio segments of length n_sample.
+    If sample=True: randomly sample segments (repeating if shorter).
+    If sample=False: always take from the beginning (repeating if shorter).
 
     Args:
         prompt_audio: Tensor [B, T]
         prompt_audio_lens: Tensor [B] with valid lengths
         n_sample: int, target length per segment
+        sample: bool, whether to randomly sample (True) or take first seconds (False)
 
     Returns:
         Tensor [B, n_sample]
@@ -52,27 +57,35 @@ def sample_audio_segments_repeat(prompt_audio: torch.Tensor,
     for b in range(B):
         length = min(prompt_audio_lens[b].item(), T)
 
-        # case: empty audio (avoid crash)
+        # Case: empty audio
         if length <= 0:
             continue
 
         if length >= n_sample:
-            # safe: randint high must be >= 1
-            max_start = max(1, length - n_sample + 1)
-            start = torch.randint(0, max_start, (1,), device=device).item()
+            if sample:
+                # Random start (safe bounds)
+                max_start = max(1, length - n_sample + 1)
+                start = torch.randint(0, max_start, (1,), device=device).item()
+            else:
+                # Deterministic: take from start
+                start = 0
             out[b] = prompt_audio[b, start:start + n_sample]
 
         else:
-            # pick a random start inside available audio
-            start = torch.randint(0, length, (1,), device=device).item()
+            # Audio shorter than target → repeat
+            if sample:
+                # Random start position
+                start = torch.randint(0, length, (1,), device=device).item()
+            else:
+                start = 0
             segment = prompt_audio[b, start:length]
 
-            # repeat until reaching n_sample
             repeat_times = (n_sample + (length - start) - 1) // (length - start)
             repeated = segment.repeat(repeat_times)[:n_sample]
             out[b] = repeated
 
     return out
+
 
 def get_mask_from_lengths(
     lengths: torch.Tensor = None,
@@ -306,20 +319,21 @@ class DuplexEARTTSDataset(torch.utils.data.Dataset):
                 desc_tokens_ids = self.generate_prompt_description(device=input_text_tokens[i].device).squeeze(0)
                 if self.add_audio_prompt_after_description:
                     prompt_audio_size = int(((self.audio_prompt_duration * self.target_sample_rate) // target_samples_per_frame) * target_samples_per_frame)
-                    prompt_audio = sample_audio_segments_repeat(speaker_reference_audio, speaker_reference_audio_lens, prompt_audio_size)
-                    # add a silence in the end to smooth the transition between prompt and audio tokens
-                    prompt_audio[:, -target_samples_per_frame:] = 0
+                    prompt_audio = sample_audio_segments_repeat(speaker_reference_audio, speaker_reference_audio_lens, prompt_audio_size, sample=True)
+                    # add a silence in the end to smooth the transition between prompt and audio tokens, keep one extra pad token due shift on subword_ids
+                    prompt_audio[:, -int(target_samples_per_frame * 2):] = 0
 
                     # create tensor to pad text channels with the same amount of frames added in audio channel (audio prompt)
-                    prompt_audio_text_pad_size = prompt_audio_size // target_samples_per_frame
+                    prompt_audio_text_pad_size = (prompt_audio_size // target_samples_per_frame)
                     prompt_audio_text_pad = torch.ones(prompt_audio_text_pad_size, device=input_text_tokens.device, dtype=input_text_tokens.dtype) * text_pad_id
+                    # set last prompt frame with eos in text channel
+                    prompt_audio_text_pad[-1] = self.tokenizer.eos
+
                     # Add eos to simulate the end of a turn as in EAR-TTS inference
                     desc_tokens_ids = torch.cat([desc_tokens_ids, torch.tensor([self.tokenizer.eos], dtype=desc_tokens_ids.dtype, device=desc_tokens_ids.device)])
                     # Add padding equivalent to the audio prompt size in number of tokens
                     new_input_text_tokens = torch.cat([desc_tokens_ids.to(input_text_tokens.dtype), prompt_audio_text_pad.to(input_text_tokens.dtype), input_text_tokens[i]])
-
-                    # set eos right after the audio prompt
-                    # new_input_text_tokens[len(desc_tokens_ids) + prompt_audio_text_pad_size] = self.tokenizer.eos
+                    # append to list and update lens
                     input_text_tokens_.append(new_input_text_tokens)
                     target_token_lens[i] = target_token_lens[i] + len(desc_tokens_ids) + prompt_audio_text_pad_size
 
@@ -338,7 +352,7 @@ class DuplexEARTTSDataset(torch.utils.data.Dataset):
                     target_audio_lens[i] = target_audio_lens[i] + pad_size + prompt_audio.size(1)
                     # desc duration
                     desc_lens.append(len(desc_tokens_ids))
-                    desc_plus_audio_prompt_lens.append(len(desc_tokens_ids) + prompt_audio_text_pad_size)
+                    desc_plus_audio_prompt_lens.append(len(desc_tokens_ids) + prompt_audio_text_pad_size - 1) # -1 due the shift done in subword_ids
                 else:
                     # add description to target text tokens
                     input_text_tokens_.append(torch.cat([desc_tokens_ids, input_text_tokens[i]]))
@@ -379,7 +393,7 @@ class DuplexEARTTSDataset(torch.utils.data.Dataset):
             # create non_prompt_mask that should mask desc plus audio prompt if used
             non_prompt_mask = get_mask_from_lengths(target_token_lens)
             for i, frame in enumerate(desc_plus_audio_prompt_lens):
-                non_prompt_mask[i, :frame] = 0.0
+                non_prompt_mask[i, :frame-1] = 0.0
         else:
             # create a mask for audio using target tokens that suppose to have the same size of the tokenized audio
             audio_mask = get_mask_from_lengths(target_token_lens)

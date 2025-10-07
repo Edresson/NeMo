@@ -1623,8 +1623,7 @@ class RVQEARTTSModel(PreTrainedModel):
                 # bos_idx = audio_mask.float().argmax(dim=1)  # [B]
                 # using non_prompt_mask because audio_mask does not mask the audio prompt and 
                 # it would added the BOS in the wrong place and also shift the prompt
-                bos_idx = (~non_prompt_mask.bool()).float().argmax(dim=1)
-
+                bos_idx = (non_prompt_mask.bool()).float().argmax(dim=1)
                 # 3. Create mask for positions before BOS
                 pos = torch.arange(T, device=device).unsqueeze(0)  # [1, T]
                 before_bos_mask = pos < bos_idx.unsqueeze(1)       # [B, T]
@@ -1640,6 +1639,7 @@ class RVQEARTTSModel(PreTrainedModel):
                 # 6. Add BOS embedding only at BOS index
                 bos_mask = (pos == bos_idx.unsqueeze(1)).unsqueeze(-1)  # [B, T, 1]
                 code_embeds = code_embeds + bos_mask * self.bos_emb
+
             else:
                 code_embeds = (
                     self.embed_code(self.depthsum_embedding(F.pad(dropped_code[:, :-1], [0, 0, 1, 0])))
