@@ -623,6 +623,8 @@ def read_lhotse_magpietts_data_as_duplex(config) -> tuple[CutSet, bool]:
             # Save both to memory
             cut_source = cut_source.to_mono().move_to_memory(audio_format='wav')
             cut_target = cut_target.to_mono().move_to_memory(audio_format='wav')
+            agent_sup.duration = agent_sup.duration +  sil_duration + 1.0 # added here 1.0 seconds to not have text EOS for this dataset to avoid conflicts with S2S, text EOS is the interruption token on duplex
+            user_sup.duration = user_sup.duration +  sil_duration
 
         # Assemble final cut
         cut_source.supervisions = [user_sup, agent_sup]
@@ -754,6 +756,8 @@ def read_lhotse_magpietts_data_as_continuation(config) -> tuple[CutSet, bool]:
             # Save both to memory
             cut_source = cut_source.to_mono().move_to_memory(audio_format='wav')
             cut_target = cut_target.to_mono().move_to_memory(audio_format='wav')
+            agent_sup.duration = agent_sup.duration +  sil_duration + 1.0 # added here 1.0 seconds to not have text EOS for this dataset to avoid conflicts with S2S, text EOS is the interruption token on duplex
+            user_sup.duration = user_sup.duration +  sil_duration
 
         # Assemble final cut
         cut_source.supervisions = [user_sup, agent_sup]
