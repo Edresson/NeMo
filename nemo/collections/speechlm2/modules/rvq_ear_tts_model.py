@@ -392,6 +392,7 @@ class RVQEARTTSConfig(Config):
 
     # extra parameters used for compatibility with S2S
     use_unshifthed_prompt: bool = False
+    ignore_prompt_audio_on_loss: bool = False
     disable_eos_prediction: bool = False
     use_subword_flag_emb: bool = False
     use_bos_eos_emb: bool = False
@@ -1639,7 +1640,6 @@ class RVQEARTTSModel(PreTrainedModel):
                 # 6. Add BOS embedding only at BOS index
                 bos_mask = (pos == bos_idx.unsqueeze(1)).unsqueeze(-1)  # [B, T, 1]
                 code_embeds = code_embeds + bos_mask * self.bos_emb
-
             else:
                 code_embeds = (
                     self.embed_code(self.depthsum_embedding(F.pad(dropped_code[:, :-1], [0, 0, 1, 0])))

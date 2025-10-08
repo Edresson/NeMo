@@ -1198,6 +1198,17 @@ class DuplexEARTTS(LightningModule, HFHubMixin):
             target_codes
         )
 
+        if self.cfg.get("ignore_audio_prompt_on_loss", False):
+            # set audio_mask as non_prompt_mask to avoid the audio prompt in loss computation
+            audio_mask = non_prompt_mask
+
+        if self.cfg.get("add_pad_speech_token_in_last_prompt_frame", False):
+            # set special token in the last audio prompt (it will works as a BOS token)
+            pos = non_prompt_mask.float().argmax(dim=1)  # shape: [B]
+            row_idx = torch.arange(B, device=self.device)
+            # set the extra self.speech_pad_id at first 1 position in non_prompt_mask
+            target_codes_aligned[row_idx, pos] = self.speech_pad_id
+
         B, T = input_text_tokens.shape
         # ToDo: consider to handle Speech BOS and EOS as duplex
         """
@@ -2065,6 +2076,17 @@ class DuplexEARTTS(LightningModule, HFHubMixin):
         else:
             asr_speech_tokens_emb = None
 
+        if self.cfg.get("ignore_audio_prompt_on_loss", False):
+            # set audio_mask as non_prompt_mask to avoid the audio prompt in loss computation
+            audio_mask = non_prompt_mask
+
+        if self.cfg.get("add_pad_speech_token_in_last_prompt_frame", False):
+            # set special token in the last audio prompt (it will works as a BOS token)
+            pos = non_prompt_mask.float().argmax(dim=1)  # shape: [B]
+            row_idx = torch.arange(B, device=self.device)
+            # set the extra self.speech_pad_id at first 1 position in non_prompt_mask
+            code[row_idx, pos] = self.speech_pad_id
+
         init_inputs = {
             "code": code[:, :-1],
             "audio_mask": audio_mask.bool()[:, :-1],
@@ -2111,6 +2133,7 @@ class DuplexEARTTS(LightningModule, HFHubMixin):
         B = next_subword_ids.size(0)
 
         # init_inputs, code, past_key_values = self.init_model_for_ar_inference(speaker_audio=speaker_audio, speaker_audio_lens=speaker_audio_lens, system_prompt=system_prompt, user_prompt=user_prompt, guidance_enabled=guidance_enabled, generation_config=generation_config)
+
         if init_inputs is None:
             init_inputs = self.get_init_inputs(speaker_audio, speaker_audio_lens, system_prompt=system_prompt, user_prompt=user_prompt)
         # compare_dicts(init_inputs_fn, init_inputs)
@@ -2136,7 +2159,12 @@ class DuplexEARTTS(LightningModule, HFHubMixin):
             # warmup the model and generate the very first audio token
             outputs = self.tts_model(**init_inputs)
 
-        code, _, _ = self.tts_model.generate_step(outputs.hidden_states[:, -1:], **generation_config)
+        if self.cfg.get("inference_skip_first_code_prediction_on_init", True):
+            # use the last token on init, because we are shifthing it in the model forward, so we dont really need to compute it
+            code = init_inputs["code"][:, -1:]
+        else:
+            code, _, _ = self.tts_model.generate_step(outputs.hidden_states[:, -1:], **generation_config)
+
         past_key_values = outputs.past_key_values
 
         # get current asr speech token
