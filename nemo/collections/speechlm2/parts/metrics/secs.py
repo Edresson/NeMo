@@ -55,7 +55,7 @@ class SECS:
             with torch.no_grad():
                 _, t_g = self.speaker_encoder(input_signal=target_audio, input_signal_length=target_audio_lens.long())
                 _, s_g = self.speaker_encoder(input_signal=pred_audio, input_signal_length=pred_audio_lens.long())
-            secs = torch.nn.functional.cosine_similarity(t_g, s_g)
+            secs = torch.nn.functional.cosine_similarity(t_g, s_g, dim=-1).mean()
 
 
         self._secs[name].append(secs)
