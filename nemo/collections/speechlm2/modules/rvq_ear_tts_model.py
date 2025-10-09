@@ -392,6 +392,7 @@ class RVQEARTTSConfig(Config):
 
     # extra parameters used for compatibility with S2S
     use_unshifthed_prompt: bool = False
+    use_only_first_n_codebooks_for_TF: int = None
     ignore_prompt_audio_on_loss: bool = False
     disable_eos_prediction: bool = False
     use_subword_flag_emb: bool = False
@@ -1640,6 +1641,36 @@ class RVQEARTTSModel(PreTrainedModel):
                 # 6. Add BOS embedding only at BOS index
                 bos_mask = (pos == bos_idx.unsqueeze(1)).unsqueeze(-1)  # [B, T, 1]
                 code_embeds = code_embeds + bos_mask * self.bos_emb
+            elif self.config.get("use_only_first_n_codebooks_for_TF", None):
+                # padded code for teacher forcing
+                padded_code = F.pad(dropped_code[:, :-1], [0, 0, 1, 0])  # [B, T, D]
+
+                b, t, d = padded_code.shape
+                device = padded_code.device
+
+                # BOS mask: True only at BOS position
+                bos_mask = (audio_mask & (~F.pad(audio_mask[:, :-1], [1, 0]))).unsqueeze(-1)  # [B, T, 1]
+
+                # BOS index per batch
+                bos_idx = audio_mask.bool().float().argmax(dim=1)  # [B]
+
+                # Compute full embedding for all positions
+                full_emb = self.depthsum_embedding(padded_code)  # [B, T, H]
+
+                # Compute coarse embedding (first codebook only)
+                coarse_emb = self.depthsum_embedding(padded_code[..., 0:self.config.use_only_first_n_codebooks_for_TF])  # [B, T, H]
+
+                # Create mask: True for positions < BOS → full_emb, False for BOS and after → coarse_emb
+                positions = torch.arange(t, device=device).unsqueeze(0).expand(b, t)  # [B, T]
+                before_bos_mask = positions < bos_idx.unsqueeze(1)  # [B, T]
+
+                # Combine embeddings based on mask
+                code_embeds = torch.where(before_bos_mask.unsqueeze(-1), full_emb, coarse_emb)  # [B, T, H]
+
+                # project embeddings
+                code_embeds = self.embed_code(code_embeds)
+                # Add BOS embedding only at BOS position
+                code_embeds = code_embeds + bos_mask * self.bos_emb
             else:
                 code_embeds = (
                     self.embed_code(self.depthsum_embedding(F.pad(dropped_code[:, :-1], [0, 0, 1, 0])))
@@ -1647,7 +1678,11 @@ class RVQEARTTSModel(PreTrainedModel):
                 )
 
         else:  # Inference
-            code_embeds = self.embed_code(self.depthsum_embedding(code))
+            if self.config.get("use_only_first_n_codebooks_for_TF", None):
+                # inference dont do prompt so we need to only add the n_codes
+                code_embeds = self.embed_code(self.depthsum_embedding(code[..., 0:self.config.use_only_first_n_codebooks_for_TF]))
+            else:
+                code_embeds = self.embed_code(self.depthsum_embedding(code))
             uncond_dec_flag = torch.zeros(code.size(0), 1, 1, device=code.device, dtype=torch.bool)
 
         if guidance_enabled:
