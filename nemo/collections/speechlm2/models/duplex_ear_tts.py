@@ -164,6 +164,48 @@ def setup_rvq_audio_codec(model):
     for p in model.audio_codec.parameters():
         p.requires_grad = False
 
+def setup_audio_codec(self):
+    # codec configs
+    if self.cfg.get("use_nanocodec", False):
+        from nemo.collections.speechlm2.parts.pretrained import setup_audio_codec as setup_audio_codec_nemo
+        setup_audio_codec_nemo(self)
+        if not isinstance(self.audio_codec, GroupedCodec):
+            self.audio_codec = GroupedCodec(self.audio_codec, frame_stacking_factor=1)
+
+        num_codebooks = self.cfg.tts_config.num_quantizers
+        codebook_size = self.cfg.tts_config.codebook_size
+        # Prepare a tensor to store all embeddings
+        all_embeddings = []
+
+        for _ in range(num_codebooks):
+            # Create all possible indices for this codebook
+            indices = torch.arange(codebook_size, device=self.device)
+            
+            # Reshape to [1, B, T] or whatever shape decode expects
+            indices = indices[None, None, :]  # [1, 1, codebook_size]
+            
+            # Decode this codebook's embeddings
+            decoded = self.audio_codec.codec.vector_quantizer.decode(indices=indices, input_len=None)  # should return [B, D, T] = [1, emb_dim, codebook_size]
+            decoded = decoded.squeeze(0).permute(1, 0)  # -> [codebook_size, emb_dim]
+            all_embeddings.append(decoded.detach())
+
+        # Stack everything: [num_codebooks, codebook_size, emb_dim]
+        all_embeddings = torch.stack(all_embeddings, dim=0)
+        assert callable(self.tts_model.set_rvq_embs)
+        self.tts_model.set_rvq_embs(all_embeddings)
+        self.tts_model.rvq_embs = self.tts_model.rvq_embs.to(next(self.tts_model.parameters()).dtype)
+
+        # compute target fps
+        self.target_fps = self.target_sample_rate / self.audio_codec.samples_per_frame
+        self.target_samples_per_frame = self.audio_codec.samples_per_frame
+    else:
+        setup_rvq_audio_codec(self)
+        assert callable(self.tts_model.set_rvq_embs)
+        self.tts_model.set_rvq_embs(torch.stack([x.detach() for x in self.audio_codec.prvq.mus_list], 0))
+        self.tts_model.rvq_embs = self.tts_model.rvq_embs.to(next(self.tts_model.parameters()).dtype)
+        # compute target fps
+        self.target_fps = self.target_sample_rate / self.audio_codec.config.wav_to_token_ratio
+        self.target_samples_per_frame = self.audio_codec.config.wav_to_token_ratio
 
 from nemo.collections.speechlm2.modules.asr_speech_tokenizer.modeling_whisper import WhisperVQEncoder
 from transformers import WhisperFeatureExtractor
@@ -767,6 +809,139 @@ class WordSepTokenizer(AutoTokenizer):
         return text.replace(self.word_sep_token, " ")
 
 
+class GroupedCodec(NeuralModule):
+    def __init__(self, codec, frame_stacking_factor=1):
+        super().__init__()
+        self.codec = codec
+        self.frame_stacking_factor = frame_stacking_factor
+
+    @property
+    def device(self):
+        return self.codec.device
+
+    @property
+    def _codebook_size(self):
+        return self.codec.vector_quantizer.codebook_size_per_group
+
+    @property
+    def _num_codebooks(self):
+        return self.codec.vector_quantizer.num_groups * self.frame_stacking_factor
+
+    @property
+    def samples_per_frame(self):
+        return self.codec.samples_per_frame * self.frame_stacking_factor
+
+    def encode(self, audio, audio_len):
+        audio = audio.squeeze(1)
+        with fp32_precision():
+            # make the audio divisible by frame rate and also by self.frame_stacking_factor with extra frames of 1 to avoid issues because we are removing a audio frame to shift target and input for TF
+            audio, audio_len = self.pad_audio_to_factor(audio, audio_len, self.samples_per_frame, extra_frames=1)
+            # encodes audio using the codec
+            tokens, tokens_len = self.codec.encode(audio=audio, audio_len=audio_len)  # B, C, T
+            tokens = tokens.transpose(1, 2)  # → B, T, C
+            B, T, C = tokens.shape
+            assert T % self.frame_stacking_factor == 0
+            grouped = tokens.reshape(B, T // self.frame_stacking_factor, C * self.frame_stacking_factor)
+            tokens_len = tokens_len // self.frame_stacking_factor
+            # grouped = grouped.transpose(1, 2)
+            return grouped, tokens_len
+
+    def decode(self, tokens, tokens_len):
+        with fp32_precision():
+            # tokens = tokens.transpose(1, 2)
+            # tokens: B, T', C'
+            B, T, Cg = tokens.shape
+            assert Cg % self.frame_stacking_factor == 0
+            C = Cg // self.frame_stacking_factor
+            ungrouped = tokens.reshape(B, T * self.frame_stacking_factor, C)  # → [B, T, C]
+            ungrouped = ungrouped.transpose(1, 2)      # → [B, C, T] for decode
+            tokens_len = torch.ceil(tokens_len * self.frame_stacking_factor).to(tokens_len.dtype)
+            audio, audio_len = self.codec.decode(tokens=ungrouped, tokens_len=tokens_len)
+        return audio, audio_len
+
+    def decode_audio(self, inputs: torch.Tensor, input_len: torch.Tensor):
+        """Apply decoder on the input. Note that the input is a non-quantized encoder output or a dequantized representation.
+
+        Args:
+            inputs: encoded signal
+            input_len: valid length for each example in the batch
+
+        Returns:
+            Decoded output `audio` in the time domain and its length in number of samples `audio_len`.
+            Note that `audio_len` will be a multiple of `self.samples_per_frame`.
+        """
+        with fp32_precision():
+            if self.frame_stacking_factor > 1:
+                inputs = inputs.transpose(1, 2)
+                B, T, Cg = inputs.shape
+                C = Cg // self.frame_stacking_factor
+                inputs = inputs.reshape(B, T * self.frame_stacking_factor, C)  # → [B, T, C]
+                input_len = torch.ceil(input_len * self.frame_stacking_factor).to(input_len.dtype)
+                inputs = inputs.transpose(1, 2)
+
+            audio, audio_len = self.codec.audio_decoder(inputs=inputs, input_len=input_len)
+        return audio, audio_len
+
+    def dequantize(self, tokens: torch.Tensor, tokens_len: torch.Tensor) -> torch.Tensor:
+        """Convert the discrete tokens into a continuous encoded representation.
+
+        Args:
+            tokens: discrete tokens for each codebook for each time frame
+            tokens_len: valid length of each example in the batch
+
+        Returns:
+            Continuous encoded representation of the discrete input representation.
+        """
+        with fp32_precision():
+            # reshape to dequantize
+            if self.frame_stacking_factor > 1:
+                tokens = tokens.transpose(1, 2)
+                # tokens: B, T', C'
+                B, T, Cg = tokens.shape
+                assert Cg % self.frame_stacking_factor == 0
+                C = Cg // self.frame_stacking_factor
+                tokens = tokens.reshape(B, T * self.frame_stacking_factor, C)  # → [B, T, C]
+                tokens = tokens.transpose(1, 2)      # → [B, C, T] for decode
+                tokens_len = torch.ceil(tokens_len * self.frame_stacking_factor).to(tokens_len.dtype)
+            dequantized = self.codec.dequantize(tokens=tokens, tokens_len=tokens_len)
+            # reshape back to the compress form if needed
+            if self.frame_stacking_factor > 1:
+                dequantized = dequantized.transpose(1, 2)  # → B, T, C
+                B, T, C = dequantized.shape
+                assert T % self.frame_stacking_factor == 0
+                dequantized = dequantized.reshape(B, T // self.frame_stacking_factor, C * self.frame_stacking_factor)
+                dequantized = dequantized.transpose(1, 2)  # → B, C, T
+
+        return dequantized
+
+    def forward(self, audio, audio_len):
+        tokens, tokens_len = self.encode(audio, audio_len)
+        audio, audio_len = self.decode(tokens, tokens_len)
+        return audio, audio_len
+
+    def pad_audio_to_factor(self, audio, audio_len, samples_per_frame, extra_frames: int = 0):
+        """
+        Zero pad the end of the audio so that we do not have a partial end frame.
+        The output will be zero-padded to have an integer number of frames of
+        length `samples_per_frame * frame_stacking_factor`.
+
+        Args:
+            audio: input time-domain signal (B, T)
+            audio_len: valid length for each example in the batch (B,)
+            samples_per_frame: number of samples per frame
+
+        Returns:
+            padded_audio: Padded time-domain signal (B, T')
+            padded_len: Adjusted valid lengths (B,)
+        """
+        with fp32_precision():
+            padded_len = (samples_per_frame * torch.ceil(audio_len / samples_per_frame).int()) + (extra_frames * samples_per_frame)
+        max_len = padded_len.max().int().item()
+        num_padding = (max_len - audio.shape[1])
+        padded_audio = F.pad(audio, (0, num_padding))   
+        return padded_audio, padded_len
+
+
 import math
 
 def compare_dicts(dict_a, dict_b):
@@ -859,15 +1034,12 @@ class DuplexEARTTS(LightningModule, HFHubMixin):
         # instanciate eartts model and codec
         self._load_tts_model(self.cfg)
         self._codebook_size = self.tts_model.config.codebook_size
-        # compute target fps
-        self.target_fps = self.target_sample_rate / self.audio_codec.config.wav_to_token_ratio
 
         # compute source fps
         self.source_fps = self.source_sample_rate / (
             self.source_sample_rate * cfg.data.frame_length
         )  # conver frame rate in fps
         self.source_samples_per_frame = int(self.source_sample_rate//self.source_fps)
-        self.target_samples_per_frame = self.audio_codec.config.wav_to_token_ratio
 
         # get codec silence tokens
         self.codec_silence_tokens = self.get_codec_silence_frame()
@@ -977,11 +1149,7 @@ class DuplexEARTTS(LightningModule, HFHubMixin):
             # start the model from scratch
             self.tts_model = RVQEARTTSModel(RVQEARTTSConfig(**cfg.tts_config))
 
-        # codec configs
-        setup_rvq_audio_codec(self)
-
-        assert callable(self.tts_model.set_rvq_embs)
-        self.tts_model.set_rvq_embs(torch.stack([x.detach() for x in self.audio_codec.prvq.mus_list], 0))
+        setup_audio_codec(self)
 
 
     def _load_language_model(self, cfg):
@@ -1529,7 +1697,7 @@ class DuplexEARTTS(LightningModule, HFHubMixin):
         return ans
 
     def on_train_epoch_start(self) -> None:
-        setup_rvq_audio_codec(self)  # potentially reloads the audio codec to make sure it's in fp32
+        setup_audio_codec(self)  # potentially reloads the audio codec to make sure it's in fp32
 
     def on_validation_epoch_start(self) -> None:
         self.on_train_epoch_start()
