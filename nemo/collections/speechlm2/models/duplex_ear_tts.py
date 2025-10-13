@@ -149,6 +149,78 @@ def get_mask_from_lengths(
     return mask
 
 
+from transformers import MimiModel, AutoFeatureExtractor
+class MimiCodec(NeuralModule):
+    def __init__(self, num_codebooks=12):
+        super().__init__()
+        from transformers import MimiModel
+        self.codec = MimiModel.from_pretrained("kyutai/mimi")
+        self.feature_extractor = AutoFeatureExtractor.from_pretrained("kyutai/mimi")
+        self.num_codebooks = num_codebooks
+
+    @property
+    def device(self):
+        return next(self.codec.parameters()).device
+
+    @property
+    def _codebook_size(self):
+        return self.codec.config.codebook_size
+
+    @property
+    def _num_codebooks(self):
+        return self.num_codebooks
+
+    @property
+    def samples_per_frame(self):
+        return int(self.feature_extractor.sampling_rate // self.codec.config.frame_rate)
+
+    def encode(self, audio, audio_len):
+        audio = audio.squeeze(1)
+        with fp32_precision():
+            # make the audio divisible by frame rate and also by self.frame_stacking_factor with extra frames of 1 to avoid issues because we are removing a audio frame to shift target and input for TF
+            audio, audio_len = self.pad_audio_to_factor(audio, audio_len, self.samples_per_frame, extra_frames=1)
+            # explicitly encode then decode the audio inputs
+            encoder_outputs = self.codec.encode(audio.unsqueeze(1).to(self.device), num_quantizers=self.num_codebooks)
+            codes = encoder_outputs.audio_codes
+            tokens_len = audio_len // self.samples_per_frame
+            return codes.transpose(1, 2), tokens_len
+
+    def decode(self, tokens, tokens_len):
+        with fp32_precision():
+            tokens = tokens.transpose(1, 2)
+            # tokens: B, T', C'
+            audio = self.codec.decode(tokens).audio_values.squeeze(1)
+            audio_len = tokens_len * self.samples_per_frame
+        return audio, audio_len
+
+    def forward(self, audio, audio_len):
+        tokens, tokens_len = self.encode(audio, audio_len)
+        audio, audio_len = self.decode(tokens, tokens_len)
+        return audio, audio_len
+
+
+    def pad_audio_to_factor(self, audio, audio_len, samples_per_frame, extra_frames: int = 0):
+        """
+        Zero pad the end of the audio so that we do not have a partial end frame.
+        The output will be zero-padded to have an integer number of frames of
+        length `samples_per_frame * frame_stacking_factor`.
+
+        Args:
+            audio: input time-domain signal (B, T)
+            audio_len: valid length for each example in the batch (B,)
+            samples_per_frame: number of samples per frame
+
+        Returns:
+            padded_audio: Padded time-domain signal (B, T')
+            padded_len: Adjusted valid lengths (B,)
+        """
+        with fp32_precision():
+            padded_len = (samples_per_frame * torch.ceil(audio_len / samples_per_frame).int()) + (extra_frames * samples_per_frame)
+        max_len = padded_len.max().int().item()
+        num_padding = (max_len - audio.shape[1])
+        padded_audio = F.pad(audio, (0, num_padding))   
+        return padded_audio, padded_len
+
 
 def setup_rvq_audio_codec(model):
     """
@@ -169,28 +241,58 @@ def setup_audio_codec(self):
     if self.cfg.get("use_nanocodec", False):
         from nemo.collections.speechlm2.parts.pretrained import setup_audio_codec as setup_audio_codec_nemo
         setup_audio_codec_nemo(self)
-        if not isinstance(self.audio_codec, GroupedCodec):
-            self.audio_codec = GroupedCodec(self.audio_codec, frame_stacking_factor=1)
+        if not isinstance(self.audio_codec, NeMoGroupedCodec):
+            self.audio_codec = NeMoGroupedCodec(self.audio_codec, frame_stacking_factor=1)
+
+        # get FSQ embeddings
+        num_codebooks = self.cfg.tts_config.num_quantizers
+        codebook_size = self.cfg.tts_config.codebook_size
+        # Create tensor of indices: [num_codebooks, 1, codebook_size]
+        indices = torch.arange(codebook_size, device=self.device)[None, None, :].repeat(num_codebooks, 1, 1)
+
+        # Decode embeddings for all possible indices
+        all_embeddings = self.audio_codec.codec.vector_quantizer.decode(indices=indices, input_len=None)
+
+        emb_dim_total = all_embeddings.shape[1]
+        emb_dim_per_group = emb_dim_total // num_codebooks
+
+        # [1, 52, 2016] → [num_codebooks, emb_dim_per_group, codebook_size]
+        all_embeddings = (
+            all_embeddings.squeeze(0)  # [52, 2016]
+            .view(num_codebooks, emb_dim_per_group, codebook_size)
+            .permute(0, 2, 1)  # [num_codebooks, codebook_size, emb_dim_per_group]
+        )
+        assert callable(self.tts_model.set_rvq_embs)
+        self.tts_model.set_rvq_embs(all_embeddings)
+        self.tts_model.rvq_embs = self.tts_model.rvq_embs.to(next(self.tts_model.parameters()).dtype)
+
+        # compute target fps
+        self.target_fps = self.target_sample_rate / self.audio_codec.samples_per_frame
+        self.target_samples_per_frame = self.audio_codec.samples_per_frame
+    elif self.cfg.get("use_mimicodec", False):
+        if hasattr(self, "audio_codec") and next(self.audio_codec.parameters()).dtype == torch.float:
+            return  # skip if already set up and has the right dtype
+        with fp32_precision():
+            self.audio_codec = MimiCodec(num_codebooks=self.cfg.get("mimi_number_codebooks", 12)).eval().to(self.device)
+        for p in self.audio_codec.parameters():
+            p.requires_grad = False
 
         num_codebooks = self.cfg.tts_config.num_quantizers
         codebook_size = self.cfg.tts_config.codebook_size
-        # Prepare a tensor to store all embeddings
         all_embeddings = []
+        # get semantic embeddings
+        svq = self.audio_codec.codec.quantizer.semantic_residual_vector_quantizer
+        for i in range(svq.num_quantizers):
+            emb = svq.layers[i].codebook.embed
+            all_embeddings.append(emb)
 
-        for _ in range(num_codebooks):
-            # Create all possible indices for this codebook
-            indices = torch.arange(codebook_size, device=self.device)
-            
-            # Reshape to [1, B, T] or whatever shape decode expects
-            indices = indices[None, None, :]  # [1, 1, codebook_size]
-            
-            # Decode this codebook's embeddings
-            decoded = self.audio_codec.codec.vector_quantizer.decode(indices=indices, input_len=None)  # should return [B, D, T] = [1, emb_dim, codebook_size]
-            decoded = decoded.squeeze(0).permute(1, 0)  # -> [codebook_size, emb_dim]
-            all_embeddings.append(decoded.detach())
+        # get acoustic embeddings
+        avq = self.audio_codec.codec.quantizer.acoustic_residual_vector_quantizer 
+        for i in range(avq.num_quantizers):
+            emb = avq.layers[i].codebook.embed
+            all_embeddings.append(emb)
 
-        # Stack everything: [num_codebooks, codebook_size, emb_dim]
-        all_embeddings = torch.stack(all_embeddings, dim=0)
+        all_embeddings = torch.stack(all_embeddings, dim=0).detach()
         assert callable(self.tts_model.set_rvq_embs)
         self.tts_model.set_rvq_embs(all_embeddings)
         self.tts_model.rvq_embs = self.tts_model.rvq_embs.to(next(self.tts_model.parameters()).dtype)
@@ -809,7 +911,7 @@ class WordSepTokenizer(AutoTokenizer):
         return text.replace(self.word_sep_token, " ")
 
 
-class GroupedCodec(NeuralModule):
+class NeMoGroupedCodec(NeuralModule):
     def __init__(self, codec, frame_stacking_factor=1):
         super().__init__()
         self.codec = codec
@@ -940,7 +1042,6 @@ class GroupedCodec(NeuralModule):
         num_padding = (max_len - audio.shape[1])
         padded_audio = F.pad(audio, (0, num_padding))   
         return padded_audio, padded_len
-
 
 import math
 
