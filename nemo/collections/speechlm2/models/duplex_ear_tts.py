@@ -151,11 +151,10 @@ def get_mask_from_lengths(
 
 from transformers import MimiModel, AutoFeatureExtractor
 class MimiCodec(NeuralModule):
-    def __init__(self, num_codebooks=12):
+    def __init__(self, model_path_or_name="kyutai/mimi", num_codebooks=12):
         super().__init__()
-        from transformers import MimiModel
-        self.codec = MimiModel.from_pretrained("kyutai/mimi")
-        self.feature_extractor = AutoFeatureExtractor.from_pretrained("kyutai/mimi")
+        self.codec = MimiModel.from_pretrained(model_path_or_name)
+        self.feature_extractor = AutoFeatureExtractor.from_pretrained(model_path_or_name)
         self.num_codebooks = num_codebooks
 
     @property
@@ -273,7 +272,7 @@ def setup_audio_codec(self):
         if hasattr(self, "audio_codec") and next(self.audio_codec.parameters()).dtype == torch.float:
             return  # skip if already set up and has the right dtype
         with fp32_precision():
-            self.audio_codec = MimiCodec(num_codebooks=self.cfg.get("mimi_number_codebooks", 12)).eval().to(self.device)
+            self.audio_codec = MimiCodec(model_path_or_name=self.cfg.get("mimi_model_path", "kyutai/mimi"), num_codebooks=self.cfg.get("mimi_number_codebooks", 12)).eval().to(self.device)
         for p in self.audio_codec.parameters():
             p.requires_grad = False
 
