@@ -328,166 +328,6 @@ def setup_asr_speech_tokenizer(model):
     for p in model.asr_speech_tokenizer.parameters():
         p.requires_grad = False
 
-def subwords_to_chars__(subword_ids, subword_id_to_char_ids, bos_id, eos_id, pad_id):
-    device = subword_ids.device
-    B, T = subword_ids.shape
-
-    # Build LUT
-    max_subword_id = int(subword_ids.max().item())
-    max_chars = max(len(v) for v in subword_id_to_char_ids.values()) if subword_id_to_char_ids else 0
-    if max_chars == 0:
-        return subword_ids.clone()
-
-    char_expansion = torch.full((max_subword_id + 1, max_chars),
-                                fill_value=pad_id, device=device, dtype=subword_ids.dtype)
-    expansion_len = torch.zeros(max_subword_id + 1, dtype=torch.long, device=device)
-    for k, v in subword_id_to_char_ids.items():
-        if k <= max_subword_id:
-            v_t = torch.tensor(v, device=device, dtype=subword_ids.dtype)
-            char_expansion[k, :v_t.numel()] = v_t
-            expansion_len[k] = v_t.numel()
-
-    # Output with BOS/EOS copied
-    output = torch.full_like(subword_ids, fill_value=pad_id)
-    special_mask = (subword_ids == bos_id) | (subword_ids == eos_id)
-    output[special_mask] = subword_ids[special_mask]
-
-    # Find next EOS for each position (vectorized)
-    pos = torch.arange(T, device=device)
-    bos_mask = (subword_ids == bos_id)
-    eos_mask = (subword_ids == eos_id)
-    eos_pos_tensor = torch.where(eos_mask, pos.unsqueeze(0).expand(B, T), torch.full((B, T), T, device=device))
-    next_eos_idx = torch.flip(torch.cummin(torch.flip(eos_pos_tensor, [1]), dim=1).values, [1])
-
-    # Process each span individually (much smaller loop)
-    bos_coords = torch.nonzero(bos_mask, as_tuple=False)
-    for b, start in bos_coords:
-        end = next_eos_idx[b, start]
-        if end <= start + 1:
-            continue
-        span_subwords = subword_ids[b, start + 1:end]
-        chars_list = [char_expansion[s] for s in span_subwords]
-        chars_flat = torch.cat([c[:expansion_len[s]] for c, s in zip(chars_list, span_subwords)], dim=0)
-        span_len = min(len(chars_flat), end - (start + 1))
-        output[b, start + 1:start + 1 + span_len] = chars_flat[:span_len]
-
-    return output
-
-
-def subwords_to_chars_(subword_ids, subword_id_to_char_ids, bos_id, eos_id, pad_id):
-    device = subword_ids.device
-    B, T = subword_ids.shape
-
-    # Build LUT
-    max_subword_id = int(subword_ids.max().item())
-    max_chars = max(len(v) for v in subword_id_to_char_ids.values()) if subword_id_to_char_ids else 0
-    if max_chars == 0:
-        return subword_ids.clone()
-    char_expansion = torch.full((max_subword_id + 1, max_chars),
-                                fill_value=pad_id, device=device, dtype=subword_ids.dtype)
-    expansion_len = torch.zeros(max_subword_id + 1, dtype=torch.long, device=device)
-    for k, v in subword_id_to_char_ids.items():
-        if k <= max_subword_id:
-            v_t = torch.tensor(v, device=device, dtype=subword_ids.dtype)
-            char_expansion[k, :v_t.numel()] = v_t
-            expansion_len[k] = v_t.numel()
-
-    # Output with BOS/EOS copied
-    output = torch.full_like(subword_ids, fill_value=pad_id)
-    special_mask = (subword_ids == bos_id) | (subword_ids == eos_id)
-    output[special_mask] = subword_ids[special_mask]
-
-    # Find next EOS
-    pos = torch.arange(T, device=device)
-    bos_mask = (subword_ids == bos_id)
-    eos_mask = (subword_ids == eos_id)
-    eos_pos_tensor = torch.where(eos_mask, pos.unsqueeze(0).expand(B, T),
-                                 torch.full((B, T), T, device=device))
-    next_eos_idx = torch.flip(torch.cummin(torch.flip(eos_pos_tensor, [1]), dim=1).values, [1])
-
-    # Process each BOS span
-    bos_coords = torch.nonzero(bos_mask, as_tuple=False)
-    for b, start in bos_coords:
-        end = next_eos_idx[b, start]
-        if end <= start + 1:
-            continue
-        span_subwords = subword_ids[b, start + 1:end]
-        chars_list = []
-        for s in span_subwords:
-            chars_list.append(char_expansion[s][:expansion_len[s]])
-        if chars_list:
-            # Concatenate chars and truncate to span length
-            chars_flat = torch.cat(chars_list)[:len(span_subwords)]
-            output[b, start + 1:start + 1 + len(chars_flat)] = chars_flat
-
-    return output
-
-
-def subwords_to_chars_(subword_ids: torch.Tensor,
-                                    subword_id_to_char_ids: dict[int, tuple[int, ...]],
-                                    bos_id: int,
-                                    eos_id: int,
-                                    pad_id: int):
-    """
-    Span-wise fast subword->char expansion:
-    - Exact output per span
-    - Handles multiple BOS..EOS spans per batch
-    - Vectorized inside each span
-    """
-    B, T = subword_ids.shape
-    device = subword_ids.device
-
-    # Build LUT
-    max_subword_id = int(subword_ids.max().item())
-    max_chars = max(len(v) for v in subword_id_to_char_ids.values()) if subword_id_to_char_ids else 0
-    if max_chars == 0:
-        return subword_ids.clone()
-
-    char_expansion = torch.full((max_subword_id + 1, max_chars),
-                                fill_value=pad_id, device=device, dtype=subword_ids.dtype)
-    expansion_len = torch.zeros(max_subword_id + 1, dtype=torch.long, device=device)
-    for k, v in subword_id_to_char_ids.items():
-        if k <= max_subword_id:
-            v_t = torch.tensor(v, device=device, dtype=subword_ids.dtype)
-            char_expansion[k, :v_t.numel()] = v_t
-            expansion_len[k] = v_t.numel()
-
-    # Output with BOS/EOS preserved
-    output = torch.full_like(subword_ids, fill_value=pad_id)
-    special_mask = (subword_ids == bos_id) | (subword_ids == eos_id)
-    output[special_mask] = subword_ids[special_mask]
-
-    # Find next EOS for each position
-    pos = torch.arange(T, device=device)
-    bos_mask = (subword_ids == bos_id)
-    eos_mask = (subword_ids == eos_id)
-    eos_pos_tensor = torch.where(eos_mask, pos.unsqueeze(0).expand(B, T),
-                                 torch.full((B, T), T, device=device))
-    next_eos_idx = torch.flip(torch.cummin(torch.flip(eos_pos_tensor, [1]), dim=1).values, [1])
-
-    # Process each BOS span
-    bos_coords = torch.nonzero(bos_mask, as_tuple=False)
-    for b, start in bos_coords:
-        end = next_eos_idx[b, start]
-        if end <= start + 1:
-            continue
-        span_subwords = subword_ids[b, start + 1:end]
-
-        # Vectorized expansion inside span
-        expanded = char_expansion[span_subwords]          # [span_len, max_chars]
-        lengths = expansion_len[span_subwords]            # [span_len]
-
-        # Flatten expanded chars
-        expanded_flat = expanded.view(-1)
-        valid_mask = torch.arange(expanded_flat.size(0), device=device) < lengths.sum()
-        chars_to_place = expanded_flat[valid_mask]
-
-        # Place characters back into output (truncate to span length)
-        n = min(len(chars_to_place), end - (start + 1))
-        output[b, start + 1:start + 1 + n] = chars_to_place[:n]
-
-    return output
-
 
 def subwords_to_chars(subword_ids: torch.Tensor,
                                  subword_id_to_char_ids: dict[int, tuple[int, ...]],
@@ -1459,18 +1299,22 @@ class DuplexEARTTS(LightningModule, HFHubMixin):
             elif L1 > new_len or L2 > new_len:
                 aligned_attention_mask = aligned_attention_mask[:, :, :new_len, :new_len]
 
-        # set the pad token when there is desc as in https://gitlab-master.nvidia.com/jaehyeonk/easy-ar-tts/-/blame/simple-bq/scripts/train_tts_with_rvqvae.py#L69
-        target_codes_aligned = torch.where(
-            desc_mask.unsqueeze(-1),                    # (B, T, 1) for broadcasting
-            torch.full_like(target_codes, self.speech_pad_id),  # fill with pad id
-            target_codes
-        )
+        if self.cfg.get("disable_speech_pad", False):
+            target_codes_aligned = target_codes
+        else:
+            # ToDo: desc_mask is one for the end of the sequence, this is what cause the artifact issue in the end, fix it.
+            # set the pad token when there is desc as in https://gitlab-master.nvidia.com/jaehyeonk/easy-ar-tts/-/blame/simple-bq/scripts/train_tts_with_rvqvae.py#L69
+            target_codes_aligned = torch.where(
+                desc_mask.unsqueeze(-1),                    # (B, T, 1) for broadcasting
+                torch.full_like(target_codes, self.speech_pad_id),  # fill with pad id
+                target_codes
+            )
 
         if self.cfg.get("ignore_audio_prompt_on_loss", False):
             # set audio_mask as non_prompt_mask to avoid the audio prompt in loss computation
             audio_mask = non_prompt_mask
 
-        if self.cfg.get("add_pad_speech_token_in_last_prompt_frame", False):
+        if self.cfg.get("add_pad_speech_token_in_last_prompt_frame", False) and not self.cfg.get("disable_speech_pad", False):
             # set special token in the last audio prompt (it will works as a BOS token)
             pos = non_prompt_mask.float().argmax(dim=1)  # shape: [B]
             row_idx = torch.arange(B, device=self.device)
@@ -2287,12 +2131,13 @@ class DuplexEARTTS(LightningModule, HFHubMixin):
         desc_mask = torch.zeros_like(input_text_tokens)
         desc_mask[:, :desc_tokens_ids.size(-1)] = 1
 
-        # add special tokens on audio codes
-        code = torch.where(
-            desc_mask.unsqueeze(-1).bool(),                    # (B, T, 1) for broadcasting
-            torch.full_like(code, self.speech_pad_id),  # fill with pad id
-            code
-        )
+        if not self.cfg.get("disable_speech_pad", False):
+            # add special tokens on audio codes
+            code = torch.where(
+                desc_mask.unsqueeze(-1).bool(),                    # (B, T, 1) for broadcasting
+                torch.full_like(code, self.speech_pad_id),  # fill with pad id
+                code
+            )
 
         # shift subword_ids
         # subword_ids = F.pad(input_text_tokens[:, 1:], [0, 1], value=current_subword_id)
@@ -2348,7 +2193,7 @@ class DuplexEARTTS(LightningModule, HFHubMixin):
             # set audio_mask as non_prompt_mask to avoid the audio prompt in loss computation
             audio_mask = non_prompt_mask
 
-        if self.cfg.get("add_pad_speech_token_in_last_prompt_frame", False):
+        if self.cfg.get("add_pad_speech_token_in_last_prompt_frame", False) and not self.cfg.get("disable_speech_pad", False):
             # set special token in the last audio prompt (it will works as a BOS token)
             pos = non_prompt_mask.float().argmax(dim=1)  # shape: [B]
             row_idx = torch.arange(B, device=self.device)
