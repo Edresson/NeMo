@@ -1267,6 +1267,7 @@ class DuplexEARTTS(LightningModule, HFHubMixin):
             )
             source_codes = source_codes.transpose(1, 2)  # (B, K, T) -> (B, T, K)
         """
+
         with fp32_precision():
             target_len = target_codes.shape[1]
 
@@ -1905,14 +1906,14 @@ class DuplexEARTTS(LightningModule, HFHubMixin):
                     # resample audio to the asr sampling rate
                     metric_audio_pred = resample(metric_audio_pred, self.target_sample_rate, 16000)
                     metric_audio_pred_lens = (metric_audio_pred_lens / self.target_sample_rate * 16000).to(torch.long)
-
+                    # reshape target audio without prompt
+                    target_audio_no_prompt_16khz = resample(target_audio_no_prompt, self.target_sample_rate, 16000)
+                    target_audio_no_prompt_lens_16khz = (target_audio_no_prompt_lens / self.target_sample_rate * 16000).to(torch.long)
                     if self.cfg.get("use_GT_transcriptions_for_metrics", True):
                         # use target audio transcription for metrics
-                        target_audio = resample(target_audio_no_prompt, self.target_sample_rate, 16000)
-                        target_audio_lens= (target_audio_no_prompt_lens / self.target_sample_rate * 16000).to(torch.long)
                         target_asr_texts = self.asr_bleu.asr.transcribe(
-                            [audio[:alen] for audio, alen in zip(target_audio, target_audio_lens)],
-                            batch_size=target_audio.shape[0],
+                            [audio[:alen] for audio, alen in zip(target_audio_no_prompt_16khz, target_audio_no_prompt_lens_16khz)],
+                            batch_size=target_audio_no_prompt_16khz.shape[0],
                             verbose=False,
                         )
                         metric_text = [asr_hyp.text for asr_hyp in target_asr_texts]
@@ -1932,6 +1933,15 @@ class DuplexEARTTS(LightningModule, HFHubMixin):
                         pred_audio=metric_audio_pred,
                         pred_audio_lens=metric_audio_pred_lens,
                         asr_hyps=asr_hyps,
+                    )
+                    
+                    # add ground truth intelligibility metrics
+                    self.intelligibility.update(
+                        name=name+"_gt",
+                        refs=dataset_batch["target_texts"],
+                        pred_audio=target_audio_no_prompt_16khz,
+                        pred_audio_lens=target_audio_no_prompt_lens_16khz,
+                        asr_hyps=metric_text if self.cfg.get("use_GT_transcriptions_for_metrics", True) else None, # reuse GT transcription
                     )
 
                     self.secs.update(
