@@ -838,7 +838,6 @@ class DuplexS2SExternalSpeechDecoderModel(LightningModule, HFHubMixin):
         )
         gen_text[:, 0] = ans["text_logits"][:, -1].argmax(dim=-1)
 
-
         # Init external Duplex TTS model
         generation_config = None
         guidance_enabled = True

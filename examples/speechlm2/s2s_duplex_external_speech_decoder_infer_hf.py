@@ -33,10 +33,14 @@ def inference(cfg):
     torch.backends.cudnn.allow_tf32 = True
     trainer = Trainer(**resolve_trainer_cfg(cfg.trainer))
     log_dir = exp_manager(trainer, cfg.get("exp_manager", None))
-    OmegaConf.save(cfg, log_dir / "exp_config.yaml")
 
     with trainer.init_module():
         model = DuplexS2SExternalSpeechDecoderModel.from_pretrained(cfg.ckpt_path)
+
+    # update model internal configs
+    model.full_cfg.merge_with(cfg)
+    model.cfg.merge_with(cfg.model)
+    OmegaConf.save(model.full_cfg, log_dir / "exp_config.yaml")
 
     # set validation output path
     model.validation_save_path = os.path.join(cfg.exp_manager.explicit_log_dir, "validation_logs")
