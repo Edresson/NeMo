@@ -402,6 +402,8 @@ class RVQEARTTSConfig(Config):
     use_char_tokenizer: bool = False
     ignore_cas_enc: bool = False
     use_inp_code_aug: bool = False
+    ignore_attn_mask_pos_id_subword_mask: bool = False
+    pretrained_text_name: bool = False
 
     p_uncond: float = 0.1
     label_smoothing: float = 0.01
@@ -551,7 +553,6 @@ def build_vocabs(
     # The padding subword maps to a new character padding ID
     subword_id_to_char_ids[subword_padding_idx] = (len(char_vocab),)
     return subword_id_to_char_ids, char_vocab, subword_padding_idx
-
 
 def _split_ipa_symbols(text: str) -> list[str]:
     """
@@ -1346,18 +1347,24 @@ class RVQEARTTSModel(PreTrainedModel):
         super().__init__(config)
 
         # Backbone module
-        if self.config.backbone_type is None:
-            assert self.config.backbone_model_class is not None and self.config.backbone_config_class is not None
-            backbone_config = getattr(transformers, self.config.backbone_config_class)(
-                **(self.config.backbone_config.to_dict() if self.config.backbone_config else {}),
-            )
-            self.backbone = getattr(transformers, self.config.backbone_model_class)(backbone_config)
+        if self.config.get("pretrained_text_name", None):
+            from nemo.collections.speechlm2.parts.pretrained import load_pretrained_hf
+            llm = load_pretrained_hf(self.config.pretrained_text_name, pretrained_weights=True).train()
+            self.backbone = llm.model  # fetch PretrainedBaseModel from model "ForCausalLM"
+            print("Hereee\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n")
         else:
-            backbone_config = AutoConfig.for_model(
-                self.config.backbone_type,
-                **(self.config.backbone_config.to_dict() if self.config.backbone_config else {}),
-            )
-            self.backbone = AutoModel.from_config(backbone_config)
+            if self.config.backbone_type is None:
+                assert self.config.backbone_model_class is not None and self.config.backbone_config_class is not None
+                backbone_config = getattr(transformers, self.config.backbone_config_class)(
+                    **(self.config.backbone_config.to_dict() if self.config.backbone_config else {}),
+                )
+                self.backbone = getattr(transformers, self.config.backbone_model_class)(backbone_config)
+            else:
+                backbone_config = AutoConfig.for_model(
+                    self.config.backbone_type,
+                    **(self.config.backbone_config.to_dict() if self.config.backbone_config else {}),
+                )
+                self.backbone = AutoModel.from_config(backbone_config)
 
         self.hidden_size = self.backbone.get_input_embeddings().weight.size(-1)
         find_and_delete_module(self.backbone, self.backbone.get_input_embeddings(), "backbone")
@@ -1589,6 +1596,12 @@ class RVQEARTTSModel(PreTrainedModel):
             RVQEARTTSOutput: A dataclass containing losses (for training) or generated outputs
                           and the cache (for inference).
         """
+
+        if self.config.get("ignore_attn_mask_pos_id_subword_mask", False):
+            subword_mask = torch.ones_like(subword_mask).bool()
+            attention_mask = None
+            position_ids = None
+
         # Determine operating mode.
         if training is None:
             training = self.training
