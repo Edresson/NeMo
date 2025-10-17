@@ -836,6 +836,7 @@ class DuplexS2SExternalSpeechDecoderModel(LightningModule, HFHubMixin):
             input_embeds[:, :1],
             cache=cache,
         )
+
         gen_text[:, 0] = ans["text_logits"][:, -1].argmax(dim=-1)
 
         # Init external Duplex TTS model
@@ -878,6 +879,13 @@ class DuplexS2SExternalSpeechDecoderModel(LightningModule, HFHubMixin):
                 ans = self(
                     input_embeds[:, :t + 1],
                 )
+
+            if self.cfg.get("inference_pad_boost", None):
+                ans["text_logits"][:, :, self.text_pad_id] += self.cfg.inference_pad_boost
+            if self.cfg.get("inference_bos_boost", None):
+                ans["text_logits"][:, :, self.text_bos_id] += self.cfg.inference_bos_boost
+            if self.cfg.get("inference_eos_boost", None):
+                ans["text_logits"][:, :, self.text_eos_id] += self.cfg.inference_eos_boost
 
             gen_text[:, t] = ans["text_logits"][:, -1].argmax(dim=-1)
             
