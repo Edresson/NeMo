@@ -78,6 +78,8 @@ from nemo.collections.speechlm2.modules.rvq_ear_tts_model import RVQEARTTSModel,
 from nemo.collections.speechlm2.modules.rvq_ear_tts_vae import RVQVAEModel
 from nemo.collections.speechlm2.data.duplex_ear_tts_dataset import normalize_text_fn
 
+from nemo.collections.speechlm2.modules.decoder_only_magpietts_model import DecoderOnlyMagpieTTS
+
 def generate_multiturn_speaking_mask(input_ids: torch.Tensor, bos_token_id: int = 0, eos_token_id: int = 1):
     """
     Efficient, batched speaking mask generator that marks 1 between <bos> and <eos> pairs.
@@ -242,28 +244,29 @@ def setup_audio_codec(self):
         setup_audio_codec_nemo(self)
         if not isinstance(self.audio_codec, NeMoGroupedCodec):
             self.audio_codec = NeMoGroupedCodec(self.audio_codec, frame_stacking_factor=1)
+        
+        if not self.cfg.get("use_magpietts_backbone", False):
+            # get FSQ embeddings
+            num_codebooks = self.cfg.tts_config.num_quantizers
+            codebook_size = self.cfg.tts_config.codebook_size
+            # Create tensor of indices: [num_codebooks, 1, codebook_size]
+            indices = torch.arange(codebook_size, device=self.device)[None, None, :].repeat(num_codebooks, 1, 1)
 
-        # get FSQ embeddings
-        num_codebooks = self.cfg.tts_config.num_quantizers
-        codebook_size = self.cfg.tts_config.codebook_size
-        # Create tensor of indices: [num_codebooks, 1, codebook_size]
-        indices = torch.arange(codebook_size, device=self.device)[None, None, :].repeat(num_codebooks, 1, 1)
+            # Decode embeddings for all possible indices
+            all_embeddings = self.audio_codec.codec.vector_quantizer.decode(indices=indices, input_len=None)
 
-        # Decode embeddings for all possible indices
-        all_embeddings = self.audio_codec.codec.vector_quantizer.decode(indices=indices, input_len=None)
+            emb_dim_total = all_embeddings.shape[1]
+            emb_dim_per_group = emb_dim_total // num_codebooks
 
-        emb_dim_total = all_embeddings.shape[1]
-        emb_dim_per_group = emb_dim_total // num_codebooks
-
-        # [1, 52, 2016] → [num_codebooks, emb_dim_per_group, codebook_size]
-        all_embeddings = (
-            all_embeddings.squeeze(0)  # [52, 2016]
-            .view(num_codebooks, emb_dim_per_group, codebook_size)
-            .permute(0, 2, 1)  # [num_codebooks, codebook_size, emb_dim_per_group]
-        )
-        assert callable(self.tts_model.set_rvq_embs)
-        self.tts_model.set_rvq_embs(all_embeddings)
-        self.tts_model.rvq_embs = self.tts_model.rvq_embs.to(next(self.tts_model.parameters()).dtype)
+            # [1, 52, 2016] → [num_codebooks, emb_dim_per_group, codebook_size]
+            all_embeddings = (
+                all_embeddings.squeeze(0)  # [52, 2016]
+                .view(num_codebooks, emb_dim_per_group, codebook_size)
+                .permute(0, 2, 1)  # [num_codebooks, codebook_size, emb_dim_per_group]
+            )
+            assert callable(self.tts_model.set_rvq_embs)
+            self.tts_model.set_rvq_embs(all_embeddings)
+            self.tts_model.rvq_embs = self.tts_model.rvq_embs.to(next(self.tts_model.parameters()).dtype)
 
         # compute target fps
         self.target_fps = self.target_sample_rate / self.audio_codec.samples_per_frame
@@ -276,37 +279,39 @@ def setup_audio_codec(self):
         for p in self.audio_codec.parameters():
             p.requires_grad = False
 
-        num_codebooks = self.cfg.tts_config.num_quantizers
-        codebook_size = self.cfg.tts_config.codebook_size
-        all_embeddings = []
-        # get semantic embeddings
-        svq = self.audio_codec.codec.quantizer.semantic_residual_vector_quantizer
-        for i in range(svq.num_quantizers):
-            emb = svq.layers[i].codebook.embed
-            all_embeddings.append(emb)
+        if not self.cfg.get("use_magpietts_backbone", False):
+            num_codebooks = self.cfg.tts_config.num_quantizers
+            codebook_size = self.cfg.tts_config.codebook_size
+            all_embeddings = []
+            # get semantic embeddings
+            svq = self.audio_codec.codec.quantizer.semantic_residual_vector_quantizer
+            for i in range(svq.num_quantizers):
+                emb = svq.layers[i].codebook.embed
+                all_embeddings.append(emb)
 
-        # get acoustic embeddings
-        avq = self.audio_codec.codec.quantizer.acoustic_residual_vector_quantizer 
-        for i in range(avq.num_quantizers):
-            emb = avq.layers[i].codebook.embed
-            all_embeddings.append(emb)
+            # get acoustic embeddings
+            avq = self.audio_codec.codec.quantizer.acoustic_residual_vector_quantizer 
+            for i in range(avq.num_quantizers):
+                emb = avq.layers[i].codebook.embed
+                all_embeddings.append(emb)
 
-        all_embeddings = torch.stack(all_embeddings, dim=0).detach()
-        assert callable(self.tts_model.set_rvq_embs)
-        self.tts_model.set_rvq_embs(all_embeddings)
-        self.tts_model.rvq_embs = self.tts_model.rvq_embs.to(next(self.tts_model.parameters()).dtype)
+            all_embeddings = torch.stack(all_embeddings, dim=0).detach()
+            assert callable(self.tts_model.set_rvq_embs)
+            self.tts_model.set_rvq_embs(all_embeddings)
+            self.tts_model.rvq_embs = self.tts_model.rvq_embs.to(next(self.tts_model.parameters()).dtype)
 
         # compute target fps
         self.target_fps = self.target_sample_rate / self.audio_codec.samples_per_frame
         self.target_samples_per_frame = self.audio_codec.samples_per_frame
     else:
         setup_rvq_audio_codec(self)
-        assert callable(self.tts_model.set_rvq_embs)
-        self.tts_model.set_rvq_embs(torch.stack([x.detach() for x in self.audio_codec.prvq.mus_list], 0))
-        self.tts_model.rvq_embs = self.tts_model.rvq_embs.to(next(self.tts_model.parameters()).dtype)
-        # compute target fps
-        self.target_fps = self.target_sample_rate / self.audio_codec.config.wav_to_token_ratio
-        self.target_samples_per_frame = self.audio_codec.config.wav_to_token_ratio
+        if not self.cfg.get("use_magpietts_backbone", False):
+            assert callable(self.tts_model.set_rvq_embs)
+            self.tts_model.set_rvq_embs(torch.stack([x.detach() for x in self.audio_codec.prvq.mus_list], 0))
+            self.tts_model.rvq_embs = self.tts_model.rvq_embs.to(next(self.tts_model.parameters()).dtype)
+            # compute target fps
+            self.target_fps = self.target_sample_rate / self.audio_codec.config.wav_to_token_ratio
+            self.target_samples_per_frame = self.audio_codec.config.wav_to_token_ratio
 
 from nemo.collections.speechlm2.modules.asr_speech_tokenizer.modeling_whisper import WhisperVQEncoder
 from transformers import WhisperFeatureExtractor
@@ -1083,11 +1088,14 @@ class DuplexEARTTS(LightningModule, HFHubMixin):
 
     def _load_tts_model(self, cfg) -> nn.Module:
         """Load TTS model for RVQ-EAR-TTS."""
-        if self.cfg.get("pretrained_tts_model", None):
-            self.tts_model = RVQEARTTSModel.from_pretrained(cfg.pretrained_tts_model, RVQEARTTSConfig(**cfg.tts_config), strict=False)
+        if self.cfg.get("use_magpietts_backbone", False):
+            self.tts_model = DecoderOnlyMagpieTTS(cfg.tts_config)
         else:
-            # start the model from scratch
-            self.tts_model = RVQEARTTSModel(RVQEARTTSConfig(**cfg.tts_config))
+            if self.cfg.get("pretrained_tts_model", None):
+                self.tts_model = RVQEARTTSModel.from_pretrained(cfg.pretrained_tts_model, RVQEARTTSConfig(**cfg.tts_config), strict=False)
+            else:
+                # start the model from scratch
+                self.tts_model = RVQEARTTSModel(RVQEARTTSConfig(**cfg.tts_config))
 
         setup_audio_codec(self)
 
@@ -1581,10 +1589,15 @@ class DuplexEARTTS(LightningModule, HFHubMixin):
             non_prompt_mask=inputs["non_prompt_mask"],
             asr_speech_tokens_emb=inputs["asr_speech_tokens_emb"],
         )
-        loss_dict = {"lm_loss": tts_output.lm_loss, "c_loss": tts_output.c_loss, "k_loss": tts_output.k_loss}
+        if self.cfg.get("use_magpietts_backbone", False):
+            loss_dict = tts_output["loss_dict"]
+            backbone_out = tts_output["backbone_out"]
+        else:
+            loss_dict = {"lm_loss": tts_output.lm_loss, "c_loss": tts_output.c_loss, "k_loss": tts_output.k_loss}
+            backbone_out = tts_output.hidden_states
         loss = sum(loss_dict.values())
         if self.cfg.get("use_char_ids_loss", None):
-            char_logits = self.char_head(tts_output.hidden_states)
+            char_logits = self.char_head(backbone_out)
             # decode bpe tokens into chars tokens
             with torch.no_grad():
                 subword_ids_no_prompt = torch.where(~inputs["subword_mask"], self.text_pad_id, inputs["subword_ids"])
@@ -1612,7 +1625,7 @@ class DuplexEARTTS(LightningModule, HFHubMixin):
             if drop_semantic_loss or self.cfg.get("only_semantic_to_speech", False):
                 loss_dict["asr_tok_loss"] = 0.0
             else:
-                asr_tok_logits = self.asr_speech_tokens_head(tts_output.hidden_states)
+                asr_tok_logits = self.asr_speech_tokens_head(backbone_out)
                 asr_tok_loss = (
                     F.cross_entropy(
                         asr_tok_logits.transpose(1, 2),
@@ -1695,8 +1708,9 @@ class DuplexEARTTS(LightningModule, HFHubMixin):
             guidance_enabled=guidance_enabled,
             asr_speech_tokens_emb=inputs["asr_speech_tokens_emb"],
         )
-        tf_audio_codes_pred = tts_output.codes.squeeze(2)
+        tf_audio_codes_pred = tts_output["codes"].squeeze(2)
 
+        print(self.codec_silence_tokens.shape, tf_audio_codes_pred.shape)
         # decode audio
         tf_audio_codes_pred = replace_control_speech_codes(tf_audio_codes_pred, self._control_codes, self.codec_silence_tokens)
         with fp32_precision(), torch.no_grad():
@@ -1824,6 +1838,7 @@ class DuplexEARTTS(LightningModule, HFHubMixin):
                 results = {}
                 inputs = self.prepare_inputs(dataset_batch)
                 # cut it on prompt
+
                 init_inputs = {
                     "code": inputs["code"],
                     "audio_mask": inputs["audio_mask"],
@@ -1881,6 +1896,8 @@ class DuplexEARTTS(LightningModule, HFHubMixin):
                 # remove prompt padding from the user audio as autoregressive inference does not return the prompt
                 dataset_batch["source_audio"] = dataset_batch["source_audio"][:, -int(next_subword_ids.size(-1)*self.source_samples_per_frame):]
 
+                results["audio_tf"], results["audio_tf_len"] = self.get_teacher_force_inference_audio(dataset_batch)
+
                 results["audio"], results["audio_len"] = self.offline_inference(
                     speaker_audio=dataset_batch["speaker_reference_audio"],
                     speaker_audio_lens=dataset_batch["speaker_reference_audio_lens"],
@@ -1890,7 +1907,6 @@ class DuplexEARTTS(LightningModule, HFHubMixin):
                     init_inputs=init_inputs,
                 )
 
-                results["audio_tf"], results["audio_tf_len"] = self.get_teacher_force_inference_audio(dataset_batch)
                 # clean prompt from the audio
                 results["audio_tf"] = results["audio_tf"][:, -int(next_subword_ids.size(-1)*self.target_samples_per_frame):]
                 # remove prompt from target audio
@@ -1984,14 +2000,6 @@ class DuplexEARTTS(LightningModule, HFHubMixin):
 
     def test_step(self, *args, **kwargs):
         return self.validation_step(*args, **kwargs)
-
-    def _get_text_pad_embedding(self) -> torch.Tensor:
-        """
-        Remove the audio codec embedding for the beginning of AR decoding.
-        """
-        text_bos = torch.full((1,), fill_value=self.text_pad_id, device=self.device)
-        input_embeds = self.embed_text_tokens(text_bos)
-        return text_bos, input_embeds
 
     def get_system_prompt(self, system_prompt=None, user_prompt=None):
         messages = []
@@ -2282,14 +2290,14 @@ class DuplexEARTTS(LightningModule, HFHubMixin):
             # warmup the model and generate the very first audio token
             outputs = self.tts_model(**init_inputs)
 
-        if self.cfg.get("inference_skip_first_code_prediction_on_init", True):
+        if self.cfg.get("inference_skip_first_code_prediction_on_init", True) or not self.cfg.get("use_magpietts_backbone", False):
             # use the last token on init, because we are shifthing it in the model forward, so we dont really need to compute it
             code = init_inputs["code"][:, -1:]
         else:
             code, _, _ = self.tts_model.generate_step(outputs.hidden_states[:, -1:], **generation_config)
 
-        past_key_values = outputs.past_key_values
-
+        past_key_values = outputs["past_key_values"]
+        print("past_key_values", past_key_values)
         # get current asr speech token
         if self.cfg.get("use_asr_speech_tokens", False):
             if self.cfg.get("only_semantic_to_speech", False):
@@ -2388,8 +2396,8 @@ class DuplexEARTTS(LightningModule, HFHubMixin):
 
             outputs = self.tts_model(**inputs)
 
-            code = outputs.codes
-            past_key_values = outputs.past_key_values
+            code = outputs["codes"]
+            past_key_values = outputs["past_key_values"]
             # ToDo: check why it is -1
             gen_audio_codes[:, i-1] = code.squeeze(1)
 
@@ -2511,16 +2519,41 @@ class DuplexEARTTS(LightningModule, HFHubMixin):
 
                 parallelize_module(transformer_block, tp_mesh, plan)
 
-            for m in (self.tts_model.mog_head, self.tts_model.embed_subword, self.tts_model.embed_context, self.tts_model.embed_code, self.tts_model.null_emb, self.tts_model.bos_emb, self.tts_model.lm_head):
-                parallelize_module(
-                    m,
-                    tp_mesh,
-                    ColwiseParallel(
-                        input_layouts=Shard(1),
-                        output_layouts=Shard(-1),
-                        use_local_output=False,
-                    ),
-                )
+            if self.cfg.get("use_magpietts_backbone", False):
+                for m in (self.tts_model.final_proj, self.tts_model.audio_embeddings):
+                    parallelize_module(
+                        m,
+                        tp_mesh,
+                        ColwiseParallel(
+                            input_layouts=Shard(1),
+                            output_layouts=Shard(-1),
+                            use_local_output=False,
+                        ),
+                    )
+
+                if self.tts_model.use_local_transformer:
+                    for m in (self.tts_model.local_transformer_in_projection, self.tts_model.local_transformer):
+                        parallelize_module(
+                            m,
+                            tp_mesh,
+                            ColwiseParallel(
+                                input_layouts=Shard(1),
+                                output_layouts=Shard(-1),
+                                use_local_output=False,
+                            ),
+                        )
+
+            else:
+                for m in (self.tts_model.mog_head, self.tts_model.embed_subword, self.tts_model.embed_context, self.tts_model.embed_code, self.tts_model.null_emb, self.tts_model.bos_emb, self.tts_model.lm_head):
+                    parallelize_module(
+                        m,
+                        tp_mesh,
+                        ColwiseParallel(
+                            input_layouts=Shard(1),
+                            output_layouts=Shard(-1),
+                            use_local_output=False,
+                        ),
+                    )
 
         if (dp_mesh := device_mesh["data_parallel"]).size() > 1:
             assert dp_mesh.ndim == 1
@@ -2530,15 +2563,24 @@ class DuplexEARTTS(LightningModule, HFHubMixin):
 
             for idx, layer in enumerate(llm.layers):
                 llm.layers[idx] = fully_shard(layer, **fsdp_config)
-            self.embed_text_tokens = fully_shard(self.embed_text_tokens, **fsdp_config)
-            # self.tts_model = fully_shard(self.tts_model, **fsdp_config)
-            self.tts_model.mog_head = fully_shard(self.tts_model.mog_head, **fsdp_config)
-            self.tts_model.embed_subword = fully_shard(self.tts_model.embed_subword, **fsdp_config)
-            self.tts_model.embed_context = fully_shard(self.tts_model.embed_context, **fsdp_config)
-            self.tts_model.embed_code = fully_shard(self.tts_model.embed_code, **fsdp_config)
-            self.tts_model.null_emb = fully_shard(self.tts_model.null_emb, **fsdp_config)
-            self.tts_model.bos_emb = fully_shard(self.tts_model.bos_emb, **fsdp_config)
-            self.tts_model.lm_head = fully_shard(self.tts_model.lm_head, **fsdp_config)
+            if self.cfg.get("use_magpietts_backbone", False):
+                self.tts_model.final_proj = fully_shard(self.tts_model.final_proj, **fsdp_config)
+            for idx in range(self.tts_model._num_codebooks):
+                self.tts_model.audio_embeddings[idx] = fully_shard(self.tts_model.audio_embeddings[idx], **fsdp_config)
+                
+            if self.tts_model.use_local_transformer:
+                self.tts_model.local_transformer = fully_shard(self.tts_model.local_transformer, **fsdp_config)
+                self.tts_model.local_transformer_in_projection = fully_shard(self.tts_model.local_transformer_in_projection, **fsdp_config)
+            else:
+                self.embed_text_tokens = fully_shard(self.embed_text_tokens, **fsdp_config)
+                # self.tts_model = fully_shard(self.tts_model, **fsdp_config)
+                self.tts_model.mog_head = fully_shard(self.tts_model.mog_head, **fsdp_config)
+                self.tts_model.embed_subword = fully_shard(self.tts_model.embed_subword, **fsdp_config)
+                self.tts_model.embed_context = fully_shard(self.tts_model.embed_context, **fsdp_config)
+                self.tts_model.embed_code = fully_shard(self.tts_model.embed_code, **fsdp_config)
+                self.tts_model.null_emb = fully_shard(self.tts_model.null_emb, **fsdp_config)
+                self.tts_model.bos_emb = fully_shard(self.tts_model.bos_emb, **fsdp_config)
+                self.tts_model.lm_head = fully_shard(self.tts_model.lm_head, **fsdp_config)
 
     def load_state_dict(self, state_dict, strict: bool = True):
         try:
