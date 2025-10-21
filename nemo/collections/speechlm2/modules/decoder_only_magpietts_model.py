@@ -431,50 +431,30 @@ class DecoderOnlyMagpieTTS(NeuralModule):
 
         # if use maskgit local transformer
         if self.use_local_transformer:
-            if self.local_transformer_type == "cfm":
-                self.codec_feature_dim = self._num_codebooks * 4
-                # Instance new CFM based encoder
-                decoder_params = {"channels": [256, 256], "dropout": 0.05, "attention_head_dim": 64, "n_blocks": 4, "num_mid_blocks": 2, "num_heads": 2, "act_fn": "snakebeta", "disable_down_up": True}
-                cfm_params = SimpleNamespace(**{"solver": "euler", "sigma_min": 1e-4})
+            local_transformer_hidden_dim = self.config.get('local_transformer_hidden_dim', 768)
+            self.local_transformer_mask_token_id = self.speech_vocab_size - 1# local transformer mask token
 
-                # projection from model backbone to local transformer
-                if self.codec_feature_dim != self.backbone.config.hidden_size:
-                    self.local_transformer_in_projection = nn.Linear(self.backbone.config.hidden_size, self.codec_feature_dim)
-                else:
-                    self.local_transformer_in_projection = nn.Identity()
-
-                self.local_transformer = MatchaTTSCFM(
-                    in_channels=2 * self.codec_feature_dim,
-                    out_channel=self.codec_feature_dim,
-                    cfm_params=cfm_params,
-                    decoder_params=decoder_params,
-                    spk_emb_dim=0,
-                )
+            # projection from model backbone to local transformer
+            if local_transformer_hidden_dim != self.backbone.config.hidden_size:
+                self.local_transformer_in_projection = nn.Linear(self.backbone.config.hidden_size, local_transformer_hidden_dim)
             else:
-                local_transformer_hidden_dim = self.config.get('local_transformer_hidden_dim', 768)
-                self.local_transformer_mask_token_id = self.speech_vocab_size - 1# local transformer mask token
+                self.local_transformer_in_projection = nn.Identity()
 
-                # projection from model backbone to local transformer
-                if local_transformer_hidden_dim != self.backbone.config.hidden_size:
-                    self.local_transformer_in_projection = nn.Linear(self.backbone.config.hidden_size, local_transformer_hidden_dim)
-                else:
-                    self.local_transformer_in_projection = nn.Identity()
-
-                self.local_transformer = transformer_2501.Transformer(
-                    n_layers=self.config.get('local_transformer_n_layers', 4),
-                    d_model=local_transformer_hidden_dim,
-                    d_ffn=local_transformer_hidden_dim*4,
-                    sa_n_heads=self.config.get('local_transformer_n_heads', 12),
-                    kernel_size=1,
-                    is_causal=True if self.local_transformer_type == "ar" else False,
-                    max_length_causal_mask=self.downsampling_factor * self._num_codebooks+2,
-                    use_learnable_pos_emb=True,
-                )
-                local_transformer_out_projections = []
-                for _ in range(self._num_codebooks * self.downsampling_factor):
-                    # Have a separate projection layer for each codebook, to distinguish between them
-                    local_transformer_out_projections.append(nn.Linear(local_transformer_hidden_dim, self.speech_vocab_size))
-                self.local_transformer_out_projections = nn.ModuleList(local_transformer_out_projections)
+            self.local_transformer = transformer_2501.Transformer(
+                n_layers=self.config.get('local_transformer_n_layers', 4),
+                d_model=local_transformer_hidden_dim,
+                d_ffn=local_transformer_hidden_dim*4,
+                sa_n_heads=self.config.get('local_transformer_n_heads', 12),
+                kernel_size=1,
+                is_causal=True if self.local_transformer_type == "ar" else False,
+                max_length_causal_mask=self.downsampling_factor * self._num_codebooks+2,
+                use_learnable_pos_emb=True,
+            )
+            local_transformer_out_projections = []
+            for _ in range(self._num_codebooks * self.downsampling_factor):
+                # Have a separate projection layer for each codebook, to distinguish between them
+                local_transformer_out_projections.append(nn.Linear(local_transformer_hidden_dim, self.speech_vocab_size))
+            self.local_transformer_out_projections = nn.ModuleList(local_transformer_out_projections)
 
         # cached for quicker audio decoding
         self._use_fsdp = False
@@ -569,8 +549,10 @@ class DecoderOnlyMagpieTTS(NeuralModule):
                 (2) speech_generation cache relys on reset_input_and_kv_cache function.
         """
         input_embeds = self.cas_encoder(subword_ids, subword_mask=subword_mask)  # (B, L, E)
+
         # shift input audio tokens by 1
         input_audio_tokens = F.pad(code[:, :-1], [0, 0, 1, 0], value=self.speech_pad_id)
+
         # get embedding
         input_audio_emb = self.embed_audio_tokens(
             input_audio_tokens
@@ -609,7 +591,7 @@ class DecoderOnlyMagpieTTS(NeuralModule):
         if audio_mask is not None and not self.training and teacher_forcing_inference:
             # local transformer
             local_transformer_logits = None
-            if self.use_local_transformer and self.local_transformer_type != "cfm":
+            if self.use_local_transformer:
                 if self.local_transformer_type == "ar":
                     # autoregressive
                     local_transformer_logits = self.compute_local_transformer_logits(out.last_hidden_state, code, targets_offset_by_one=False)
@@ -624,7 +606,7 @@ class DecoderOnlyMagpieTTS(NeuralModule):
                 lengths = torch.tensor([code.shape[1]] * code.shape[0], device=self.device)
                 codes = self.logits_to_audio_codes(out.last_hidden_state, lengths).transpose(1, 2)
             return {"codes": codes}
-        
+
         # training time compute losses
         if audio_mask is not None:
             codebook_loss, loss_mask = self.compute_loss(logits, code, loss_mask=audio_mask)
@@ -635,18 +617,6 @@ class DecoderOnlyMagpieTTS(NeuralModule):
                     # autoregressive
                     local_transformer_logits = self.compute_local_transformer_logits(out.last_hidden_state, code, targets_offset_by_one=False)
                     local_transformer_loss, _ = self.compute_loss(local_transformer_logits, code, loss_mask=audio_mask)
-                elif self.local_transformer_type == "cfm":
-                    # move time dimention to batch
-                    encoded = out.last_hidden_state.reshape(-1, out.last_hidden_state.size(-1)).unsqueeze(1)
-                    # remove special tokens from labels
-                    audio_labels = replace_control_speech_codes(code, self._control_codes).transpose(1, 2)
-                    # get codec latent from audio tokens
-                    codec_latent = self.audio_codec.dequantize(audio_labels, inputs["output_lens"]).detach().transpose(1, 2)
-                    # move time dimention to batch
-                    codec_latent = codec_latent.to(encoded.dtype).reshape(-1, codec_latent.size(-1)).unsqueeze(-1)
-                    mask = inputs["audio_mask"].reshape(codec_latent.size(0)).unsqueeze(1).unsqueeze(-1)
-                    encoded = self.local_transformer_in_projection(encoded).transpose(1, 2)
-                    local_transformer_loss, _  = self.local_transformer.compute_loss(x1=codec_latent, mask=mask, mu=encoded, spks=None)
                 else:
                     # randomly replace some positions with MASK_TOKEN
                     audio_codes_masked, mask_tokens_mask = self.maskgit_apply_random_mask(code)
@@ -669,7 +639,7 @@ class DecoderOnlyMagpieTTS(NeuralModule):
             uncond_logits = logits[batch_size:]
             logits = (1 - self.config_scale) * uncond_logits + self.config_scale * cond_logits
 
-        if self.use_local_transformer and self.local_transformer_type != "cfm":
+        if self.use_local_transformer:
             codes = self.local_transformer_sample_codes_from_logits(out.last_hidden_state[:, -1], temperature=self.config.get('temperature', 0.7), topk=self.config.get('topk', 80)) # (B, num_codebooks)
         else:
             codes = self.sample_codes_from_logits(logits[:, -1], temperature=self.config.get('temperature', 0.7), topk=self.config.get('topk', 80)) # (B, num_codebooks)

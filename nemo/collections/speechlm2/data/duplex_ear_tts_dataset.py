@@ -176,7 +176,7 @@ class DuplexEARTTSDataset(torch.utils.data.Dataset):
         input_roles: list[str] = None,
         output_roles: list[str] = None,
         add_description: bool = True,
-        p_drop_description: float = 0.1,
+        p_drop_description: float = 0.0,
         add_text_bos_and_eos_in_each_turn: bool = False,
         add_audio_prompt_after_description: bool = False,
         audio_prompt_duration: float = 3.0,
@@ -196,7 +196,7 @@ class DuplexEARTTSDataset(torch.utils.data.Dataset):
         self.add_audio_prompt_after_description = add_audio_prompt_after_description
         self.audio_prompt_duration = audio_prompt_duration
         self.num_delay_speech_tokens = num_delay_speech_tokens
-        
+
         assert tokenizer.bos is not None, "BOS support in the tokenizer is required for S2S models."
         assert tokenizer.eos is not None, "EOS support in the tokenizer is required for S2S models."
 
