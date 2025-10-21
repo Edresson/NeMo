@@ -179,7 +179,7 @@ class MimiCodec(NeuralModule):
         audio = audio.squeeze(1)
         with fp32_precision():
             # make the audio divisible by frame rate and also by self.frame_stacking_factor with extra frames of 1 to avoid issues because we are removing a audio frame to shift target and input for TF
-            audio, audio_len = self.pad_audio_to_factor(audio, audio_len, self.samples_per_frame, extra_frames=1)
+            audio, audio_len = self.pad_audio_to_factor(audio, audio_len, self.samples_per_frame, extra_frames=0)
             # explicitly encode then decode the audio inputs
             encoder_outputs = self.codec.encode(audio.unsqueeze(1).to(self.device), num_quantizers=self.num_codebooks)
             codes = encoder_outputs.audio_codes
@@ -244,7 +244,7 @@ def setup_audio_codec(self):
         setup_audio_codec_nemo(self)
         if not isinstance(self.audio_codec, NeMoGroupedCodec):
             self.audio_codec = NeMoGroupedCodec(self.audio_codec, frame_stacking_factor=1)
-        
+
         if not self.cfg.get("use_magpietts_backbone", False):
             # get FSQ embeddings
             num_codebooks = self.cfg.tts_config.num_quantizers
@@ -781,7 +781,7 @@ class NeMoGroupedCodec(NeuralModule):
         audio = audio.squeeze(1)
         with fp32_precision():
             # make the audio divisible by frame rate and also by self.frame_stacking_factor with extra frames of 1 to avoid issues because we are removing a audio frame to shift target and input for TF
-            audio, audio_len = self.pad_audio_to_factor(audio, audio_len, self.samples_per_frame, extra_frames=1)
+            audio, audio_len = self.pad_audio_to_factor(audio, audio_len, self.samples_per_frame, extra_frames=0)
             # encodes audio using the codec
             tokens, tokens_len = self.codec.encode(audio=audio, audio_len=audio_len)  # B, C, T
             tokens = tokens.transpose(1, 2)  # → B, T, C
@@ -1710,7 +1710,6 @@ class DuplexEARTTS(LightningModule, HFHubMixin):
         )
         tf_audio_codes_pred = tts_output["codes"].squeeze(2)
 
-        print(self.codec_silence_tokens.shape, tf_audio_codes_pred.shape)
         # decode audio
         tf_audio_codes_pred = replace_control_speech_codes(tf_audio_codes_pred, self._control_codes, self.codec_silence_tokens)
         with fp32_precision(), torch.no_grad():
@@ -2149,6 +2148,7 @@ class DuplexEARTTS(LightningModule, HFHubMixin):
         desc_mask = torch.zeros_like(input_text_tokens)
         desc_mask[:, :desc_tokens_ids.size(-1)] = 1
 
+
         if not self.cfg.get("disable_speech_pad", False):
             # add special tokens on audio codes
             code = torch.where(
@@ -2265,6 +2265,7 @@ class DuplexEARTTS(LightningModule, HFHubMixin):
 
         # init_inputs, code, past_key_values = self.init_model_for_ar_inference(speaker_audio=speaker_audio, speaker_audio_lens=speaker_audio_lens, system_prompt=system_prompt, user_prompt=user_prompt, guidance_enabled=guidance_enabled, generation_config=generation_config)
 
+        # ToDo: verify why codes differ from dataloader init_inputs when using nanocodec
         if init_inputs is None:
             init_inputs = self.get_init_inputs(speaker_audio, speaker_audio_lens, system_prompt=system_prompt, user_prompt=user_prompt)
         # compare_dicts(init_inputs_fn, init_inputs)
@@ -2297,7 +2298,7 @@ class DuplexEARTTS(LightningModule, HFHubMixin):
             code, _, _ = self.tts_model.generate_step(outputs.hidden_states[:, -1:], **generation_config)
 
         past_key_values = outputs["past_key_values"]
-        print("past_key_values", past_key_values)
+
         # get current asr speech token
         if self.cfg.get("use_asr_speech_tokens", False):
             if self.cfg.get("only_semantic_to_speech", False):

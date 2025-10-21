@@ -391,7 +391,7 @@ class DecoderOnlyMagpieTTS(NeuralModule):
         self._codebook_size = self.config.get('codebook_size', 2016)
 
         # Load ForCausalLM
-        llm = load_pretrained_hf(self.config.pretrained_llm, pretrained_weights=self.config.get("pretrained_weights", True)).train()
+        llm = load_pretrained_hf(self.config.pretrained_backbone_llm, pretrained_weights=self.config.get("pretrained_weights", True)).train()
         self.backbone = llm.model  # fetch PretrainedBaseModel from model "ForCausalLM"
 
         # Note: we have to "move out" the token embedding outside of LLM to avoid
@@ -412,7 +412,7 @@ class DecoderOnlyMagpieTTS(NeuralModule):
         self.cross_entropy_loss = nn.CrossEntropyLoss(reduction='none')
 
         # use BPE char aware tokenizer
-        self.tokenizer = AutoTokenizer(self.config.pretrained_tokenizer, use_fast=True)
+        self.tokenizer = AutoTokenizer(self.config.pretrained_tokenizer_name, use_fast=True)
         llm_tokenizer_vocab_items = self.tokenizer.vocab
         # if vocab is a dict it already has the subword and token id, if not, get it from the tokenizer
         if isinstance(llm_tokenizer_vocab_items, dict):
