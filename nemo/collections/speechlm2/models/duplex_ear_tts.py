@@ -1421,13 +1421,44 @@ class DuplexEARTTS(LightningModule, HFHubMixin):
                 desc_mask = desc_mask[:, :-remainder]
                 subword_ids = subword_ids[:, :-remainder]
                 subword_mask = subword_mask[:, :-remainder]
-    
+
+        
+        if self.cfg.get("use_seq_mask_as_attn_and_subword_ids_mask", False):
+            seq_mask = get_mask_from_lengths(target_codes_lens)
+            # make sure seq_mask is in right shape
+            target_len = audio_mask.size(1)
+            seq_mask = pad_or_truncate(seq_mask, pad_value=0)
+            aligned_attention_mask = seq_mask.clone()
+            subword_mask = seq_mask.clone()
 
         # debug samples:
         if (
             self.cfg.get("debug_dataloader_audios_path", None)
             and self.training
         ):
+
+            def count_leading_silence_tokens(tensor: torch.Tensor, silence_token: int = 0) -> int:
+                """
+                Count the number of consecutive silence tokens at the beginning of a 1D tensor.
+
+                Args:
+                    tensor (torch.Tensor): 1D tensor of tokens.
+                    silence_token (int): The token considered as silence (default: 0).
+
+                Returns:
+                    int: Number of consecutive silence tokens at the beginning.
+                """
+                if tensor.ndim != 1:
+                    raise ValueError("Input tensor must be 1D.")
+
+                count = 0
+                for token in tensor:
+                    if token.item() == silence_token:
+                        count += 1
+                    else:
+                        break
+                return count
+
             def write_wave(one_audio_signal, file_name, sr=None):
                 import numpy as np
                 import soundfile as sf
@@ -1521,6 +1552,23 @@ class DuplexEARTTS(LightningModule, HFHubMixin):
             # Shape: [B]
             num_eos_tokens = (text_labels.unsqueeze(-1) == self.text_eos_id).flatten(1, 2).sum(-1)
             print("Num eos:", num_eos_tokens, "num bos:", num_bos_tokens)
+
+            batch_idx = -1
+            positions = (text_labels[batch_idx] == self.text_bos_id).nonzero(as_tuple=True)[0]
+            first_pos = positions[0].item() if len(positions) > 0 else None
+
+            print(
+                "First BOS is in:", first_pos, "for batch idx:", batch_idx
+            )
+
+            batch_idx = -1
+            positions = (audio_mask[batch_idx] == 1).nonzero(as_tuple=True)[0]
+            first_audio_mask = positions[0].item() if len(positions) > 0 else None
+
+            print("Last EOS in text (for TTS data it is the end of prompt):", (text_labels[batch_idx] == self.text_eos_id).nonzero(as_tuple=True)[0][-1].item())
+            print("First one in audio mask:", first_audio_mask)
+            print("First one in subword_mask:", (subword_mask[batch_idx] == 1).nonzero(as_tuple=True)[0][0].item())
+            
 
             print(batch["formatter"])
             if target_codes_aligned_.shape[0] > 1:

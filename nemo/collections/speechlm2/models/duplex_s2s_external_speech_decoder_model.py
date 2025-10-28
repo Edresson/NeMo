@@ -881,7 +881,7 @@ class DuplexS2SExternalSpeechDecoderModel(LightningModule, HFHubMixin):
                 )
 
             gen_text[:, t] = ans["text_logits"][:, -1].argmax(dim=-1)
-            
+
             # do inference on external TTS model
             # current subword id is always seem
             current_subword_id = gen_text[:, t].unsqueeze(-1)

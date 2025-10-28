@@ -404,6 +404,8 @@ class RVQEARTTSConfig(Config):
     use_inp_code_aug: bool = False
     ignore_attn_mask_pos_id_subword_mask: bool = False
     pretrained_text_name: bool = False
+    use_bf16_safe_mog_head: bool = False
+    use_fp32_mog_head: bool = False
 
     p_uncond: float = 0.1
     label_smoothing: float = 0.01
@@ -880,6 +882,284 @@ class MoGHead(nn.Module):
             return torch.abs(dist)
 
 
+class MoGHeadSafeBF16(nn.Module):
+    """
+    Mixture of Gaussians head compatible with bf16-mixed training.
+    Supports Triton batch_matmul or PyTorch fallback.
+    """
+
+    def __init__(
+        self,
+        hidden_size: int,
+        intermediate_size: int,
+        out_size: int,
+        num_layers: int,
+        num_predictions: int,
+        low_rank: int | None = 64,
+        min_log_std: float = -4.0,
+        eps: float = 1e-6,
+    ):
+        super().__init__()
+        self.out_size = out_size
+        self.low_rank = low_rank
+        self.num_predictions = num_predictions
+        self.min_log_std = min_log_std
+
+        self.mlp_stack = nn.Sequential(
+            *[MLPLayer(hidden_size, intermediate_size, eps=eps) for _ in range(num_layers)],
+            RMSNorm(hidden_size, eps=eps),
+        )
+
+        if low_rank is None:
+            self.proj_logits = nn.Linear(hidden_size, num_predictions, bias=False)
+            self.proj_mus = nn.Linear(hidden_size, num_predictions * out_size, bias=False)
+            self.proj_logs = nn.Linear(hidden_size, 1, bias=False)
+        else:
+            assert low_rank < out_size
+            self.proj_logits = nn.Linear(hidden_size, num_predictions, bias=False)
+            self.proj_mus = nn.Linear(hidden_size, num_predictions * low_rank, bias=False)
+            self.proj_logs = nn.Linear(hidden_size, 1, bias=False)
+            self.proj_else = nn.Linear(hidden_size, out_size, bias=False)
+            self.low_mat = nn.Parameter(
+                torch.randn(num_predictions, out_size, low_rank) * (low_rank**-0.5)
+            )
+
+    # ------------------------------------------------------------
+    # Safe wrapper for batch_matmul (bf16 → float32 → bf16)
+    # ------------------------------------------------------------
+    @staticmethod
+    def safe_batch_matmul(x: Tensor, W: Tensor, indices: Tensor) -> Tensor:
+        orig_dtype = x.dtype
+        x_fp32 = x.float()
+        W_fp32 = W.float()
+        result = batch_matmul(x_fp32, W_fp32, indices)
+        return result.to(orig_dtype)
+
+    # ------------------------------------------------------------
+    # Forward pass
+    # ------------------------------------------------------------
+    def forward(self, x: Tensor) -> tuple[Tensor, Tensor, Tensor, Tensor]:
+        b, t, _ = x.size()
+        d = self.low_rank or self.out_size
+        x = self.mlp_stack(x)
+        logits = self.proj_logits(x)
+        mus = self.proj_mus(x).view(b, t, self.num_predictions, d)
+
+        # logs in fp32 for stability
+        with fp32_precision():
+            logs = self.proj_logs(x).clamp_min(self.min_log_std)
+        logs = logs.to(x.dtype)
+
+        mu_res = self.proj_else(x) if self.low_rank else torch.zeros((b, t, d), device=x.device)
+        return logits, mus, mu_res, logs
+
+    # ------------------------------------------------------------
+    # Inference / sampling
+    # ------------------------------------------------------------
+    @torch.no_grad()
+    def infer(self, x: Tensor, guidance_scale: float = 0.0, top_p_or_k: float | int = 1.0) -> tuple[Tensor, Tensor]:
+        b, t, _ = x.size()
+        n, d = self.num_predictions, self.low_rank or self.out_size
+
+        x = self.mlp_stack(x)
+        if guidance_scale > 0:
+            b //= 2
+            x_cond, x_uncond = x.chunk(2, dim=0)
+            x = x_cond + guidance_scale * (x_cond - x_uncond)
+
+        logits = self.proj_logits(x)
+
+        if top_p_or_k is not None:
+            logits = (
+                TopPLogitsWarper(top_p_or_k)(
+                    None,
+                    logits.view(-1, n),
+                ).view_as(logits)
+                if isinstance(top_p_or_k, float)
+                else TopKLogitsWarper(top_p_or_k)(
+                    None,
+                    logits.view(-1, n),
+                ).view_as(logits)
+            )
+
+        mixture_indices = (F.log_softmax(logits.float(), dim=-1) + gumbel_like(logits)).argmax(-1)
+
+        # Use safe_batch_matmul for low-rank computations
+        mu = self.safe_batch_matmul(
+            x.view(b * t, -1),
+            self.proj_mus.weight.detach().view(n, d, -1),
+            mixture_indices.view(b * t),
+        ).view(b, t, d)
+
+        if self.proj_mus.bias is not None:
+            mu += self.proj_mus.bias.detach().view(n, d)[mixture_indices]
+
+        if self.low_rank:
+            mu = self.safe_batch_matmul(
+                mu.view(b * t, -1),
+                self.low_mat.detach().view(n, self.out_size, -1),
+                mixture_indices.view(b * t),
+            ).view(b, t, self.out_size)
+            mu_res = self.proj_else(x)
+        else:
+            mu_res = torch.zeros((b, t, d), device=x.device)
+
+        # logs in fp32 for stability
+        with fp32_precision():
+            logs = self.proj_logs(x).clamp_min(self.min_log_std)
+            out = mu * torch.exp(logs) + mu_res
+
+        return out.to(x.dtype), logs.to(x.dtype)
+
+    # ------------------------------------------------------------
+    # Distance computation
+    # ------------------------------------------------------------
+    def dist(self, mus: Tensor, mu: Tensor) -> Tensor:
+        with fp32_precision():
+            if self.low_rank is None:
+                return (mus - mu.unsqueeze(-2)).pow(2).sum(-1)
+            else:
+                low_mat = self.low_mat.float()
+                low_mat_sq = low_mat.transpose(-1, -2) @ low_mat
+                x, y = mus.float(), mu.float()
+                b, t, n, d_l = x.size()
+                wx_sq = (x * torch.einsum("btni,nij->btnj", x, low_mat_sq)).sum(-1)
+                y_sq = y.pow(2).sum(-1, keepdim=True)
+                xwy = (x * torch.einsum("bti,nij->btnj", y, low_mat)).sum(-1)
+                dist = wx_sq + y_sq - 2 * xwy
+            return torch.abs(dist).to(mus.dtype)
+
+class MoGHeadFP32(nn.Module):
+    """
+    Mixture of Gaussians (MoG) head that forces FP32 computation efficiently
+    using a no-autocast context, avoiding redundant .float() calls.
+    """
+
+    def __init__(
+        self,
+        hidden_size: int,
+        intermediate_size: int,
+        out_size: int,
+        num_layers: int,
+        num_predictions: int,
+        low_rank: int | None = 64,
+        min_log_std: float = -4.0,
+        eps: float = 1e-6,
+    ):
+        super().__init__()
+        self.out_size = out_size
+        self.low_rank = low_rank
+        self.num_predictions = num_predictions
+        self.min_log_std = min_log_std
+
+        self.mlp_stack = nn.Sequential(
+            *[MLPLayer(hidden_size, intermediate_size, eps=eps) for _ in range(num_layers)],
+            RMSNorm(hidden_size, eps=eps),
+        )
+
+        if low_rank is None:
+            self.proj_logits = nn.Linear(hidden_size, num_predictions, bias=False)
+            self.proj_mus = nn.Linear(hidden_size, num_predictions * out_size, bias=False)
+            self.proj_logs = nn.Linear(hidden_size, 1, bias=False)
+        else:
+            assert low_rank < out_size
+            self.proj_logits = nn.Linear(hidden_size, num_predictions, bias=False)
+            self.proj_mus = nn.Linear(hidden_size, num_predictions * low_rank, bias=False)
+            self.proj_logs = nn.Linear(hidden_size, 1, bias=False)
+            self.proj_else = nn.Linear(hidden_size, out_size, bias=False)
+            self.low_mat = nn.Parameter(
+                torch.randn(num_predictions, out_size, low_rank) * (low_rank ** -0.5)
+            )
+        self.to(torch.float32)  # ensure initialized weights in fp32
+
+    def forward(self, x: torch.Tensor):
+        with fp32_precision():
+            b, t, _ = x.size()
+            d = self.low_rank or self.out_size
+
+            x = x.float()
+            x = self.mlp_stack(x)
+            logits = self.proj_logits(x)
+            mus = self.proj_mus(x).view(b, t, self.num_predictions, d)
+            logs = self.proj_logs(x).clamp_min(self.min_log_std)
+            mu_res = self.proj_else(x) if self.low_rank else torch.zeros((b, t, d), device=x.device)
+            return logits, mus, mu_res, logs
+
+    @torch.no_grad()
+    def infer(self, x, guidance_scale=0.0, top_p_or_k=1.0):
+        with fp32_precision():
+            b, t, _ = x.size()
+            n, d = self.num_predictions, self.low_rank or self.out_size
+
+            x = x.float()
+            x = self.mlp_stack(x)
+            if guidance_scale > 0:
+                b //= 2
+                x_cond, x_uncond = x.chunk(2, dim=0)
+                x = x_cond + guidance_scale * (x_cond - x_uncond)
+
+            logits = self.proj_logits(x)
+            if top_p_or_k is not None:
+                logits = (
+                    TopPLogitsWarper(top_p_or_k)(
+                        None, logits.view(-1, n),
+                    ).view_as(logits)
+                    if isinstance(top_p_or_k, float)
+                    else TopKLogitsWarper(top_p_or_k)(
+                        None, logits.view(-1, n),
+                    ).view_as(logits)
+                )
+
+            mixture_indices = (F.log_softmax(logits, dim=-1) + gumbel_like(logits)).argmax(-1)
+
+            mu = batch_matmul(
+                x.view(b * t, -1),
+                self.proj_mus.weight.detach().view(n, d, -1),
+                mixture_indices.view(b * t),
+            ).view(b, t, d)
+
+            if self.proj_mus.bias is not None:
+                mu += self.proj_mus.bias.detach().view(n, d)[mixture_indices]
+
+            if self.low_rank:
+                mu = batch_matmul(
+                    mu.view(b * t, -1),
+                    self.low_mat.detach().view(n, self.out_size, -1),
+                    mixture_indices.view(b * t),
+                ).view(b, t, self.out_size)
+                mu_res = self.proj_else(x)
+            else:
+                mu_res = torch.zeros((b, t, d), device=x.device)
+
+            logs = self.proj_logs(x).clamp_min(self.min_log_std)
+            return mu * torch.exp(logs) + mu_res, logs
+
+    def dist(self, mus, mu):
+        with fp32_precision():
+            if self.low_rank is None:
+                return (mus - mu.unsqueeze(-2)).pow(2).sum(-1)
+            else:
+                low_mat = self.low_mat.float()
+                low_mat_sq = low_mat.transpose(-1, -2) @ low_mat
+                b, t, n, d_l = mus.size()
+                wx_sq = (mus * torch.einsum("btni,nij->btnj", mus, low_mat_sq)).sum(-1)
+                y_sq = mu.pow(2).sum(-1, keepdim=True)
+                xwy = (mus * torch.einsum("bti,nij->btnj", mu, low_mat)).sum(-1)
+                return torch.abs(wx_sq + y_sq - 2 * xwy)
+
+    def to(self, *args, **kwargs):
+        # Always keep weights/buffers in FP32
+        super().to(torch.float32)
+        return self
+
+    def bfloat16(self, *args, **kwargs):
+        # Ignore bfloat16 conversion requests
+        return self
+
+    def half(self, *args, **kwargs):
+        # Ignore fp16 conversion requests
+        return self
+
 class NeMoSubwordFlagEmbedding(nn.Module):
     """
     Adds a tiny embedding table for continuation tokens
@@ -1351,7 +1631,6 @@ class RVQEARTTSModel(PreTrainedModel):
             from nemo.collections.speechlm2.parts.pretrained import load_pretrained_hf
             llm = load_pretrained_hf(self.config.pretrained_text_name, pretrained_weights=True).train()
             self.backbone = llm.model  # fetch PretrainedBaseModel from model "ForCausalLM"
-            print("Hereee\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n")
         else:
             if self.config.backbone_type is None:
                 assert self.config.backbone_model_class is not None and self.config.backbone_config_class is not None
@@ -1396,11 +1675,24 @@ class RVQEARTTSModel(PreTrainedModel):
         if not self.config.disable_eos_prediction:
             self.lm_head = nn.Linear(self.hidden_size, 2, bias=False)
 
-        self.mog_head = MoGHead(
-            hidden_size=self.hidden_size,
-            out_size=self.config.latent_size,
-            **self.config.mog_head_config,
-        )
+        if self.config.use_bf16_safe_mog_head: 
+            self.mog_head = MoGHeadSafeBF16(
+                hidden_size=self.hidden_size,
+                out_size=self.config.latent_size,
+                **self.config.mog_head_config,
+            )
+        elif self.config.use_fp32_mog_head: 
+            self.mog_head = MoGHeadFP32(
+                hidden_size=self.hidden_size,
+                out_size=self.config.latent_size,
+                **self.config.mog_head_config,
+            )
+        else:
+            self.mog_head = MoGHead(
+                hidden_size=self.hidden_size,
+                out_size=self.config.latent_size,
+                **self.config.mog_head_config,
+            )
 
     def set_rvq_embs(self, rvq_embs: Tensor):
         self.register_buffer("rvq_embs", rvq_embs.detach().clone())
@@ -1522,7 +1814,6 @@ class RVQEARTTSModel(PreTrainedModel):
             cont_code_target = self.depthsum_embedding(
                 code * target_mask + (torch.zeros_like(code) + self.config.codebook_size) * (~target_mask)
             )
-
             mog_logits = mog_logits.float()
             mog_mus = mog_mus.float()
             mog_mu_res = mog_mu_res.float()
