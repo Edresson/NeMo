@@ -406,6 +406,8 @@ class RVQEARTTSConfig(Config):
     pretrained_text_name: bool = False
     use_bf16_safe_mog_head: bool = False
     use_fp32_mog_head: bool = False
+    use_fp32_cas: bool = False
+    use_gated_fusion_for_text_audio: bool = False
 
     p_uncond: float = 0.1
     label_smoothing: float = 0.01
@@ -1549,6 +1551,7 @@ class CharAwareSubwordEncoder(nn.Module):
 
         # 2. Get character embeddings and pass them through the backbone
         char_embeds = self.embed_tokens(char_ids)
+
         # The backbone model should be able to accept `inputs_embeds`
         char_hidden_states = self.backbone(inputs_embeds=char_embeds, attention_mask=char_mask).last_hidden_state
 
@@ -1573,7 +1576,199 @@ class CharAwareSubwordEncoder(nn.Module):
 
         if self.use_cumulative_word_emb:
             subword_embeds = self.cumulative_word_emb(subword_embeds, subword_ids)
+
         return subword_embeds
+
+
+class GatedProjectedSumRMSNorm(nn.Module):
+    def __init__(self, audio_dim, text_dim, hidden_dim,
+                 final_norm=True, num_codebooks=31, init_residual_scale=0.5):
+        super().__init__()
+        self.num_codebooks = num_codebooks
+
+        self.audio_proj = nn.Linear(audio_dim, hidden_dim)
+        self.text_proj  = nn.Linear(text_dim, hidden_dim)
+
+        nn.init.normal_(self.audio_proj.weight, mean=0.0, std=0.015)
+        nn.init.zeros_(self.audio_proj.bias)
+        nn.init.normal_(self.text_proj.weight, mean=0.0, std=0.015)
+        nn.init.zeros_(self.text_proj.bias)
+
+        # FP32 gate params
+        self.gate = nn.Parameter(torch.zeros(hidden_dim, dtype=torch.float32))
+        self.residual_scale = nn.Parameter(torch.tensor(init_residual_scale, dtype=torch.float32))
+
+        self.final_norm = RMSNorm(hidden_dim) if final_norm else nn.Identity()
+
+    def forward(self, audio_emb, text_emb):
+        audio_emb = audio_emb / self.num_codebooks
+
+        # projections run in model dtype (BF16)
+        audio_h = self.audio_proj(audio_emb)
+        text_h  = self.text_proj(text_emb)
+
+        dtype = audio_h.dtype
+
+        with fp32_precision():
+            gate = torch.sigmoid(self.gate)                 # FP32
+            res  = torch.sigmoid(self.residual_scale)       # FP32
+
+        h = gate.to(dtype) * audio_h + (1 - gate).to(dtype) * text_h
+        h = res.to(dtype) * h
+        h = self.final_norm(h.float()).to(dtype)
+
+        return h
+
+
+class CharAwareSubwordEncoderFP32(nn.Module):
+    """
+    Character-aware subword encoder that forces all computations to run in FP32.
+    Compatible with AMP/bf16 contexts — safely overrides autocast.
+    """
+
+    def __init__(
+        self,
+        out_size: int,
+        pretrained_tokenizer_name: str,
+        vocab_dir: str | None = None,
+        backbone_type: str | None = "t5gemma",
+        backbone_model_class: str | None = None,
+        backbone_config_class: str | None = None,
+        backbone_config=None,
+        use_phonemes: bool = False,
+        use_char_tokenizer: bool = False,
+        use_subword_flag_emb: bool = False,
+        use_bos_eos_emb: bool = False,
+        use_cumulative_word_emb: bool = False
+    ):
+        super().__init__()
+
+        # 1. Build or load character vocabulary
+        if use_phonemes:
+            self.subword_id_to_char_ids, self.char_vocab, self.subword_padding_idx = build_phoneme_vocabs(
+                pretrained_tokenizer_name, vocab_dir, language="en-us",
+            )
+        else:
+            self.subword_id_to_char_ids, self.char_vocab, self.subword_padding_idx = build_vocabs(
+                pretrained_tokenizer_name, vocab_dir,
+            )
+
+        self.char_padding_idx = len(self.char_vocab)
+        self.use_char_tokenizer = use_char_tokenizer
+        self.use_subword_flag_emb = use_subword_flag_emb
+        self.use_bos_eos_emb = use_bos_eos_emb
+        self.use_cumulative_word_emb = use_cumulative_word_emb
+
+        # 2. Initialize backbone
+        if backbone_type:
+            config = AutoConfig.for_model(
+                backbone_type,
+                **(backbone_config.to_dict() if backbone_config else {})
+            )
+            self.backbone = AutoModelForTextEncoding.from_config(config)
+        else:
+            assert backbone_model_class and backbone_config_class
+            config_class = getattr(transformers, backbone_config_class)
+            model_class = getattr(transformers, backbone_model_class)
+            config = config_class(**(backbone_config.to_dict() if backbone_config else {}))
+            self.backbone = model_class(config)
+
+        self.hidden_size = self.backbone.get_input_embeddings().weight.size(-1)
+
+        # 3. Replace subword embeddings with character embeddings
+        find_and_delete_module(self.backbone, self.backbone.get_input_embeddings(), "backbone")
+        self.embed_tokens = nn.Embedding(len(self.char_vocab) + 1, self.hidden_size, padding_idx=self.char_padding_idx)
+        self.proj_embedding = nn.Linear(self.hidden_size, out_size, bias=False)
+
+
+        # Optional embeddings
+        if self.use_subword_flag_emb:
+            self.subword_flag_emb = SubwordFlagEmbedding(pretrained_tokenizer_name, self.hidden_size)
+
+        if self.use_bos_eos_emb:
+            self.bos_eos_emb = BOSEOSEmbedding(pretrained_tokenizer_name, self.hidden_size)
+
+        if self.use_cumulative_word_emb:
+            with fp32_precision():
+                self.cumulative_word_emb = CumulativeWordEmbedding(pretrained_tokenizer_name, self.hidden_size)
+
+        self.to(torch.float32)  # ensure all weights/buffers in FP32
+
+    def prepare_inputs(self, subword_ids: torch.Tensor, padding_mask: torch.Tensor):
+        device = subword_ids.device
+        subword_id_list = torch.masked_select(subword_ids, padding_mask).cpu().tolist()
+        char_id_list = [list(self.subword_id_to_char_ids.get(x, ())) for x in subword_id_list]
+        char_lengths = torch.tensor([len(x) for x in char_id_list], dtype=torch.long, device=device)
+
+        batch_size = char_lengths.size(0)
+        max_len = int(char_lengths.max().item()) if batch_size > 0 else 0
+        char_ids = torch.full((batch_size, max_len), self.char_padding_idx, dtype=torch.long, device=device)
+        for i, char_seq in enumerate(char_id_list):
+            char_ids[i, : len(char_seq)] = torch.tensor(char_seq, dtype=torch.long, device=device)
+
+        return char_ids, char_lengths
+
+    def forward_char_tokenizer(self, char_ids: torch.Tensor, char_mask: torch.Tensor | None = None):
+        with fp32_precision():
+            char_embeds = self.embed_tokens(char_ids).float()
+            char_hidden_states = self.backbone(inputs_embeds=char_embeds, attention_mask=char_mask).last_hidden_state
+            out_emb = self.proj_embedding(char_hidden_states.float())
+            return out_emb.float()
+
+    def forward(self, subword_ids: torch.Tensor, subword_mask: torch.Tensor | None = None):
+        with fp32_precision():
+            if subword_mask is None:
+                subword_mask = torch.ones_like(subword_ids, dtype=torch.bool)
+
+            if self.use_char_tokenizer:
+                return self.forward_char_tokenizer(subword_ids, subword_mask)
+
+            # 1. Convert subword IDs → character IDs
+            char_ids, char_lengths = self.prepare_inputs(subword_ids, subword_mask)
+            char_mask = sequence_mask(char_lengths)
+
+            # 2. Character embeddings → backbone
+            char_embeds = self.embed_tokens(char_ids).float()
+
+            char_hidden_states = self.backbone(inputs_embeds=char_embeds, attention_mask=char_mask).last_hidden_state.float()
+
+            # 3. Mean-pool across characters (in fp32)
+            masked_sum = (char_hidden_states * char_mask.unsqueeze(-1).float()).sum(dim=1)
+            mean_emb = masked_sum / char_lengths.unsqueeze(-1).float().clamp(min=1)
+
+            # 4. Project and scatter back to subword positions
+            out_emb = self.proj_embedding(mean_emb.float())
+            subword_embeds = torch.zeros(
+                subword_ids.shape + (out_emb.size(-1),),
+                device=subword_ids.device,
+                dtype=out_emb.dtype,
+            )
+            subword_embeds[subword_mask] = out_emb
+
+            # 5. Optional embeddings
+            if self.use_subword_flag_emb:
+                subword_embeds = self.subword_flag_emb(subword_embeds.float(), subword_ids)
+
+            if self.use_bos_eos_emb:
+                subword_embeds = self.bos_eos_emb(subword_embeds.float(), subword_ids)
+
+            if self.use_cumulative_word_emb:
+                subword_embeds = self.cumulative_word_emb(subword_embeds.float(), subword_ids)
+
+            return subword_embeds.float()
+
+    # --- Precision control overrides ---
+    def to(self, *args, **kwargs):
+        super().to(torch.float32)
+        return self
+
+    def bfloat16(self, *args, **kwargs):
+        # Ignore bfloat16 conversion requests
+        return self
+
+    def half(self, *args, **kwargs):
+        # Ignore fp16 conversion requests
+        return self
 
 
 def random_prev_token_dropout(dropped_code: torch.Tensor, dropout_prob: float, codebook_size: int):
@@ -1665,11 +1860,22 @@ class RVQEARTTSModel(PreTrainedModel):
         if self.config.cas_config is not None and self.config.get("ignore_cas_enc", False):
             self.embed_subword = SubwordEmbedding(model_name=self.config.cas_config.pretrained_tokenizer_name, d_model=self.hidden_size)
         else:
-            self.embed_subword = (
-                CharAwareSubwordEncoder(out_size=self.hidden_size, use_phonemes=self.config.use_phonemes, use_char_tokenizer=self.config.use_char_tokenizer, use_subword_flag_emb=self.config.use_subword_flag_emb, use_bos_eos_emb=self.config.use_bos_eos_emb, use_cumulative_word_emb=self.config.use_cumulative_word_emb, **self.config.cas_config)
-                if self.config.cas_config
-                else None
-            )
+            if self.config.use_fp32_cas:
+                self.embed_subword = (
+                    CharAwareSubwordEncoderFP32(out_size=self.hidden_size, use_phonemes=self.config.use_phonemes, use_char_tokenizer=self.config.use_char_tokenizer, use_subword_flag_emb=self.config.use_subword_flag_emb, use_bos_eos_emb=self.config.use_bos_eos_emb, use_cumulative_word_emb=self.config.use_cumulative_word_emb, **self.config.cas_config)
+                    if self.config.cas_config
+                    else None
+                )
+            else:
+
+                self.embed_subword = (
+                    CharAwareSubwordEncoder(out_size=self.hidden_size, use_phonemes=self.config.use_phonemes, use_char_tokenizer=self.config.use_char_tokenizer, use_subword_flag_emb=self.config.use_subword_flag_emb, use_bos_eos_emb=self.config.use_bos_eos_emb, use_cumulative_word_emb=self.config.use_cumulative_word_emb, **self.config.cas_config)
+                    if self.config.cas_config
+                    else None
+                )
+
+        if self.config.use_gated_fusion_for_text_audio:
+            self.gated_fusion_audio_text = GatedProjectedSumRMSNorm(self.hidden_size, self.hidden_size, self.hidden_size, self.config.num_quantizers)
 
         # Prediction Heads
         if not self.config.disable_eos_prediction:
@@ -2010,9 +2216,14 @@ class RVQEARTTSModel(PreTrainedModel):
         # Prepare conditioning
         cond = self._prepare_conditioning(context_hidden_state, subword_ids, subword_mask, uncond_dec_flag, asr_speech_tokens_emb=asr_speech_tokens_emb)
 
+        if self.config.use_gated_fusion_for_text_audio:
+            inputs_embeds = self.gated_fusion_audio_text(code_embeds, cond)
+        else:
+            inputs_embeds = code_embeds + cond
+
         # Main backbone pass
         backbone_outputs = self.backbone(
-            inputs_embeds=code_embeds + cond,
+            inputs_embeds=inputs_embeds,
             attention_mask=attention_mask,
             position_ids=position_ids,
             past_key_values=past_key_values,

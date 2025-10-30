@@ -790,6 +790,7 @@ class NeMoGroupedCodec(NeuralModule):
             grouped = tokens.reshape(B, T // self.frame_stacking_factor, C * self.frame_stacking_factor)
             tokens_len = tokens_len // self.frame_stacking_factor
             # grouped = grouped.transpose(1, 2)
+
             return grouped, tokens_len
 
     def decode(self, tokens, tokens_len):
@@ -945,6 +946,181 @@ def compare_dicts(dict_a, dict_b):
         print("⚠️ Some keys/values differ (see above).")
 
     return equal, differing_keys
+
+import copy
+def extract_first_tensor(x):
+    """Recursively find the first tensor in nested structures."""
+    if isinstance(x, torch.Tensor):
+        return x
+    if isinstance(x, (list, tuple)):
+        for v in x:
+            t = extract_first_tensor(v)
+            if t is not None:
+                return t
+    if isinstance(x, dict):
+        for v in x.values():
+            t = extract_first_tensor(v)
+            if t is not None:
+                return t
+    return None
+
+def compare_tts_model_fp32_bf16(tts_model, inputs, atol=1e-3, topk=15):
+    model_fp32 = copy.deepcopy(tts_model).eval().to(torch.float32)
+    model_bf16 = copy.deepcopy(tts_model).eval().to(torch.bfloat16)
+
+    diffs = {}
+
+    def make_hook(name, tag):
+        def hook_fn(module, inp, out):
+            tensor = extract_first_tensor(out)
+            if tensor is not None:
+                tensor = tensor.detach().float().cpu()
+                if name not in diffs:
+                    diffs[name] = {}
+                diffs[name][tag] = tensor
+        return hook_fn
+
+    # Register hooks independently
+    hooks_fp32 = []
+    for name, module in model_fp32.named_modules():
+        hooks_fp32.append(module.register_forward_hook(make_hook(name, "fp32")))
+
+    hooks_bf16 = []
+    for name, module in model_bf16.named_modules():
+        hooks_bf16.append(module.register_forward_hook(make_hook(name, "bf16")))
+
+    def maybe_to(x, dtype):
+        if x is None:
+            return None
+        if isinstance(x, torch.Tensor) and torch.is_floating_point(x):
+            return x.to(dtype)
+        return x
+
+    with torch.no_grad():
+        # BF16 forward
+        with torch.autocast('cuda', dtype=torch.bfloat16):
+            _ = model_bf16(
+                code=maybe_to(inputs["code"], torch.bfloat16),
+                audio_mask=inputs["audio_mask"],
+                attention_mask=inputs["attention_mask"],
+                position_ids=inputs["position_ids"],
+                context_hidden_state=maybe_to(inputs["context_hidden_state"], torch.bfloat16),
+                subword_ids=inputs["subword_ids"],
+                subword_mask=inputs["subword_mask"],
+                non_prompt_mask=inputs["non_prompt_mask"],
+                asr_speech_tokens_emb=maybe_to(inputs["asr_speech_tokens_emb"], torch.bfloat16),
+            )
+
+        # FP32 forward
+        _ = model_fp32(
+            code=maybe_to(inputs["code"], torch.float32),
+            audio_mask=inputs["audio_mask"],
+            attention_mask=inputs["attention_mask"],
+            position_ids=inputs["position_ids"],
+            context_hidden_state=maybe_to(inputs["context_hidden_state"], torch.float32),
+            subword_ids=inputs["subword_ids"],
+            subword_mask=inputs["subword_mask"],
+            non_prompt_mask=inputs["non_prompt_mask"],
+            asr_speech_tokens_emb=maybe_to(inputs["asr_speech_tokens_emb"], torch.float32),
+        )
+
+    # Compute diffs for matching layers
+    diff_list = []
+    for name, val in diffs.items():
+        if "fp32" in val and "bf16" in val:
+            delta = (val["fp32"] - val["bf16"]).abs().mean().item()
+            diff_list.append((name, delta))
+
+    diff_list.sort(key=lambda x: x[1], reverse=True)
+
+    print(f"\nTop {topk} layers with largest FP32 vs BF16 diff:")
+    if not diff_list:
+        print("⚠️ No matching tensor outputs found. Try increasing atol or check nested outputs.")
+    else:
+        for name, delta in diff_list[:topk]:
+            print(f"{name:<60} mean abs diff = {delta:.6f}")
+
+    for h in hooks_fp32 + hooks_bf16:
+        h.remove()
+
+    return diff_list
+
+
+def rescale_state_dict(
+    state_dict,
+    target_std=0.02,
+    first_n_layers=None,
+    layer_prefix="tts_model.backbone.layers."
+):
+    """
+    Rescale trainable weights in a state_dict for BF16 stability.
+
+    Args:
+        state_dict: PyTorch state_dict
+        target_std: desired target std for weights
+        first_n_layers: if not None, rescale only the first N transformer blocks
+        layer_prefix: prefix for layer names (default: "tts_model.backbone.layers.")
+    Returns:
+        new_state_dict
+    """
+    weight_tensors = []
+
+    # Compute which prefixes to match if first_n_layers is set
+    prefixes_to_match = []
+    if first_n_layers is not None:
+        prefixes_to_match = [f"{layer_prefix}{i}" for i in range(first_n_layers)]
+
+    for name, param in state_dict.items():
+        if not torch.is_tensor(param):
+            continue
+
+        if "rvq_embs" in name:
+            continue
+
+        # Skip biases & 1-dim params (norm weights/gates)
+        if param.ndim <= 1:
+            continue
+
+        # Skip layers not in the first N
+        if first_n_layers is not None and not any(name.startswith(pfx) for pfx in prefixes_to_match):
+            continue
+
+        weight_tensors.append(param.float())
+
+    if not weight_tensors:
+        if first_n_layers is not None:
+            print(f"⚠️ No weights found for first {first_n_layers} layers with prefix '{layer_prefix}'.")
+        else:
+            print("⚠️ No weights found to rescale in state_dict.")
+        return state_dict
+
+    # Compute global std across selected weights (on CPU)
+    cpu_weights = [p.detach().cpu() for p in weight_tensors]
+    flat = torch.cat([p.flatten() for p in cpu_weights])
+    current_std = float(torch.std(flat))
+    scale = target_std / (current_std + 1e-8)
+
+    print(
+        f"📦 Rescaling state_dict "
+        f"{'(first N layers)' if first_n_layers else '(all layers)'}: "
+        f"current std = {current_std:.6f}, target = {target_std}, scale = {scale:.6f}"
+    )
+
+    # Apply scaling
+    new_state_dict = {}
+    for name, param in state_dict.items():
+        if (
+            torch.is_tensor(param)
+            and param.ndim > 1
+            and (first_n_layers is None or any(name.startswith(pfx) for pfx in prefixes_to_match))
+        ):
+            new_state_dict[name] = param * scale
+        else:
+            new_state_dict[name] = param
+
+    print("✅ Done: weights rescaled.")
+    return new_state_dict
+
 
 class DuplexEARTTS(LightningModule, HFHubMixin):
     def __init__(self, cfg: dict) -> None:
@@ -1130,6 +1306,10 @@ class DuplexEARTTS(LightningModule, HFHubMixin):
                 checkpoint_state = torch.load(checkpoint_path, weights_only=False, map_location='cpu')['state_dict']
 
             checkpoint_state = set_model_dict_for_partial_init(checkpoint_state, self.state_dict())
+
+            if self.cfg.get("rescale_pretrained_weights", None):
+                checkpoint_state = rescale_state_dict(checkpoint_state, first_n_layers=self.cfg.get("rescale_first_n_layers", None))
+
             self.load_state_dict(checkpoint_state, strict=True)
 
     @property
@@ -1422,7 +1602,6 @@ class DuplexEARTTS(LightningModule, HFHubMixin):
                 subword_ids = subword_ids[:, :-remainder]
                 subword_mask = subword_mask[:, :-remainder]
 
-        
         if self.cfg.get("use_seq_mask_as_attn_and_subword_ids_mask", False):
             seq_mask = get_mask_from_lengths(target_codes_lens)
             # make sure seq_mask is in right shape
@@ -1625,7 +1804,11 @@ class DuplexEARTTS(LightningModule, HFHubMixin):
         if self.cfg.get("use_asr_speech_tokens", False) and self.cfg.get("only_semantic_to_speech", False):
             inputs["subword_ids"] = torch.full_like(inputs["subword_ids"], self.text_pad_id)
             inputs["subword_mask"] = torch.full_like(inputs["subword_mask"], 0.0)
-            
+        
+
+        # compare_tts_model_fp32_bf16(self.tts_model, inputs)
+        # exit()
+
         tts_output = self.tts_model(
             code=inputs["code"],
             audio_mask=inputs["audio_mask"],
@@ -1704,6 +1887,48 @@ class DuplexEARTTS(LightningModule, HFHubMixin):
 
     def on_train_epoch_start(self) -> None:
         setup_audio_codec(self)  # potentially reloads the audio codec to make sure it's in fp32
+
+    def on_train_epoch_end(self) -> None:
+        # log model stats to debug gradient weights issues
+        self.log_model_stats()
+
+    def log_model_stats(self):
+        weight_norm = 0.0
+        weight_max = 0.0
+        weight_sum = 0.0
+        n_weights = 0
+
+        grad_norm = 0.0
+        n_grads = 0
+
+        for p in self.parameters():
+            if not p.requires_grad:
+                continue
+
+            # Convert to float for BF16 safety
+            w = p.detach().float()
+
+            # Weight stats
+            weight_norm += w.norm() ** 2
+            weight_max = max(weight_max, w.abs().max().item())
+            weight_sum += w.sum().item()
+            n_weights += w.numel()
+
+            # Grad stats
+            if p.grad is not None:
+                g = p.grad.detach().float()
+                grad_norm += g.norm() ** 2
+                n_grads += 1
+
+        weight_norm = (weight_norm ** 0.5) / n_grads if n_grads > 0 else weight_norm ** 0.5
+        weight_mean = weight_sum / n_weights if n_weights > 0 else 0.0
+        grad_norm = (grad_norm ** 0.5) / n_grads if n_grads > 0 else 0.0
+
+        # Log all metrics
+        self.log("weights/norm", torch.tensor(weight_norm, device=self.device), on_epoch=True, sync_dist=True)
+        self.log("weights/max_abs", torch.tensor(weight_max, device=self.device), on_epoch=True, sync_dist=True)
+        self.log("weights/mean", torch.tensor(weight_mean, device=self.device), on_epoch=True, sync_dist=True)
+        self.log("grads/norm", torch.tensor(grad_norm, device=self.device), on_epoch=True, sync_dist=True)
 
     def on_validation_epoch_start(self) -> None:
         self.on_train_epoch_start()
@@ -1940,9 +2165,6 @@ class DuplexEARTTS(LightningModule, HFHubMixin):
                 else:
                     inp_asr_speech_tokens = None
 
-                # remove prompt padding from the user audio as autoregressive inference does not return the prompt
-                dataset_batch["source_audio"] = dataset_batch["source_audio"][:, -int(next_subword_ids.size(-1)*self.source_samples_per_frame):]
-
                 results["audio_tf"], results["audio_tf_len"] = self.get_teacher_force_inference_audio(dataset_batch)
 
                 results["audio"], results["audio_len"] = self.offline_inference(
@@ -1953,6 +2175,9 @@ class DuplexEARTTS(LightningModule, HFHubMixin):
                     inp_asr_speech_tokens=inp_asr_speech_tokens,
                     init_inputs=init_inputs,
                 )
+
+                # remove prompt padding from the user audio as autoregressive inference does not return the prompt
+                dataset_batch["source_audio"] = dataset_batch["source_audio"][:, -int(next_subword_ids.size(-1)*self.source_samples_per_frame):]
 
                 # clean prompt from the audio
                 results["audio_tf"] = results["audio_tf"][:, -int(next_subword_ids.size(-1)*self.target_samples_per_frame):]

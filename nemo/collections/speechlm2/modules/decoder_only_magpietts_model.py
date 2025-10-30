@@ -377,8 +377,7 @@ class DecoderOnlyMagpieTTS(NeuralModule):
     def embed_audio_tokens(self, audio_tokens, lengths=None):
         audio_tokens = audio_tokens.transpose(1, 2).contiguous()
         B, C, T = audio_tokens.shape
-        print(B, C, T)
-        exit()
+
         # Add and average the embeddings of the audio tokens across the codebooks
         audio_embedding = None
         for i in range(self.downsampling_factor):
@@ -425,7 +424,6 @@ class DecoderOnlyMagpieTTS(NeuralModule):
         input_audio_tokens = F.pad(code[:, :-1], [0, 0, 1, 0], value=self.speech_pad_id)
 
         # get embedding
-        print("inp audio toke", input_audio_tokens.shape)
         input_audio_emb = self.embed_audio_tokens(
             input_audio_tokens
         )
@@ -454,31 +452,33 @@ class DecoderOnlyMagpieTTS(NeuralModule):
 
         # get logits
         logits = self.final_proj(out.last_hidden_state)  # (B, T', num_codebooks * _codebook_size)
-        
+
         # inference/model initialization
         if audio_mask is not None and not self.training and not teacher_forcing_inference:
             return {"past_key_values": out.past_key_values}
 
         # teacher forcing inference
         if audio_mask is not None and not self.training and teacher_forcing_inference:
+            codebook_loss, loss_mask = self.compute_loss(logits, code, loss_mask=audio_mask)
             # local transformer
             local_transformer_logits = None
             if self.use_local_transformer:
                 if self.local_transformer_type == "ar":
                     # autoregressive
                     local_transformer_logits = self.compute_local_transformer_logits(out.last_hidden_state, code, targets_offset_by_one=False)
+                    local_transformer_loss, _ = self.compute_loss(local_transformer_logits, code, loss_mask=audio_mask)
                 else:
                     # randomly replace some positions with MASK_TOKEN
                     audio_codes_masked, mask_tokens_mask = self.maskgit_apply_random_mask(code)
                     local_transformer_logits = self.compute_local_transformer_logits(out.last_hidden_state, code, targets_offset_by_one=True)
+                    local_transformer_loss, _ =  self.compute_loss(local_transformer_logits, code, mask_tokens_mask=mask_tokens_mask, loss_mask=audio_mask)
 
                 lengths = torch.tensor([code.shape[1]] * code.shape[0], device=self.device)
-                print("logits", local_transformer_logits.shape)
                 codes = self.logits_to_audio_codes(local_transformer_logits, lengths).transpose(1, 2)
-                print("codes:", codes.shape)
             else:
                 lengths = torch.tensor([code.shape[1]] * code.shape[0], device=self.device)
-                codes = self.logits_to_audio_codes(out.last_hidden_state, lengths).transpose(1, 2)
+                codes = self.logits_to_audio_codes(logits, lengths).transpose(1, 2)
+
             return {"codes": codes}
 
         # training time compute losses
@@ -710,6 +710,7 @@ class DecoderOnlyMagpieTTS(NeuralModule):
             for idx in range(self._num_codebooks):
                 si = (idx + self._num_codebooks * ds_index) * self.speech_vocab_size
                 ei = si + self.speech_vocab_size
+                print(all_code_logits.shape)
                 codebook_logits = all_code_logits[:, :, si:ei]
                 codebook_probs = torch.softmax(codebook_logits, dim=-1)  # (B, T', num_tokens_per_codebook)
                 # argmax to get the tokens

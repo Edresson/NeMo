@@ -199,7 +199,7 @@ class DuplexS2SExternalSpeechDecoderModel(LightningModule, HFHubMixin):
 
         # move back text channel by x, in inference it advance the text channel prediction by x frames
         self.advance_text_channel_by = self.cfg.get("advance_text_channel_by", None)
-        
+
         # if self.cfg.get("speech_generation", None):
         self.tts_model = DuplexEARTTS(OmegaConf.to_container(self.cfg.speech_generation, resolve=True))
         self.target_fps = self.tts_model.target_fps
