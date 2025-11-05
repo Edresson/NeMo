@@ -275,7 +275,7 @@ class DuplexEARTTSDataset(torch.utils.data.Dataset):
                 speaker_reference_audio, padding_value=0
             ).float()
             speaker_reference_audio_lens = torch.tensor(speaker_reference_audio_lens).long()
-        else:   
+        else:
             # extract target speaker reference from a random audio audio
             speaker_reference_audio, speaker_reference_audio_lens = collate_random_turn_audio(
                 cuts.resample(self.target_sample_rate), roles=self.output_roles, recording_field="target_audio"

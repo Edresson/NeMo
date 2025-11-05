@@ -74,11 +74,316 @@ from nemo.collections.speechlm2.modules.cfm import MatchaTTSCFM
 from types import SimpleNamespace
 
 
-from nemo.collections.speechlm2.modules.rvq_ear_tts_model import RVQEARTTSModel, RVQEARTTSConfig, build_vocabs, SubwordFlagEmbedding
+from nemo.collections.speechlm2.modules.rvq_ear_tts_model import RVQEARTTSModel, RVQEARTTSConfig, build_vocabs, SubwordFlagEmbedding, RMSNorm
 from nemo.collections.speechlm2.modules.rvq_ear_tts_vae import RVQVAEModel
 from nemo.collections.speechlm2.data.duplex_ear_tts_dataset import normalize_text_fn
 
 from nemo.collections.speechlm2.modules.decoder_only_magpietts_model import DecoderOnlyMagpieTTS
+
+import torch
+import torch.nn as nn
+import copy
+
+def patch_linear_fp32_forward(module):
+    """Wrap forward to ensure FP32."""
+    if hasattr(module, "_original_forward"):
+        return  # already patched
+    module._original_forward = module.forward
+
+    def new_forward(*args, **kwargs):
+        with fp32_precision():
+            return module._original_forward(*args, **kwargs)
+    module.forward = new_forward
+
+def maybe_to(x, dtype):
+    if x is None:
+        return None
+    if isinstance(x, torch.Tensor) and torch.is_floating_point(x):
+        return x.to(dtype)
+    return x
+
+from collections import Counter
+def make_tts_model_mixed_precision_safe(model, inputs,
+                                        bf16_min=1e-2, bf16_max=1e2,
+                                        safety_factor=1.0):
+    safe_min = bf16_min * safety_factor
+    safe_max = bf16_max * safety_factor
+
+    # 1️⃣ Collect activation stats in FP32
+    model_fp32 = copy.deepcopy(model).eval().to(torch.float32)
+    stats = {}
+    hooks = []
+
+    def _activation_hook(name):
+        def hook(_, __, out):
+            if isinstance(out, tuple):
+                out = out[0]
+            if torch.is_tensor(out):
+                t = out.detach()
+                stats[name] = {"min": float(t.min()), "max": float(t.max())}
+        return hook
+
+    for name, module in model_fp32.named_modules():
+        if isinstance(module, (nn.Linear, nn.LayerNorm, nn.Embedding)):
+            hooks.append(module.register_forward_hook(_activation_hook(name)))
+
+    with torch.no_grad():
+        _ = model_fp32(code=inputs["code"], audio_mask=maybe_to(inputs["audio_mask"], torch.float32), attention_mask=maybe_to(inputs["attention_mask"], torch.float32), position_ids=inputs["position_ids"], context_hidden_state=maybe_to(inputs["context_hidden_state"], torch.float32), subword_ids=inputs["subword_ids"], subword_mask=maybe_to(inputs["subword_mask"], torch.float32), non_prompt_mask=maybe_to(inputs["non_prompt_mask"], torch.float32), asr_speech_tokens_emb=maybe_to(inputs["asr_speech_tokens_emb"], torch.float32), )
+
+    for h in hooks:
+        h.remove()
+
+    # 2️⃣ Patch BF16/FP16-safe layers
+    model_patched = copy.deepcopy(model).eval()
+    bf16_layers, fp32_layers = [], []
+
+    for name, module in model_patched.named_modules():
+        if name not in stats:
+            continue
+
+        mn, mx = stats[name]["min"], stats[name]["max"]
+        safe = (abs(mn) < safe_max and abs(mx) < safe_max
+                and not (abs(mn) < safe_min and abs(mx) < safe_min))
+
+        if isinstance(module, (nn.LayerNorm, nn.Embedding)):
+            module.to(torch.float32)
+            patch_linear_fp32_forward(module)
+            fp32_layers.append(name)
+        elif isinstance(module, nn.Linear):
+            if safe:
+                bf16_layers.append(name)
+            else:
+                module.to(torch.float32)
+                patch_linear_fp32_forward(module)
+                fp32_layers.append(name)
+
+    # 3️⃣ Count running dtype during a forward pass
+    running_dtypes = Counter()
+    hook_handles = []
+
+    def dtype_counter_hook(module, inputs, outputs):
+        for x in inputs:
+            if isinstance(x, torch.Tensor):
+                running_dtypes[str(x.dtype)] += 1
+        out_list = outputs if isinstance(outputs, (tuple, list)) else [outputs]
+        for x in out_list:
+            if isinstance(x, torch.Tensor):
+                running_dtypes[str(x.dtype)] += 1
+
+    # attach hooks to all linear/embedding/layernorm modules
+    for name, module in model_patched.named_modules():
+        if isinstance(module, (nn.Linear, nn.LayerNorm, nn.Embedding)):
+            hook_handles.append(module.register_forward_hook(dtype_counter_hook))
+
+    # run a forward to count dtypes
+    with torch.no_grad():
+        _ = model_patched(code=inputs["code"], audio_mask=maybe_to(inputs["audio_mask"], torch.float32), attention_mask=maybe_to(inputs["attention_mask"], torch.float32), position_ids=inputs["position_ids"], context_hidden_state=maybe_to(inputs["context_hidden_state"], torch.float32), subword_ids=inputs["subword_ids"], subword_mask=maybe_to(inputs["subword_mask"], torch.float32), non_prompt_mask=maybe_to(inputs["non_prompt_mask"], torch.float32), asr_speech_tokens_emb=maybe_to(inputs["asr_speech_tokens_emb"], torch.float32), )
+
+    # Count BF16/FP16 and FP32 activations
+    num_bf16_fp16 = running_dtypes.get("torch.bfloat16", 0) + running_dtypes.get("torch.float16", 0)
+    num_fp32 = running_dtypes.get("torch.float32", 0)
+
+    # remove hooks
+    for h in hook_handles:
+        h.remove()
+
+    summary = {
+        "bf16_layers": bf16_layers,
+        "fp32_layers": fp32_layers,
+        "num_bf16_fp16": num_bf16_fp16,
+        "num_fp32": num_fp32,
+        "stats": stats,
+        "safe_min": safe_min,
+        "safe_max": safe_max,
+        "safety_factor": safety_factor,
+    }
+
+    print("Num. BF16/FP16 activations:", num_bf16_fp16)
+    print("Num. FP32 activations:", num_fp32)
+
+    return model_patched, summary
+
+
+
+from contextlib import contextmanager
+
+import torch
+
+
+@contextmanager
+def ensures_16_precision(mixed_dtype):
+    """
+    Workaround for precision related issues when training with bf16-true PyTorch Lightning precision setting.
+    In bf16-true, PTL changes PyTorch's default dtype, which may break implicit assumptions for some models.
+    This context manager restores default float32 precision and runs the computation in float32 autocast context.
+    """
+    default_dtype = torch.get_default_dtype()
+    torch.set_default_dtype(mixed_dtype)
+    try:
+        with torch.amp.autocast(device_type="cuda" if torch.cuda.is_available() else "cpu", dtype=mixed_dtype):
+            yield
+    finally:
+        torch.set_default_dtype(default_dtype)
+
+
+def make_tts_model_mixed_precision_definite(model, inputs,
+                                            mixed_dtype=torch.bfloat16,
+                                            bf16_min=1e-2, bf16_max=1e2,
+                                            safety_factor=1.0):
+    safe_min = bf16_min * safety_factor
+    safe_max = bf16_max * safety_factor
+
+    # 1️⃣ Collect activation stats in FP32
+    model_fp32 = copy.deepcopy(model).eval().to(torch.float32)
+    stats = {}
+    hooks = []
+
+    def _activation_hook(name):
+        def hook(_, __, out):
+            if isinstance(out, tuple):
+                out = out[0]
+            if torch.is_tensor(out):
+                stats[name] = {"min": float(out.detach().min()), "max": float(out.detach().max())}
+        return hook
+
+    for name, module in model_fp32.named_modules():
+        if isinstance(module, (nn.Linear, nn.LayerNorm, nn.Embedding)):
+            hooks.append(module.register_forward_hook(_activation_hook(name)))
+
+    with torch.no_grad():
+        _ = model_fp32(
+            code=inputs["code"],
+            audio_mask=maybe_to(inputs["audio_mask"], torch.float32),
+            attention_mask=maybe_to(inputs["attention_mask"], torch.float32),
+            position_ids=inputs["position_ids"],
+            context_hidden_state=maybe_to(inputs["context_hidden_state"], torch.float32),
+            subword_ids=inputs["subword_ids"],
+            subword_mask=maybe_to(inputs["subword_mask"], torch.float32),
+            non_prompt_mask=maybe_to(inputs["non_prompt_mask"], torch.float32),
+            asr_speech_tokens_emb=maybe_to(inputs["asr_speech_tokens_emb"], torch.float32),
+        )
+
+    for h in hooks:
+        h.remove()
+
+    # 2️⃣ Patch model for mixed precision with safe propagation
+    model_patched = copy.deepcopy(model).eval()
+    bf16_layers, fp32_layers = [], []
+
+    all_modules = list(model_patched.named_modules())
+    num_modules = len(all_modules)
+
+    # flag to propagate FP32 to next safe layers
+    propagate_fp32 = False
+
+    for idx, (name, module) in enumerate(all_modules):
+        if name not in stats:
+            continue
+        mn, mx = stats[name]["min"], stats[name]["max"]
+        safe = (abs(mn) < safe_max and abs(mx) < safe_max
+                and not (abs(mn) < safe_min and abs(mx) < safe_min))
+
+        is_sensitive = False
+        if isinstance(module, (nn.LayerNorm, nn.Embedding)):
+            is_sensitive = True
+        elif isinstance(module, nn.Linear):
+            if not safe:
+                is_sensitive = True
+
+        # mark this layer
+        if is_sensitive:
+            if name not in fp32_layers:
+                fp32_layers.append(name)
+            propagate_fp32 = True  # propagate FP32 to next layers if safe
+        else:
+            if propagate_fp32:
+                # next layer is safe but preceded by FP32-sensitive -> still FP32
+                fp32_layers.append(name)
+                propagate_fp32 = False  # stop propagation after one safe layer
+            else:
+                # layer itself is safe and no FP32 propagation -> use BF16/FP16
+                if isinstance(module, nn.Linear):
+                    bf16_layers.append(name)
+
+    # 3️⃣ Wrap forwards to enforce precision
+    def wrap_forward(module, is_fp32_sensitive):
+        if hasattr(module, "_original_forward"):
+            return
+        module._original_forward = module.forward
+
+        def new_forward(*args, **kwargs):
+            if is_fp32_sensitive:
+                with fp32_precision():
+                    return module._original_forward(*args, **kwargs)
+            else:
+                new_args = tuple(a.to(mixed_dtype) if isinstance(a, torch.Tensor) and a.is_floating_point() else a for a in args)
+                new_kwargs = {k: v.to(mixed_dtype) if isinstance(v, torch.Tensor) and v.is_floating_point() else v
+                              for k, v in kwargs.items()}
+                # with torch.cuda.amp.autocast(enabled=True, dtype=mixed_dtype):
+                with ensures_16_precision(mixed_dtype):
+                    return module._original_forward(*new_args, **new_kwargs)
+
+        module.forward = new_forward
+
+    for name, module in model_patched.named_modules():
+        if isinstance(module, (nn.Linear, nn.LayerNorm, nn.Embedding)):
+            wrap_forward(module, name in fp32_layers)
+
+    # 4️⃣ Count actual running dtype
+    running_dtypes = Counter()
+    hook_handles = []
+
+    def dtype_counter_hook(module, inputs, outputs):
+        for x in inputs:
+            if isinstance(x, torch.Tensor):
+                running_dtypes[str(x.dtype)] += 1
+        outputs_list = outputs if isinstance(outputs, (tuple, list)) else [outputs]
+        for x in outputs_list:
+            if isinstance(x, torch.Tensor):
+                running_dtypes[str(x.dtype)] += 1
+
+    for name, module in model_patched.named_modules():
+        if isinstance(module, (nn.Linear, nn.LayerNorm, nn.Embedding)):
+            hook_handles.append(module.register_forward_hook(dtype_counter_hook))
+
+    with torch.no_grad():
+        _ = model_patched(
+            code=inputs["code"],
+            audio_mask=maybe_to(inputs["audio_mask"], torch.float32),
+            attention_mask=maybe_to(inputs["attention_mask"], torch.float32),
+            position_ids=inputs["position_ids"],
+            context_hidden_state=maybe_to(inputs["context_hidden_state"], torch.float32),
+            subword_ids=inputs["subword_ids"],
+            subword_mask=maybe_to(inputs["subword_mask"], torch.float32),
+            non_prompt_mask=maybe_to(inputs["non_prompt_mask"], torch.float32),
+            asr_speech_tokens_emb=maybe_to(inputs["asr_speech_tokens_emb"], torch.float32),
+        )
+
+    for h in hook_handles:
+        h.remove()
+
+    num_bf16_fp16 = running_dtypes.get("torch.bfloat16", 0) + running_dtypes.get("torch.float16", 0)
+    num_fp32 = running_dtypes.get("torch.float32", 0)
+
+    summary = {
+        "bf16_layers": bf16_layers,
+        "fp32_layers": fp32_layers,
+        "num_bf16_fp16": num_bf16_fp16,
+        "num_fp32": num_fp32,
+        "stats": stats,
+        "safe_min": safe_min,
+        "safe_max": safe_max,
+        "safety_factor": safety_factor,
+    }
+
+    # print("Num. BF16/FP16 activations:", num_bf16_fp16)
+    # print("Num. FP32 activations:", num_fp32)
+    print("Num. BF16/FP16 candidate layers:", len(bf16_layers))
+    print("Num. FP32 layers (sensitive + propagated):", len(fp32_layers))
+
+    return model_patched, summary
+    
+
 
 def generate_multiturn_speaking_mask(input_ids: torch.Tensor, bos_token_id: int = 0, eos_token_id: int = 1):
     """
@@ -223,6 +528,7 @@ class MimiCodec(NeuralModule):
         return padded_audio, padded_len
 
 
+
 def setup_rvq_audio_codec(model):
     """
     Sets up an ``AudioCodecModel``, initializing it from pretrained weights.
@@ -241,9 +547,13 @@ def setup_audio_codec(self):
     # codec configs
     if self.cfg.get("use_nanocodec", False):
         from nemo.collections.speechlm2.parts.pretrained import setup_audio_codec as setup_audio_codec_nemo
+        # deleting audio codec to force reload before the evaluation
+        if hasattr(self, "audio_codec"):
+            del self.audio_codec
         setup_audio_codec_nemo(self)
+        self.audio_codec = self.audio_codec.eval()
         if not isinstance(self.audio_codec, NeMoGroupedCodec):
-            self.audio_codec = NeMoGroupedCodec(self.audio_codec, frame_stacking_factor=1)
+            self.audio_codec = NeMoGroupedCodec(self.audio_codec, frame_stacking_factor=1).eval()
 
         if not self.cfg.get("use_magpietts_backbone", False):
             # get FSQ embeddings
@@ -309,9 +619,9 @@ def setup_audio_codec(self):
             assert callable(self.tts_model.set_rvq_embs)
             self.tts_model.set_rvq_embs(torch.stack([x.detach() for x in self.audio_codec.prvq.mus_list], 0))
             self.tts_model.rvq_embs = self.tts_model.rvq_embs.to(next(self.tts_model.parameters()).dtype)
-            # compute target fps
-            self.target_fps = self.target_sample_rate / self.audio_codec.config.wav_to_token_ratio
-            self.target_samples_per_frame = self.audio_codec.config.wav_to_token_ratio
+        # compute target fps
+        self.target_fps = self.target_sample_rate / self.audio_codec.config.wav_to_token_ratio
+        self.target_samples_per_frame = self.audio_codec.config.wav_to_token_ratio
 
 from nemo.collections.speechlm2.modules.asr_speech_tokenizer.modeling_whisper import WhisperVQEncoder
 from transformers import WhisperFeatureExtractor
@@ -923,7 +1233,7 @@ def compare_dicts(dict_a, dict_b):
                 equal = False
                 differing_keys.append(key)
                 idx = torch.nonzero(diff_mask, as_tuple=False)
-                print(f"❌ Tensor mismatch at key '{key}': {idx.shape[0]} differing positions")
+                print(f"❌ Tensor mismatch at key '{key}': {idx.shape[0]} differing positions, shape: ", a_val.shape, b_val.shape)
                 # Print up to first 10 differences
                 for i, pos in enumerate(idx[:10]):
                     pos_tuple = tuple(pos.tolist())
@@ -964,7 +1274,7 @@ def extract_first_tensor(x):
                 return t
     return None
 
-def compare_tts_model_fp32_bf16(tts_model, inputs, atol=1e-3, topk=15):
+def compare_tts_model_fp32_bf16_old(tts_model, inputs, atol=1e-3, topk=15):
     model_fp32 = copy.deepcopy(tts_model).eval().to(torch.float32)
     model_bf16 = copy.deepcopy(tts_model).eval().to(torch.bfloat16)
 
@@ -1045,6 +1355,91 @@ def compare_tts_model_fp32_bf16(tts_model, inputs, atol=1e-3, topk=15):
 
     return diff_list
 
+def compare_tts_model_fp32_bf16_mixed(tts_model, inputs, topk=15):
+    """
+    Compare FP32 vs BF16-safe (with fp32_precision layers) outputs.
+    tts_model can have patched FP32 layers; these will run in FP32.
+    """
+    import copy
+    diffs = {}
+
+    def extract_first_tensor(x):
+        if isinstance(x, (tuple, list)):
+            for y in x:
+                if torch.is_tensor(y):
+                    return y
+            return None
+        if torch.is_tensor(x):
+            return x
+        return None
+
+    def make_hook(name, tag):
+        def hook_fn(module, inp, out):
+            tensor = extract_first_tensor(out)
+            if tensor is not None:
+                tensor = tensor.detach().float().cpu()
+                if name not in diffs:
+                    diffs[name] = {}
+                diffs[name][tag] = tensor
+        return hook_fn
+
+    # FP32 reference model
+    model_fp32 = copy.deepcopy(tts_model).eval().to(torch.float32)
+
+    hooks_fp32 = [m.register_forward_hook(make_hook(n, "fp32")) for n, m in model_fp32.named_modules()]
+    hooks_bf16 = [m.register_forward_hook(make_hook(n, "bf16")) for n, m in tts_model.named_modules()]
+
+    def maybe_to(x, dtype):
+        if x is None:
+            return None
+        if isinstance(x, torch.Tensor) and torch.is_floating_point(x):
+            return x.to(dtype)
+        return x
+
+    with torch.no_grad():
+        # BF16-safe forward (patched FP32 layers run in FP32)
+        with torch.autocast("cuda", dtype=torch.bfloat16):
+            _ = tts_model(
+                code=maybe_to(inputs["code"], torch.bfloat16),
+                audio_mask=inputs["audio_mask"],
+                attention_mask=inputs["attention_mask"],
+                position_ids=inputs["position_ids"],
+                context_hidden_state=maybe_to(inputs["context_hidden_state"], torch.bfloat16),
+                subword_ids=inputs["subword_ids"],
+                subword_mask=inputs["subword_mask"],
+                non_prompt_mask=inputs["non_prompt_mask"],
+                asr_speech_tokens_emb=maybe_to(inputs["asr_speech_tokens_emb"], torch.bfloat16),
+            )
+
+        # FP32 forward
+        _ = model_fp32(
+            code=maybe_to(inputs["code"], torch.float32),
+            audio_mask=inputs["audio_mask"],
+            attention_mask=inputs["attention_mask"],
+            position_ids=inputs["position_ids"],
+            context_hidden_state=maybe_to(inputs["context_hidden_state"], torch.float32),
+            subword_ids=inputs["subword_ids"],
+            subword_mask=inputs["subword_mask"],
+            non_prompt_mask=inputs["non_prompt_mask"],
+            asr_speech_tokens_emb=maybe_to(inputs["asr_speech_tokens_emb"], torch.float32),
+        )
+
+    # Compute diffs
+    diff_list = []
+    for name, val in diffs.items():
+        if "fp32" in val and "bf16" in val:
+            delta = (val["fp32"] - val["bf16"]).abs().mean().item()
+            diff_list.append((name, delta))
+
+    diff_list.sort(key=lambda x: x[1], reverse=True)
+    print(f"\nTop {topk} layers with largest FP32 vs BF16 diff:")
+    for name, delta in diff_list[:topk]:
+        print(f"{name:<60} mean abs diff = {delta:.6f}")
+
+    for h in hooks_fp32 + hooks_bf16:
+        h.remove()
+
+    return diff_list
 
 def rescale_state_dict(
     state_dict,
@@ -1132,11 +1527,13 @@ class DuplexEARTTS(LightningModule, HFHubMixin):
         self.save_hyperparameters()
         # convert dict to config
         cfg = DictConfig(cfg)
+        self.trainer_config = cfg.trainer
         self.data_cfg = cfg.data
         self.cfg = cfg.model
         self.target_sample_rate = cfg.data.target_sample_rate
         self.source_sample_rate = cfg.data.source_sample_rate
         self.normalize_text = cfg.data.get("normalize_text", False)
+        self.model_16_precision_safe = None
 
         self.validation_save_path = os.path.join(cfg.exp_manager.explicit_log_dir, "validation_logs")
 
@@ -1275,7 +1672,6 @@ class DuplexEARTTS(LightningModule, HFHubMixin):
 
         setup_audio_codec(self)
 
-
     def _load_language_model(self, cfg):
         """Load language model for RVQ-EAR-TTS."""
         if cfg.pretrained_lm_name:
@@ -1406,9 +1802,120 @@ class DuplexEARTTS(LightningModule, HFHubMixin):
             num_padding = max_len - audio.shape[1]
             padded_audio = F.pad(audio, (0, num_padding))
         return padded_audio, padded_len
-
+    
     def prepare_inputs(self, batch: dict):
         """
+        """
+        """
+        import hashlib
+        import torch
+
+        def hash_texts(text_list):
+            hashes = []
+            for t in text_list:
+                norm = t.strip().lower()
+                h = hashlib.sha256(norm.encode("utf-8")).hexdigest()
+                hashes.append(h)
+            return hashes
+
+        # --- Safe batch filtering function ---
+        def filter_batch_by_indices(batch, keep_indices):
+            if not keep_indices:
+                # No common samples: empty all fields
+                new_batch = {}
+                for k, v in batch.items():
+                    if isinstance(v, list):
+                        new_batch[k] = []
+                    elif hasattr(v, "__getitem__") and not isinstance(v, str):
+                        try:
+                            new_batch[k] = v[0:0]  # empty tensor
+                        except Exception:
+                            new_batch[k] = v
+                    else:
+                        new_batch[k] = v
+                return new_batch
+
+            new_batch = {}
+            for k, v in batch.items():
+                try:
+                    if isinstance(v, list):
+                        new_batch[k] = [v[i] for i in keep_indices if i < len(v)]
+                    elif hasattr(v, "__getitem__") and not isinstance(v, str):
+                        slices = [i for i in keep_indices if i < v.shape[0]]
+                        if slices:
+                            new_batch[k] = v[slices]
+                        else:
+                            new_batch[k] = v[0:0]  # empty tensor
+                    else:
+                        new_batch[k] = v  # keep metadata as-is
+                except Exception:
+                    new_batch[k] = v  # fallback if indexing fails
+            return new_batch
+
+        # --- Compute sample IDs ---
+        target_texts = batch["target_texts"]
+        batch["sample_id"] = target_texts  # using text itself as unique ID
+        print("Sample ids:", batch["sample_id"])
+
+        if self.training:
+            # --- Track sample IDs and store full batch ---
+            if not hasattr(self, "train_sample_ids"):
+                self.train_sample_ids = set(batch["sample_id"])
+                self.train_batches_by_hash = dict()
+            else:
+                self.train_sample_ids.update(batch["sample_id"])
+
+            # Save the full batch per sample
+            for i, sid in enumerate(batch["sample_id"]):
+                self.train_batches_by_hash[sid] = {
+                    k: (v[i] if isinstance(v, list) else v[i:i+1])
+                    for k, v in batch.items()
+                }
+
+        else:
+            # --- Validation: keep only common samples ---
+            if not hasattr(self, "eval_common_ids"):
+                self.eval_common_ids = set()
+
+            # Only consider validation samples that exist in training
+            keep_indices = [i for i, sid in enumerate(batch["sample_id"])
+                            if sid in self.train_batches_by_hash]
+
+            # Safe filtering
+            batch = filter_batch_by_indices(batch, keep_indices)
+
+            if keep_indices:
+                print(f"Keeping only {len(keep_indices)} common samples from validation!")
+                # Update eval_common_ids
+                self.eval_common_ids.update(batch["sample_id"])
+                print(
+                    f"total_common={len(self.eval_common_ids)}, "
+                    f"train_total={len(self.train_sample_ids)}"
+                )
+
+                # --- Compare the first common sample ---
+                first_sid = batch["sample_id"][0]
+                train_sample = self.train_batches_by_hash[first_sid]
+                val_sample = {k: (v[0] if isinstance(v, list) else v[0:1])
+                            for k, v in batch.items()}
+
+                # --- Slice tensors to minimal overlapping shape ---
+                for k in val_sample.keys():
+                    t_val = val_sample[k]
+                    t_train = train_sample.get(k, t_val)
+                    if isinstance(t_val, torch.Tensor) and isinstance(t_train, torch.Tensor):
+                        min_shape = tuple(min(s1, s2) for s1, s2 in zip(t_val.shape, t_train.shape))
+                        if all(s > 0 for s in min_shape):
+                            slices = tuple(slice(0, s) for s in min_shape)
+                            val_sample[k] = t_val[slices]
+                            train_sample[k] = t_train[slices]
+
+                print(f"Comparing first common sample (sid={first_sid})")
+                compare_dicts(train_sample, val_sample)
+                exit()
+            else:
+                print("No common samples found in this validation batch!")
+
         """
         # check if audios has the same batch size
         assert batch["source_audio"].size(0) == batch["target_audio"].size(0)
@@ -1615,7 +2122,6 @@ class DuplexEARTTS(LightningModule, HFHubMixin):
             self.cfg.get("debug_dataloader_audios_path", None)
             and self.training
         ):
-
             def count_leading_silence_tokens(tensor: torch.Tensor, silence_token: int = 0) -> int:
                 """
                 Count the number of consecutive silence tokens at the beginning of a 1D tensor.
@@ -1893,50 +2399,59 @@ class DuplexEARTTS(LightningModule, HFHubMixin):
         self.log_model_stats()
 
     def log_model_stats(self):
-        weight_norm = 0.0
-        weight_max = 0.0
-        weight_sum = 0.0
-        n_weights = 0
+        total_w_sq = 0.0
+        total_w_params = 0
+        max_abs_w = 0.0
+        sum_w = 0.0
 
-        grad_norm = 0.0
-        n_grads = 0
+        total_g_sq = 0.0
+        total_g_params = 0
 
         for p in self.parameters():
             if not p.requires_grad:
                 continue
 
-            # Convert to float for BF16 safety
-            w = p.detach().float()
+            # ----- weights -----
+            w = p.detach().cpu().float()  # ✅ safe offline copy
+            total_w_sq += (w * w).sum().item()
+            total_w_params += w.numel()
+            max_abs_w = max(max_abs_w, w.abs().max().item())
+            sum_w += w.sum().item()
 
-            # Weight stats
-            weight_norm += w.norm() ** 2
-            weight_max = max(weight_max, w.abs().max().item())
-            weight_sum += w.sum().item()
-            n_weights += w.numel()
-
-            # Grad stats
+            # ----- grads (optional, disabled for speed) -----
             if p.grad is not None:
-                g = p.grad.detach().float()
-                grad_norm += g.norm() ** 2
-                n_grads += 1
+                g = p.grad.detach().cpu().float()
+                total_g_sq += (g * g).sum().item()
+                total_g_params += g.numel()
 
-        weight_norm = (weight_norm ** 0.5) / n_grads if n_grads > 0 else weight_norm ** 0.5
-        weight_mean = weight_sum / n_weights if n_weights > 0 else 0.0
-        grad_norm = (grad_norm ** 0.5) / n_grads if n_grads > 0 else 0.0
+        # L2 norms
+        weight_l2 = (total_w_sq ** 0.5) if total_w_sq > 0 else 0.0
+        grad_l2   = (total_g_sq ** 0.5) if total_g_sq > 0 else 0.0
 
-        # Log all metrics
-        self.log("weights/norm", torch.tensor(weight_norm, device=self.device), on_epoch=True, sync_dist=True)
-        self.log("weights/max_abs", torch.tensor(weight_max, device=self.device), on_epoch=True, sync_dist=True)
-        self.log("weights/mean", torch.tensor(weight_mean, device=self.device), on_epoch=True, sync_dist=True)
-        self.log("grads/norm", torch.tensor(grad_norm, device=self.device), on_epoch=True, sync_dist=True)
+        # RMS (global)
+        weight_rms = ((total_w_sq / total_w_params) ** 0.5) if total_w_params > 0 else 0.0
+        grad_rms   = ((total_g_sq / total_g_params) ** 0.5) if total_g_params > 0 else 0.0
+
+        # Mean
+        weight_mean = sum_w / total_w_params if total_w_params > 0 else 0.0
+
+        # direct float logging avoids device sync penalty
+        self.log("weights/L2",      weight_l2,   on_epoch=True, sync_dist=True)
+        self.log("weights/RMS",     weight_rms,  on_epoch=True, sync_dist=True)
+        self.log("weights/max_abs", max_abs_w,   on_epoch=True, sync_dist=True)
+        self.log("weights/mean",    weight_mean, on_epoch=True, sync_dist=True)
+
+        # ignore the grads stats for now
+        # self.log("grads/L2",       grad_l2,    on_epoch=True, sync_dist=True)
+        # self.log("grads/RMS",      grad_rms,   on_epoch=True, sync_dist=True)
 
     def on_validation_epoch_start(self) -> None:
-        self.on_train_epoch_start()
+        setup_audio_codec(self)
         self.results_logger = ResultsLogger(self.validation_save_path).reset()
         self.asr_bleu = ASRBLEU(self.cfg.scoring_asr).reset()
         self.intelligibility = Intelligibility(self.cfg.scoring_asr, reuse_asr_hyps=True).reset()
         self.secs = SECS(self.cfg.get("scoring_se", "titanet_large")).reset()
-
+        
     def on_validation_epoch_end(self, prefix="val") -> None:
         asr_bleu = self.asr_bleu.compute()
         for k, m in asr_bleu.items():
@@ -2102,15 +2617,27 @@ class DuplexEARTTS(LightningModule, HFHubMixin):
                         tokenizer=self.tokenizer,
                     )
         else:
-
             for name, dataset_batch in batch.items():
                 if dataset_batch is None:
                     continue  # some dataset is exhausted
 
                 results = {}
                 inputs = self.prepare_inputs(dataset_batch)
-                # cut it on prompt
 
+                # 
+                # exit()
+                # first evaluation, make the model bf16 safe
+                if not self.model_16_precision_safe and self.cfg.get("ensures_16_safe", True) and str(self.trainer_config.precision) != str(32):
+                    self.tts_model, summary = make_tts_model_mixed_precision_definite(self.tts_model, inputs, safety_factor=1.0, mixed_dtype=torch.float16 if str(self.trainer_config.precision) == str(16) else torch.bfloat16)
+                    # self.tts_model, summary = make_tts_model_mixed_precision_safe(self.tts_model, inputs, safety_factor=1.0)
+                    self.model_16_precision_safe = True
+
+                    print("Current FP32 layers:", summary["fp32_layers"])
+                    # compare_tts_model_fp32_bf16_mixed(self.tts_model, inputs)
+                    # exit()
+
+                results["audio_tf"], results["audio_tf_len"] = self.get_teacher_force_inference_audio(dataset_batch)
+                # cut it on prompt
                 init_inputs = {
                     "code": inputs["code"],
                     "audio_mask": inputs["audio_mask"],
@@ -2164,8 +2691,6 @@ class DuplexEARTTS(LightningModule, HFHubMixin):
                     ])
                 else:
                     inp_asr_speech_tokens = None
-
-                results["audio_tf"], results["audio_tf_len"] = self.get_teacher_force_inference_audio(dataset_batch)
 
                 results["audio"], results["audio_len"] = self.offline_inference(
                     speaker_audio=dataset_batch["speaker_reference_audio"],
@@ -2564,7 +3089,7 @@ class DuplexEARTTS(LightningModule, HFHubMixin):
             # warmup the model and generate the very first audio token
             outputs = self.tts_model(**init_inputs)
 
-        if self.cfg.get("inference_skip_first_code_prediction_on_init", True) or not self.cfg.get("use_magpietts_backbone", False):
+        if self.cfg.get("inference_skip_first_code_prediction_on_init", True) or self.cfg.get("use_magpietts_backbone", False):
             # use the last token on init, because we are shifthing it in the model forward, so we dont really need to compute it
             code = init_inputs["code"][:, -1:]
         else:

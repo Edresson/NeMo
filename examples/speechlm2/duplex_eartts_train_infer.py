@@ -39,6 +39,8 @@ def inference(cfg):
     with trainer.init_module():
         model = DuplexEARTTS(OmegaConf.to_container(cfg, resolve=True))
 
+    model.eval()
+
     dataset = DuplexEARTTSDataset(
         tokenizer=model.tokenizer,
         frame_length=cfg.data.frame_length,

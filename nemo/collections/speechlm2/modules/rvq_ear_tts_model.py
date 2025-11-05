@@ -777,7 +777,6 @@ class MoGHead(nn.Module):
         """
         b, t, _ = x.size()
         n, d = self.num_predictions, self.low_rank or self.out_size
-
         x = self.mlp_stack(x)
         if guidance_scale > 0:
             b //= 2
@@ -788,6 +787,7 @@ class MoGHead(nn.Module):
 
         # Apply top-p or top-k filtering to the mixture logits
         if top_p_or_k is not None:
+        
             logits = (
                 TopPLogitsWarper(top_p_or_k)(
                     None,
