@@ -248,8 +248,8 @@ class DecoderOnlyMagpieTTS(NeuralModule):
         # cfg = DictConfig(cfg)
         self.config = cfg
         self.parallel_codebook_loss_scale = self.config.get("parallel_codebook_loss_scale", 1.0)
-        self.config_unconditional_prob = self.config.get('cfg_unconditional_prob', 0.2)
-        self.config_scale = self.config.get('cfg_scale', 2.5)
+        self.cfg_unconditional_prob = self.config.get('cfg_unconditional_prob', 0.2)
+        self.cfg_scale = self.config.get('cfg_scale', 2.5)
         self.use_local_transformer = self.config.get('use_local_transformer', True)
         self.local_transformer_type = self.config.get('local_transformer_type', "ar")
         self.local_transformer_loss_scale = self.config.get('local_transformer_loss_scale', 1.0)
@@ -427,21 +427,25 @@ class DecoderOnlyMagpieTTS(NeuralModule):
         input_audio_emb = self.embed_audio_tokens(
             input_audio_tokens
         )
-        input_embeds = input_embeds + input_audio_emb
 
-        if self.config_unconditional_prob and guidance_enabled and not teacher_forcing_inference:
+        if self.cfg_unconditional_prob and guidance_enabled and not teacher_forcing_inference:
             if self.training:
                 # if training drop the "text" conditioning in a percentage of batch
-                if torch.rand(1).item() < self.config_unconditional_prob:
+                if torch.rand(1).item() < self.cfg_unconditional_prob:
                     # make the whole batch zeros to the unconditional model
                     input_embeds = torch.zeros_like(input_embeds)
-            elif self.config_scale is not None and not self.training:
+
+            elif self.cfg_scale is not None and not self.training:
                 # if inference or evaluation create a zero tensor for decoder input and concatenate it to compute unconditional logits
                 input_embeds_zeros = torch.zeros_like(input_embeds)
                 input_embeds = torch.cat([input_embeds, input_embeds_zeros], dim=0)
                 # duplicate mask to match the new shape
                 if attention_mask is not None:
                     attention_mask = torch.cat([attention_mask, attention_mask], dim=0)
+
+                input_audio_emb = torch.cat([input_audio_emb, input_audio_emb], dim=0)
+
+        input_embeds = input_embeds + input_audio_emb
 
         out = self.backbone(
             inputs_embeds=input_embeds,
@@ -458,7 +462,7 @@ class DecoderOnlyMagpieTTS(NeuralModule):
             return {"past_key_values": out.past_key_values}
 
         # teacher forcing inference
-        if audio_mask is not None and not self.training and teacher_forcing_inference:
+        if audio_mask is not None and teacher_forcing_inference:
             codebook_loss, loss_mask = self.compute_loss(logits, code, loss_mask=audio_mask)
             # local transformer
             local_transformer_logits = None
@@ -503,15 +507,16 @@ class DecoderOnlyMagpieTTS(NeuralModule):
                 "local_transformer_loss": local_transformer_loss *  self.local_transformer_loss_scale,
                 "codebook_loss": codebook_loss * self.parallel_codebook_loss_scale,
             }
+
             return {"loss_dict": loss_dict, "backbone_out": out.last_hidden_state, "past_key_values": out.past_key_values}
 
         # inference time
         # if using cfg and it is in inference or evaluation mix unconditional and coditional logits
-        if self.config_scale is not None and self.config_unconditional_prob and not self.training and guidance_enabled:
+        if self.cfg_scale is not None and self.cfg_unconditional_prob and not self.training and guidance_enabled:
             batch_size = logits.size(0) // 2
             cond_logits = logits[:batch_size]
             uncond_logits = logits[batch_size:]
-            logits = (1 - self.config_scale) * uncond_logits + self.config_scale * cond_logits
+            logits = (1 - self.cfg_scale) * uncond_logits + self.cfg_scale * cond_logits
 
         if self.use_local_transformer:
             codes = self.local_transformer_sample_codes_from_logits(out.last_hidden_state[:, -1], temperature=self.config.get('temperature', 0.7), topk=self.config.get('topk', 80)) # (B, num_codebooks)
@@ -710,7 +715,6 @@ class DecoderOnlyMagpieTTS(NeuralModule):
             for idx in range(self._num_codebooks):
                 si = (idx + self._num_codebooks * ds_index) * self.speech_vocab_size
                 ei = si + self.speech_vocab_size
-                print(all_code_logits.shape)
                 codebook_logits = all_code_logits[:, :, si:ei]
                 codebook_probs = torch.softmax(codebook_logits, dim=-1)  # (B, T', num_tokens_per_codebook)
                 # argmax to get the tokens
@@ -985,8 +989,8 @@ class DecoderOnlyMagpieTTS(NeuralModule):
                 dec_output=backbone_out,
                 temperature=temperature,
                 topk=topk,
-                use_cfg=self.config_unconditional_prob,
-                cfg_scale=self.config_scale
+                use_cfg=self.cfg_unconditional_prob,
+                cfg_scale=self.cfg_scale
             )
 
         else:
@@ -994,8 +998,8 @@ class DecoderOnlyMagpieTTS(NeuralModule):
                 dec_output=backbone_out,
                 temperature=temperature,
                 topk=topk,
-                use_cfg=self.config_unconditional_prob,
-                cfg_scale=self.config_scale,
+                use_cfg=self.cfg_unconditional_prob,
+                cfg_scale=self.cfg_scale,
                 n_steps=4,
                 noise_scale=maskgit_noise_scale,
                 fixed_schedule_n_unmasked=fixed_schedule_n_unmasked,
