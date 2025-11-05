@@ -84,17 +84,6 @@ import torch
 import torch.nn as nn
 import copy
 
-def patch_linear_fp32_forward(module):
-    """Wrap forward to ensure FP32."""
-    if hasattr(module, "_original_forward"):
-        return  # already patched
-    module._original_forward = module.forward
-
-    def new_forward(*args, **kwargs):
-        with fp32_precision():
-            return module._original_forward(*args, **kwargs)
-    module.forward = new_forward
-
 def maybe_to(x, dtype):
     if x is None:
         return None
@@ -103,112 +92,8 @@ def maybe_to(x, dtype):
     return x
 
 from collections import Counter
-def make_tts_model_mixed_precision_safe(model, inputs,
-                                        bf16_min=1e-2, bf16_max=1e2,
-                                        safety_factor=1.0):
-    safe_min = bf16_min * safety_factor
-    safe_max = bf16_max * safety_factor
-
-    # 1️⃣ Collect activation stats in FP32
-    model_fp32 = copy.deepcopy(model).eval().to(torch.float32)
-    stats = {}
-    hooks = []
-
-    def _activation_hook(name):
-        def hook(_, __, out):
-            if isinstance(out, tuple):
-                out = out[0]
-            if torch.is_tensor(out):
-                t = out.detach()
-                stats[name] = {"min": float(t.min()), "max": float(t.max())}
-        return hook
-
-    for name, module in model_fp32.named_modules():
-        if isinstance(module, (nn.Linear, nn.LayerNorm, nn.Embedding)):
-            hooks.append(module.register_forward_hook(_activation_hook(name)))
-
-    with torch.no_grad():
-        _ = model_fp32(code=inputs["code"], audio_mask=maybe_to(inputs["audio_mask"], torch.float32), attention_mask=maybe_to(inputs["attention_mask"], torch.float32), position_ids=inputs["position_ids"], context_hidden_state=maybe_to(inputs["context_hidden_state"], torch.float32), subword_ids=inputs["subword_ids"], subword_mask=maybe_to(inputs["subword_mask"], torch.float32), non_prompt_mask=maybe_to(inputs["non_prompt_mask"], torch.float32), asr_speech_tokens_emb=maybe_to(inputs["asr_speech_tokens_emb"], torch.float32), )
-
-    for h in hooks:
-        h.remove()
-
-    # 2️⃣ Patch BF16/FP16-safe layers
-    model_patched = copy.deepcopy(model).eval()
-    bf16_layers, fp32_layers = [], []
-
-    for name, module in model_patched.named_modules():
-        if name not in stats:
-            continue
-
-        mn, mx = stats[name]["min"], stats[name]["max"]
-        safe = (abs(mn) < safe_max and abs(mx) < safe_max
-                and not (abs(mn) < safe_min and abs(mx) < safe_min))
-
-        if isinstance(module, (nn.LayerNorm, nn.Embedding)):
-            module.to(torch.float32)
-            patch_linear_fp32_forward(module)
-            fp32_layers.append(name)
-        elif isinstance(module, nn.Linear):
-            if safe:
-                bf16_layers.append(name)
-            else:
-                module.to(torch.float32)
-                patch_linear_fp32_forward(module)
-                fp32_layers.append(name)
-
-    # 3️⃣ Count running dtype during a forward pass
-    running_dtypes = Counter()
-    hook_handles = []
-
-    def dtype_counter_hook(module, inputs, outputs):
-        for x in inputs:
-            if isinstance(x, torch.Tensor):
-                running_dtypes[str(x.dtype)] += 1
-        out_list = outputs if isinstance(outputs, (tuple, list)) else [outputs]
-        for x in out_list:
-            if isinstance(x, torch.Tensor):
-                running_dtypes[str(x.dtype)] += 1
-
-    # attach hooks to all linear/embedding/layernorm modules
-    for name, module in model_patched.named_modules():
-        if isinstance(module, (nn.Linear, nn.LayerNorm, nn.Embedding)):
-            hook_handles.append(module.register_forward_hook(dtype_counter_hook))
-
-    # run a forward to count dtypes
-    with torch.no_grad():
-        _ = model_patched(code=inputs["code"], audio_mask=maybe_to(inputs["audio_mask"], torch.float32), attention_mask=maybe_to(inputs["attention_mask"], torch.float32), position_ids=inputs["position_ids"], context_hidden_state=maybe_to(inputs["context_hidden_state"], torch.float32), subword_ids=inputs["subword_ids"], subword_mask=maybe_to(inputs["subword_mask"], torch.float32), non_prompt_mask=maybe_to(inputs["non_prompt_mask"], torch.float32), asr_speech_tokens_emb=maybe_to(inputs["asr_speech_tokens_emb"], torch.float32), )
-
-    # Count BF16/FP16 and FP32 activations
-    num_bf16_fp16 = running_dtypes.get("torch.bfloat16", 0) + running_dtypes.get("torch.float16", 0)
-    num_fp32 = running_dtypes.get("torch.float32", 0)
-
-    # remove hooks
-    for h in hook_handles:
-        h.remove()
-
-    summary = {
-        "bf16_layers": bf16_layers,
-        "fp32_layers": fp32_layers,
-        "num_bf16_fp16": num_bf16_fp16,
-        "num_fp32": num_fp32,
-        "stats": stats,
-        "safe_min": safe_min,
-        "safe_max": safe_max,
-        "safety_factor": safety_factor,
-    }
-
-    print("Num. BF16/FP16 activations:", num_bf16_fp16)
-    print("Num. FP32 activations:", num_fp32)
-
-    return model_patched, summary
-
-
-
 from contextlib import contextmanager
-
 import torch
-
 
 @contextmanager
 def ensures_16_precision(mixed_dtype):
