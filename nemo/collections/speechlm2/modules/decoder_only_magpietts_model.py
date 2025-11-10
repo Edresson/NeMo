@@ -258,6 +258,7 @@ class DecoderOnlyMagpieTTS(NeuralModule):
         self.frame_stacking_factor = self.config.get('frame_stacking_factor', 1)
         self._num_codebooks = self.config.get('num_quantizers', 13)
         self._codebook_size = self.config.get('codebook_size', 2016)
+        self.only_semantic_to_speech = self.config.get('only_semantic_to_speech', None)
 
         # Load ForCausalLM
         llm = load_pretrained_hf(self.config.pretrained_backbone_llm, pretrained_weights=self.config.get("pretrained_weights", True)).train()
@@ -267,6 +268,8 @@ class DecoderOnlyMagpieTTS(NeuralModule):
         #       messing up FSDP/TP hooks.
         self.embed_text_tokens = self.backbone.embed_tokens
         del self.backbone.embed_tokens
+
+        self.hidden_size = self.backbone.config.hidden_size
 
         # audio embeddings
         audio_embeddings = []
@@ -409,6 +412,7 @@ class DecoderOnlyMagpieTTS(NeuralModule):
         use_cache: bool = False,
         guidance_enabled: bool = True,
         teacher_forcing_inference: bool = False,
+        asr_speech_tokens_emb: Tensor | None = None,
         **kwargs
     ) -> dict[str, Tensor]:
         """
@@ -418,7 +422,14 @@ class DecoderOnlyMagpieTTS(NeuralModule):
                 (1) llm cache depends on input cache is None or Not
                 (2) speech_generation cache relys on reset_input_and_kv_cache function.
         """
-        input_embeds = self.cas_encoder(subword_ids, subword_mask=subword_mask)  # (B, L, E)
+        if not self.only_semantic_to_speech:
+            input_embeds = self.cas_encoder(subword_ids, subword_mask=subword_mask)  # (B, L, E)
+        else:
+            if asr_speech_tokens_emb is not None:
+                input_embeds = torch.zeros_like(asr_speech_tokens_emb)
+
+        if asr_speech_tokens_emb is not None:
+            input_embeds = input_embeds + asr_speech_tokens_emb
 
         # shift input audio tokens by 1
         input_audio_tokens = F.pad(code[:, :-1], [0, 0, 1, 0], value=self.speech_pad_id)

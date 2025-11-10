@@ -17,6 +17,7 @@ import tempfile
 import numpy as np
 import time
 
+import glob
 import torch
 import torch.distributed as dist
 import torch.nn.functional as F
@@ -2444,6 +2445,179 @@ class DuplexEARTTS(LightningModule, HFHubMixin):
         )
         return audio, audio_len, speaker_audio, speaker_audio_lens
 
+    def run_evaluation_one_batch(self, name, dataset_batch, use_dataloader_init=False):
+        results = {}
+        inputs = self.prepare_inputs(dataset_batch)
+
+        # 
+        # exit()
+        # first evaluation, make the model bf16 safe
+        if not self.model_16_precision_safe and self.cfg.get("ensures_16_safe", False) and str(self.trainer_config.precision) != str(32):
+            self.tts_model, summary = make_tts_model_mixed_precision_definite(self.tts_model, inputs, safety_factor=1.0, mixed_dtype=torch.float16 if str(self.trainer_config.precision) == str(16) else torch.bfloat16)
+            # self.tts_model, summary = make_tts_model_mixed_precision_safe(self.tts_model, inputs, safety_factor=1.0)
+            self.model_16_precision_safe = True
+
+            print("Current FP32 layers:", summary["fp32_layers"])
+            # compare_tts_model_fp32_bf16_mixed(self.tts_model, inputs)
+            # exit()
+
+        results["audio_tf"], results["audio_tf_len"] = self.get_teacher_force_inference_audio(dataset_batch)
+        if use_dataloader_init:
+            # cut it on prompt
+            init_inputs = {
+                "code": inputs["code"],
+                "audio_mask": inputs["audio_mask"],
+                "non_prompt_mask": inputs["non_prompt_mask"],
+                "context_hidden_state": inputs["context_hidden_state"],
+                "subword_ids": inputs["subword_ids"],
+                "subword_mask": inputs["subword_mask"],
+                "asr_speech_tokens_emb": inputs["asr_speech_tokens_emb"]
+            }
+            # cut init_inputs to consider only the prompt
+            for key in init_inputs:
+                if init_inputs[key] is not None:
+                    init_inputs[key] = torch.stack([
+                        init_inputs[key][i, :l]
+                        for i, l in enumerate(dataset_batch["desc_plus_audio_prompt_lens"])
+                    ])
+
+        # drop items without description to avoid issues
+        """
+        lens = dataset_batch["desc_plus_audio_prompt_lens"]  # list of lengths
+
+        # Example condition: keep only those with the maximum length
+        max_len = max(lens)
+        keep_indices = [i for i, l in enumerate(lens) if l == max_len]
+
+        # Convert indices to tensor for indexing torch tensors
+        keep_indices  = torch.tensor(keep_indices, dtype=torch.long)
+
+        # Now filter every key in dataset_batch
+        for k, v in dataset_batch.items():
+            if isinstance(v, torch.Tensor):
+                dataset_batch[k] = v[keep_indices]
+            elif isinstance(v, list):
+                dataset_batch[k] = [v[i] for i in keep_indices]
+
+        # Do the same for inputs
+        for k, v in inputs.items():
+            if isinstance(v, torch.Tensor):
+                inputs[k] = v[keep_indices]
+            elif isinstance(v, list):
+                inputs[k] = [v[i] for i in keep_indices]
+        """
+
+        # remove the prompt from the input_text_tokens to emulate S2S connected inference
+        next_subword_ids = torch.stack([
+            inputs["subword_ids"][i, l:]  # slice each element
+            for i, l in enumerate(dataset_batch["desc_plus_audio_prompt_lens"])
+        ])
+
+        if self.cfg.get("use_asr_speech_tokens", False) and self.cfg.get("only_semantic_to_speech", False):
+            inp_asr_speech_tokens = torch.stack([
+                inputs["target_asr_speech_tokens"][i, l:]  # slice each element
+                for i, l in enumerate(dataset_batch["desc_plus_audio_prompt_lens"])
+            ])
+        else:
+            inp_asr_speech_tokens = None
+
+        results["audio"], results["audio_len"] = self.offline_inference(
+            speaker_audio=dataset_batch["speaker_reference_audio"],
+            speaker_audio_lens=dataset_batch["speaker_reference_audio_lens"],
+            next_subword_ids=next_subword_ids,
+            formatter=dataset_batch["formatter"][0],
+            inp_asr_speech_tokens=inp_asr_speech_tokens,
+            init_inputs=init_inputs if use_dataloader_init else None,
+        )
+
+        # remove prompt padding from the user audio as autoregressive inference does not return the prompt
+        dataset_batch["source_audio"] = dataset_batch["source_audio"][:, -int(next_subword_ids.size(-1)*self.source_samples_per_frame):]
+
+        # clean prompt from the audio
+        results["audio_tf"] = results["audio_tf"][:, -int(next_subword_ids.size(-1)*self.target_samples_per_frame):]
+        # remove prompt from target audio
+        target_audio_no_prompt = dataset_batch["target_audio"][:, -int(next_subword_ids.size(-1)*self.target_samples_per_frame):]
+        target_audio_no_prompt_lens = dataset_batch["target_audio_lens"] - (torch.tensor(dataset_batch["desc_plus_audio_prompt_lens"], dtype=torch.long, device=dataset_batch["target_audio_lens"].device) * self.target_samples_per_frame)
+        # for i, l in enumerate(dataset_batch["desc_plus_audio_prompt_lens"]):
+        #    results["audio_tf"][i, :l*self.target_samples_per_frame] = 0.0
+
+        with fp32_precision():  # resample is fragile to bfloat16 default dtype
+            metric_audio_pred = results["audio"]
+            metric_audio_pred_lens = results["audio_len"]
+
+            # resample audio to the asr sampling rate
+            metric_audio_pred = resample(metric_audio_pred, self.target_sample_rate, 16000)
+            metric_audio_pred_lens = (metric_audio_pred_lens / self.target_sample_rate * 16000).to(torch.long)
+            # reshape target audio without prompt
+            target_audio_no_prompt_16khz = resample(target_audio_no_prompt, self.target_sample_rate, 16000)
+            target_audio_no_prompt_lens_16khz = (target_audio_no_prompt_lens / self.target_sample_rate * 16000).to(torch.long)
+            if self.cfg.get("use_GT_transcriptions_for_metrics", True):
+                # use target audio transcription for metrics
+                target_asr_texts = self.asr_bleu.asr.transcribe(
+                    [audio[:alen] for audio, alen in zip(target_audio_no_prompt_16khz, target_audio_no_prompt_lens_16khz)],
+                    batch_size=target_audio_no_prompt_16khz.shape[0],
+                    verbose=False,
+                )
+                metric_text = [asr_hyp.text for asr_hyp in target_asr_texts]
+            else:
+                metric_text = dataset_batch["target_texts"]
+
+            asr_hyps = self.asr_bleu.update(
+                name=name,
+                refs=metric_text,
+                pred_audio=metric_audio_pred,
+                pred_audio_lens=metric_audio_pred_lens,
+            )
+
+            self.intelligibility.update(
+                name=name,
+                refs=metric_text,
+                pred_audio=metric_audio_pred,
+                pred_audio_lens=metric_audio_pred_lens,
+                asr_hyps=asr_hyps,
+            )
+            
+            # add ground truth intelligibility metrics
+            self.intelligibility.update(
+                name=name+"_gt",
+                refs=dataset_batch["target_texts"],
+                pred_audio=target_audio_no_prompt_16khz,
+                pred_audio_lens=target_audio_no_prompt_lens_16khz,
+                asr_hyps=metric_text if self.cfg.get("use_GT_transcriptions_for_metrics", True) else None, # reuse GT transcription
+            )
+
+            self.secs.update(
+                name=name,
+                target_audio=resample(dataset_batch["target_audio"], self.target_sample_rate, 16000),
+                target_audio_lens=(dataset_batch["target_audio_lens"] / self.target_sample_rate * 16000).to(torch.long),
+                pred_audio=resample(results["audio"], self.target_sample_rate, 16000),
+                pred_audio_lens=(results["audio_len"] / self.target_sample_rate * 16000).to(torch.long),
+            )
+
+            eou_labels = generate_multiturn_speaking_mask(
+                next_subword_ids, bos_token_id=self.text_bos_id, eos_token_id=self.text_eos_id
+            )
+
+            self.results_logger.update(
+                name=name,
+                refs=dataset_batch["target_texts"],
+                hyps=metric_text,
+                asr_hyps=asr_hyps,
+                samples_id=dataset_batch['sample_id'],
+                pred_audio=results["audio"].float(),
+                pred_audio_tf=results["audio_tf"].float(),
+                pre_audio_trimmed=None,
+                reference_audio=dataset_batch["speaker_reference_audio"].float(),
+                target_audio=target_audio_no_prompt.float(),
+                pred_audio_sr=self.target_sample_rate,
+                user_audio=dataset_batch["source_audio"].float(),
+                user_audio_sr=self.source_sample_rate,
+                eou_pred=eou_labels,
+                fps=self.target_fps,
+                results=results if self.cfg.get("dump_tokens_text", False) else None,
+                tokenizer=self.tokenizer,
+            )
+
     def validation_step(self, batch: dict, batch_idx: int):
         if self.cfg.get("test_sentences", None) and self.cfg.get("inference_speaker_reference", None):
             for name in self.cfg.test_sentences.keys():
@@ -2488,10 +2662,10 @@ class DuplexEARTTS(LightningModule, HFHubMixin):
                         hyps=test_sentences,
                         asr_hyps=asr_hyps,
                         samples_id=[str(i) for i in range(len(test_sentences))],
-                        pred_audio=results["audio"],
+                        pred_audio=results["audio"].float(),
                         pred_audio_tf=None,
                         pre_audio_trimmed=None,
-                        reference_audio=speaker_audio,
+                        reference_audio=speaker_audio.float(),
                         target_audio=None,
                         pred_audio_sr=self.target_sample_rate,
                         user_audio=None,
@@ -2501,178 +2675,47 @@ class DuplexEARTTS(LightningModule, HFHubMixin):
                         results=None,
                         tokenizer=self.tokenizer,
                     )
+
         else:
             for name, dataset_batch in batch.items():
                 if dataset_batch is None:
                     continue  # some dataset is exhausted
-
-                results = {}
-                inputs = self.prepare_inputs(dataset_batch)
-
-                # 
-                # exit()
-                # first evaluation, make the model bf16 safe
-                if not self.model_16_precision_safe and self.cfg.get("ensures_16_safe", True) and str(self.trainer_config.precision) != str(32):
-                    self.tts_model, summary = make_tts_model_mixed_precision_definite(self.tts_model, inputs, safety_factor=1.0, mixed_dtype=torch.float16 if str(self.trainer_config.precision) == str(16) else torch.bfloat16)
-                    # self.tts_model, summary = make_tts_model_mixed_precision_safe(self.tts_model, inputs, safety_factor=1.0)
-                    self.model_16_precision_safe = True
-
-                    print("Current FP32 layers:", summary["fp32_layers"])
-                    # compare_tts_model_fp32_bf16_mixed(self.tts_model, inputs)
-                    # exit()
-
-                results["audio_tf"], results["audio_tf_len"] = self.get_teacher_force_inference_audio(dataset_batch)
-                # cut it on prompt
-                init_inputs = {
-                    "code": inputs["code"],
-                    "audio_mask": inputs["audio_mask"],
-                    "non_prompt_mask": inputs["non_prompt_mask"],
-                    "context_hidden_state": inputs["context_hidden_state"],
-                    "subword_ids": inputs["subword_ids"],
-                    "subword_mask": inputs["subword_mask"],
-                }
-                # cut init_inputs to consider only the prompt
-                for key in init_inputs:
-                    if init_inputs[key] is not None:
-                        init_inputs[key] = torch.stack([
-                            init_inputs[key][i, :l]
-                            for i, l in enumerate(dataset_batch["desc_plus_audio_prompt_lens"])
-                        ])
-
-                # drop items without description to avoid issues
-                lens = dataset_batch["desc_plus_audio_prompt_lens"]  # list of lengths
-
-                # Example condition: keep only those with the maximum length
-                max_len = max(lens)
-                keep_indices = [i for i, l in enumerate(lens) if l == max_len]
-
-                # Convert indices to tensor for indexing torch tensors
-                keep_indices  = torch.tensor(keep_indices, dtype=torch.long)
-
-                # Now filter every key in dataset_batch
-                for k, v in dataset_batch.items():
-                    if isinstance(v, torch.Tensor):
-                        dataset_batch[k] = v[keep_indices]
-                    elif isinstance(v, list):
-                        dataset_batch[k] = [v[i] for i in keep_indices]
-
-                # Do the same for inputs
-                for k, v in inputs.items():
-                    if isinstance(v, torch.Tensor):
-                        inputs[k] = v[keep_indices]
-                    elif isinstance(v, list):
-                        inputs[k] = [v[i] for i in keep_indices]
-
-                # remove the prompt from the input_text_tokens to emulate S2S connected inference
-                next_subword_ids = torch.stack([
-                    inputs["subword_ids"][i, l:]  # slice each element
-                    for i, l in enumerate(dataset_batch["desc_plus_audio_prompt_lens"])
-                ])
-
-                if self.cfg.get("use_asr_speech_tokens", False) and self.cfg.get("only_semantic_to_speech", False):
-                    inp_asr_speech_tokens = torch.stack([
-                        inputs["target_asr_speech_tokens"][i, l:]  # slice each element
-                        for i, l in enumerate(dataset_batch["desc_plus_audio_prompt_lens"])
-                    ])
+                # run inference for multiples references
+                if self.cfg.get("inference_speaker_reference_path", None):
+                    B = len(dataset_batch['sample_id'])
+                    for inference_speaker_reference in  glob.glob(os.path.join(self.cfg.inference_speaker_reference_path, "**"), recursive=True):
+                        if not os.path.isfile(inference_speaker_reference):
+                            continue
+                        print("Generating sample for speaker refernce:", inference_speaker_reference)
+                        new_dataset_batch = copy.deepcopy(dataset_batch)
+                        # Get only the file name
+                        ref_name = os.path.basename(inference_speaker_reference)
+                        # Append to each sample_id
+                        new_dataset_batch['sample_id'] = [
+                            f"{sid}_{ref_name}" for sid in dataset_batch['sample_id']
+                        ]
+                        speaker_audio, sr = torchaudio.load(inference_speaker_reference)
+                        speaker_audio = resample(speaker_audio, sr, self.target_sample_rate)
+                        speaker_audio = speaker_audio.repeat(B, 1).to(self.device) 
+                        # lengths -> [B]
+                        speaker_audio_lens = torch.tensor([speaker_audio.size(1)], device=self.device).long().repeat(B)
+                        new_dataset_batch["speaker_reference_audio"] = speaker_audio
+                        new_dataset_batch["speaker_reference_audio_lens"] = speaker_audio_lens
+                        self.run_evaluation_one_batch(name, new_dataset_batch, use_dataloader_init=False)
+                # run inference for a custom speaker reference
+                elif self.cfg.get("inference_speaker_reference", None):
+                    new_dataset_batch = copy.deepcopy(dataset_batch)
+                    speaker_audio, sr = torchaudio.load(inference_speaker_reference)
+                    speaker_audio = resample(speaker_audio, sr, self.target_sample_rate)
+                    speaker_audio = speaker_audio.repeat(B, 1).to(self.device) 
+                    # lengths -> [B]
+                    speaker_audio_lens = torch.tensor([speaker_audio.size(1)], device=self.device).long().repeat(B)
+                    new_dataset_batch["speaker_reference_audio"] = speaker_audio
+                    new_dataset_batch["speaker_reference_audio_lens"] = speaker_audio_lens
+                    self.run_evaluation_one_batch(name, new_dataset_batch, use_dataloader_init=False)
+                # run inference using dataloader speaker references
                 else:
-                    inp_asr_speech_tokens = None
-
-                results["audio"], results["audio_len"] = self.offline_inference(
-                    speaker_audio=dataset_batch["speaker_reference_audio"],
-                    speaker_audio_lens=dataset_batch["speaker_reference_audio_lens"],
-                    next_subword_ids=next_subword_ids,
-                    formatter=dataset_batch["formatter"][0],
-                    inp_asr_speech_tokens=inp_asr_speech_tokens,
-                    init_inputs=init_inputs,
-                )
-
-                # remove prompt padding from the user audio as autoregressive inference does not return the prompt
-                dataset_batch["source_audio"] = dataset_batch["source_audio"][:, -int(next_subword_ids.size(-1)*self.source_samples_per_frame):]
-
-                # clean prompt from the audio
-                results["audio_tf"] = results["audio_tf"][:, -int(next_subword_ids.size(-1)*self.target_samples_per_frame):]
-                # remove prompt from target audio
-                target_audio_no_prompt = dataset_batch["target_audio"][:, -int(next_subword_ids.size(-1)*self.target_samples_per_frame):]
-                target_audio_no_prompt_lens = dataset_batch["target_audio_lens"] - (torch.tensor(dataset_batch["desc_plus_audio_prompt_lens"], dtype=torch.long, device=dataset_batch["target_audio_lens"].device) * self.target_samples_per_frame)
-                # for i, l in enumerate(dataset_batch["desc_plus_audio_prompt_lens"]):
-                #    results["audio_tf"][i, :l*self.target_samples_per_frame] = 0.0
-
-                with fp32_precision():  # resample is fragile to bfloat16 default dtype
-                    metric_audio_pred = results["audio"]
-                    metric_audio_pred_lens = results["audio_len"]
-
-                    # resample audio to the asr sampling rate
-                    metric_audio_pred = resample(metric_audio_pred, self.target_sample_rate, 16000)
-                    metric_audio_pred_lens = (metric_audio_pred_lens / self.target_sample_rate * 16000).to(torch.long)
-                    # reshape target audio without prompt
-                    target_audio_no_prompt_16khz = resample(target_audio_no_prompt, self.target_sample_rate, 16000)
-                    target_audio_no_prompt_lens_16khz = (target_audio_no_prompt_lens / self.target_sample_rate * 16000).to(torch.long)
-                    if self.cfg.get("use_GT_transcriptions_for_metrics", True):
-                        # use target audio transcription for metrics
-                        target_asr_texts = self.asr_bleu.asr.transcribe(
-                            [audio[:alen] for audio, alen in zip(target_audio_no_prompt_16khz, target_audio_no_prompt_lens_16khz)],
-                            batch_size=target_audio_no_prompt_16khz.shape[0],
-                            verbose=False,
-                        )
-                        metric_text = [asr_hyp.text for asr_hyp in target_asr_texts]
-                    else:
-                        metric_text = dataset_batch["target_texts"]
-
-                    asr_hyps = self.asr_bleu.update(
-                        name=name,
-                        refs=metric_text,
-                        pred_audio=metric_audio_pred,
-                        pred_audio_lens=metric_audio_pred_lens,
-                    )
-
-                    self.intelligibility.update(
-                        name=name,
-                        refs=metric_text,
-                        pred_audio=metric_audio_pred,
-                        pred_audio_lens=metric_audio_pred_lens,
-                        asr_hyps=asr_hyps,
-                    )
-                    
-                    # add ground truth intelligibility metrics
-                    self.intelligibility.update(
-                        name=name+"_gt",
-                        refs=dataset_batch["target_texts"],
-                        pred_audio=target_audio_no_prompt_16khz,
-                        pred_audio_lens=target_audio_no_prompt_lens_16khz,
-                        asr_hyps=metric_text if self.cfg.get("use_GT_transcriptions_for_metrics", True) else None, # reuse GT transcription
-                    )
-
-                    self.secs.update(
-                        name=name,
-                        target_audio=resample(dataset_batch["target_audio"], self.target_sample_rate, 16000),
-                        target_audio_lens=(dataset_batch["target_audio_lens"] / self.target_sample_rate * 16000).to(torch.long),
-                        pred_audio=resample(results["audio"], self.target_sample_rate, 16000),
-                        pred_audio_lens=(results["audio_len"] / self.target_sample_rate * 16000).to(torch.long),
-                    )
-
-                    eou_labels = generate_multiturn_speaking_mask(
-                        next_subword_ids, bos_token_id=self.text_bos_id, eos_token_id=self.text_eos_id
-                    )
-
-                    self.results_logger.update(
-                        name=name,
-                        refs=dataset_batch["target_texts"],
-                        hyps=metric_text,
-                        asr_hyps=asr_hyps,
-                        samples_id=dataset_batch['sample_id'],
-                        pred_audio=results["audio"],
-                        pred_audio_tf=results["audio_tf"],
-                        pre_audio_trimmed=None,
-                        reference_audio=dataset_batch["speaker_reference_audio"],
-                        target_audio=target_audio_no_prompt,
-                        pred_audio_sr=self.target_sample_rate,
-                        user_audio=dataset_batch["source_audio"],
-                        user_audio_sr=self.source_sample_rate,
-                        eou_pred=eou_labels,
-                        fps=self.target_fps,
-                        results=results if self.cfg.get("dump_tokens_text", False) else None,
-                        tokenizer=self.tokenizer,
-                    )
+                    self.run_evaluation_one_batch(name, dataset_batch, use_dataloader_init=False)
 
     def on_test_epoch_start(self) -> None:
         return self.on_validation_epoch_start()
