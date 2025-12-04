@@ -176,6 +176,15 @@ class DuplexSTTModel(LightningModule, HFHubMixin):
             self._noise_files_cache = {}
             self._lowpass_filter_cache = {}  # Cache for lowpass filter coefficients
 
+        # Preload backchannel file names for backchannel augmentation
+        if self.cfg.get('backchannel_file_path', None) and self.cfg.get('backchannel_prob', 0) > 0:
+            import glob
+            backchannel_files = glob.glob(os.path.join(self.cfg.backchannel_file_path, "*.wav"))
+            if not backchannel_files:
+                raise ValueError(f"No backchannel files found in {self.cfg.backchannel_file_path}")
+            self._backchannel_files = backchannel_files
+            logging.info(f"Loaded {len(self._backchannel_files)} backchannel files from {self.cfg.backchannel_file_path}")
+
     def init_perception_from_another_s2s_checkpoint(self, checkpoint_path):
         if checkpoint_path is not None:
             if '.nemo' in checkpoint_path:
@@ -459,6 +468,81 @@ class DuplexSTTModel(LightningModule, HFHubMixin):
 
         return target_tokens, sil_id
 
+    def add_backchannel_to_batch(
+            self,
+            batch_audio,
+            silence_start,
+            silence_end,
+            insert_prob=0.5,
+            scaling_range=(0.5, 1.0),
+    ):
+        """
+        Add backchannel audio to silence segments in the batch.
+        
+        Args:
+            batch_audio: (B, T) tensor of audio signals at 16kHz
+            silence_start: list of silence start times (in seconds) for each sample
+            silence_end: list of silence end times (in seconds) for each sample
+            insert_prob: probability of inserting backchannel in each silence segment
+            scaling_range: tuple of (min, max) scaling factors for backchannel audio
+        
+        Returns:
+            batch_audio: modified audio batch with backchannel inserted
+        """
+        batch_size, signal_length = batch_audio.shape
+        target_sr = 16000  # batch_audio sample rate
+        
+        selected_files = random.choices(self._backchannel_files, k=batch_size)
+        
+        for i in range(batch_size):
+            seg_starts = silence_start[i] if isinstance(silence_start[i], list) else silence_start[i].cpu().numpy().tolist()
+            seg_ends = silence_end[i] if isinstance(silence_end[i], list) else silence_end[i].cpu().numpy().tolist()
+            
+            for seg_start, seg_end in zip(seg_starts, seg_ends):
+                silence_duration = seg_end - seg_start
+                
+                # Skip if silence is too short (less than 4 seconds)
+                if silence_duration < 4.0:
+                    continue
+                
+                if random.random() > insert_prob:
+                    continue
+                
+                waveform, file_sr = torchaudio.load(selected_files[i])
+                
+                if waveform.shape[0] > 1:
+                    waveform = torch.mean(waveform, dim=0, keepdim=True)
+                waveform = waveform.squeeze(0)
+                
+                if file_sr != target_sr:
+                    waveform = torchaudio.functional.resample(waveform, orig_freq=file_sr, new_freq=target_sr)
+                
+                backchannel_duration = waveform.shape[0] / target_sr
+                
+                if backchannel_duration > (silence_duration - 4.0):
+                    continue
+                
+                insertion_window_start = seg_start + 2.0
+                insertion_window_end = seg_end - 2.0 - backchannel_duration
+                
+                if insertion_window_end < insertion_window_start:
+                    continue
+                
+                insertion_time = random.uniform(insertion_window_start, insertion_window_end)
+                insertion_idx = int(insertion_time * target_sr)
+                insertion_end_idx = insertion_idx + waveform.shape[0]
+                
+                if insertion_end_idx > signal_length:
+                    continue
+                
+                backchannel_tensor = waveform.to(device=batch_audio.device, dtype=batch_audio.dtype)
+                scale = random.uniform(scaling_range[0], scaling_range[1])
+                backchannel_tensor = backchannel_tensor * scale
+                
+                batch_audio[i, insertion_idx:insertion_end_idx] = backchannel_tensor
+        
+        return batch_audio
+
     def prepare_inputs(self, batch: dict):     
         if self.cfg.get('use_old_noise_aug', None):
             noise_prob = self.cfg.get('old_noise_prob', 0.99)
@@ -485,7 +569,20 @@ class DuplexSTTModel(LightningModule, HFHubMixin):
                     noise_prob_low_pass=self.cfg.get('noise_prob_low_pass', 0.1),
                 )
 
-        
+        # Apply backchannel insertion if configured (training only)
+        if self.cfg.get('backchannel_file_path', None) and self.cfg.get('backchannel_prob', 0) > 0:
+            if self.training and random.random() < self.cfg.backchannel_prob:
+                if "silence_start" in batch and "silence_end" in batch:
+                    backchannel_scaling_range = self.cfg.get('backchannel_scaling_range', (0.5, 1.0))
+                    backchannel_insert_prob = self.cfg.get('backchannel_insert_prob', 0.5)
+                    
+                    batch["source_audio"] = self.add_backchannel_to_batch(
+                        batch["source_audio"],
+                        batch["silence_start"],
+                        batch["silence_end"],
+                        insert_prob=backchannel_insert_prob,
+                        scaling_range=backchannel_scaling_range,
+                    )
 
         source_encoded, source_encoded_lens, _ = self.perception(
             input_signal=batch["source_audio"],
