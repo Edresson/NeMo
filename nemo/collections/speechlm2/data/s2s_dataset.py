@@ -11,13 +11,18 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import glob
+import os
 import re
 import random
 import torch
 import torch.utils.data
 import torchaudio
+import numpy as np
+import soundfile as sf
+from io import BytesIO
 
-from lhotse import CutSet, MonoCut, Recording, Seconds, SupervisionSegment, compute_num_frames
+from lhotse import CutSet, MonoCut, Recording, Seconds, SupervisionSegment, compute_num_frames, AudioSource
 from lhotse.cut import Cut
 from lhotse.dataset.collation import collate_audio, collate_vectors
 from lhotse.utils import ifnone
@@ -28,9 +33,65 @@ from nemo.collections.speechlm2.data.force_align import ForceAligner
 from nemo.utils import logging
 from nemo.collections.common.data.lhotse.text_adapters import Formattable
 import inflect
-import re
 
 _inflect = inflect.engine()
+
+
+def detect_silence_segments(audio_batch: torch.Tensor, audio_lens: torch.Tensor, 
+                           sample_rate: int, min_silence_samples: int = 100):
+    """
+    Detect silence segments in audio batch by finding consecutive zeros.
+    
+    Args:
+        audio_batch: (B, T) tensor of audio signals
+        audio_lens: (B,) tensor of actual audio lengths (excluding padding)
+        sample_rate: sample rate of the audio
+        min_silence_samples: minimum consecutive zero samples to be considered silence
+    
+    Returns:
+        silence_start: list of lists, silence start times in seconds for each sample
+        silence_end: list of lists, silence end times in seconds for each sample
+    """
+    batch_size = audio_batch.shape[0]
+    silence_start_batch = []
+    silence_end_batch = []
+    
+    for i in range(batch_size):
+        actual_length = audio_lens[i].item()
+        audio = audio_batch[i, :actual_length]
+        
+        is_zero = (audio.abs() < 1e-6).cpu().numpy()
+        
+        silence_starts = []
+        silence_ends = []
+        
+        in_silence = False
+        silence_start_idx = 0
+        
+        for idx in range(len(is_zero)):
+            if is_zero[idx]:
+                if not in_silence:
+                    silence_start_idx = idx
+                    in_silence = True
+            else:
+                if in_silence:
+                    silence_length = idx - silence_start_idx
+                    if silence_length >= min_silence_samples:
+                        silence_starts.append(silence_start_idx / sample_rate)
+                        silence_ends.append(idx / sample_rate)
+                    in_silence = False
+        
+        if in_silence:
+            silence_length = len(is_zero) - silence_start_idx
+            if silence_length >= min_silence_samples:
+                silence_starts.append(silence_start_idx / sample_rate)
+                silence_ends.append(len(is_zero) / sample_rate)
+        
+        silence_start_batch.append(silence_starts)
+        silence_end_batch.append(silence_ends)
+    
+    return silence_start_batch, silence_end_batch
+
 
 _COMMA_RE    = re.compile(r"([0-9][0-9,]+[0-9])")
 _DECIMAL_RE  = re.compile(r"\b([0-9]+)\.([0-9]+)\b")
@@ -215,6 +276,22 @@ class DuplexS2SDataset(torch.utils.data.Dataset):
         # Initialize force aligner lazily (only when needed during training)
         # This avoids loading the wav2vec2 model during validation
         self.force_aligner = None
+        if self.force_align_user_text:
+            self.force_aligner = ForceAligner(device=self.force_align_device, frame_length=self.frame_length)
+
+        # Keyword augmentation for interruption sensitivity (disabled by default)
+        self.keyword_augment_prob = cfg.get("keyword_augment_prob", 0.0) if cfg is not None else 0.0
+        self.keyword_audio_dir = cfg.get(
+            "keyword_audio_dir",
+            "/lustre/fsw/portfolios/llmservice/users/cchen1/code/data_generation/keyword_gen/output"
+        ) if cfg is not None else "/lustre/fsw/portfolios/llmservice/users/cchen1/code/data_generation/keyword_gen/output"
+        self._keyword_audio_cache = None
+
+        # Speed perturbation for user speech diversity (disabled by default, only for 2-turn)
+        self.speed_perturb_prob = cfg.get("speed_perturb_prob", 0.0) if cfg is not None else 0.0
+        self.speed_perturb_factors = cfg.get("speed_perturb_factors", [0.8, 0.9, 1.0, 1.1, 1.2]) if cfg is not None else [0.8, 0.9, 1.0, 1.1, 1.2]
+        self._speed_perturbation = None
+        
         self._force_aligner_initialized = False
 
         self.early_interruption_prob = early_interruption_prob if early_interruption_prob is not None else cfg.get("early_interruption_prob", 0.0) if cfg is not None else 0.0
@@ -374,6 +451,14 @@ class DuplexS2SDataset(torch.utils.data.Dataset):
                 all_cuts_combined = CutSet.from_cuts(list(cuts) + swapped_cuts)
             else:
                 all_cuts_combined = cuts
+
+            # Apply keyword augmentation for interruption sensitivity (training only)
+            if self.keyword_augment_prob > 0 and torch.is_grad_enabled():
+                all_cuts_combined = self._augment_cuts_with_keywords(all_cuts_combined)
+
+            # Apply speed perturbation for user speech diversity (training only, 2-turn only)
+            if self.speed_perturb_prob > 0 and torch.is_grad_enabled():
+                all_cuts_combined = self._augment_cuts_with_speed_perturbation(all_cuts_combined)
             
             prompt_tokens, prompt_token_lens = collate_system_prompt(
                 all_cuts_combined, self.tokenizer
@@ -413,7 +498,19 @@ class DuplexS2SDataset(torch.utils.data.Dataset):
                 user_bos_id=self.tokenizer.text_to_ids('^')[0], 
                 agent_bos_id=self.tokenizer.bos
             )
+            """
+            if self.cfg.get("user_bos_as_agent_eos", False):
+                # Mask agent EOS → PAD
+                agent_eos_mask = target_tokens == self.tokenizer.eos
+                target_tokens[agent_eos_mask] = self.tokenizer.pad_id
 
+                # Replace source BOS (^) with EOS in target
+                bos_token_id = self.tokenizer.text_to_ids('^')[0]
+                source_bos_mask = source_tokens == bos_token_id
+
+                assert source_tokens.shape == target_tokens.shape
+                target_tokens[source_bos_mask] = self.tokenizer.eos
+            """
             # Early interruption augmentation
             if self.early_interruption_prob > 0 and torch.is_grad_enabled():
                 for batch_idx in range(target_tokens.shape[0]):
@@ -444,6 +541,11 @@ class DuplexS2SDataset(torch.utils.data.Dataset):
                 import pdb; pdb.set_trace()
 
 
+            # Detect silence segments for backchannel insertion
+            silence_start, silence_end = detect_silence_segments(
+                source_audio, source_audio_lens, self.source_sample_rate, min_silence_samples=16000
+            )
+
             audio_data = {
                 "sample_id": [str(cut.id) for cut in all_cuts_combined],
                 "source_audio": source_audio,
@@ -467,7 +569,9 @@ class DuplexS2SDataset(torch.utils.data.Dataset):
                 "target_first_turn_audio": target_first_turn_audio,
                 "target_first_turn_audio_lens": target_first_turn_audio_lens,
                 "formatter": [getattr(cut, "formatter", "s2s_duplex") for cut in all_cuts_combined],
-                "aug_by_noise": [getattr(cut, "aug_by_noise", True) for cut in all_cuts_combined]
+                "aug_by_noise": [getattr(cut, "aug_by_noise", True) for cut in all_cuts_combined],
+                "silence_start": silence_start,
+                "silence_end": silence_end,
             }
         
             if torch.sum(prompt_token_lens) > 0:
@@ -529,12 +633,6 @@ class DuplexS2SDataset(torch.utils.data.Dataset):
         }
 
     def _create_role_swapped_cut(self, cut):
-
-        from lhotse import AudioSource
-        from io import BytesIO
-        import soundfile as sf
-        import numpy as np
-
         swapped_supervisions = []
         for sup in cut.supervisions:
             if sup.speaker == 'User':
@@ -680,6 +778,340 @@ class DuplexS2SDataset(torch.utils.data.Dataset):
         )
 
         return swapped_cut
+
+    # ==================== Keyword Augmentation Methods ====================
+
+    def _load_keyword_audios(self):
+        """Lazy load keyword audio file paths."""
+        if self._keyword_audio_cache is None and self.keyword_audio_dir:
+            self._keyword_audio_cache = glob.glob(os.path.join(self.keyword_audio_dir, "*.wav"))
+            if self._keyword_audio_cache:
+                logging.info(f"Loaded {len(self._keyword_audio_cache)} keyword audio files")
+        return self._keyword_audio_cache or []
+
+    def _augment_cuts_with_keywords(self, cuts: CutSet) -> CutSet:
+        """Insert keyword audio before interrupting user turns to enhance agent sensitivity."""
+        keyword_audios = self._load_keyword_audios()
+        if not keyword_audios:
+            return cuts
+
+        augmented_cuts = []
+        for cut in cuts:
+            if random.random() > self.keyword_augment_prob:
+                augmented_cuts.append(cut)
+                continue
+
+            # Find interrupted agent turns (interruption != 0)
+            interruption_pairs = []
+            for i, sup in enumerate(cut.supervisions):
+                if sup.speaker in self.output_roles:
+                    interruption = sup.custom.get('interruption', 0) if sup.custom else 0
+                    if interruption != 0 and i + 1 < len(cut.supervisions):
+                        next_sup = cut.supervisions[i + 1]
+                        if next_sup.speaker in self.input_roles:
+                            interruption_pairs.append((i, i + 1))
+
+            if not interruption_pairs:
+                augmented_cuts.append(cut)
+                continue
+
+            try:
+                augmented_cut = self._insert_keywords_at_interruptions(cut, interruption_pairs, keyword_audios)
+                augmented_cuts.append(augmented_cut)
+            except Exception as e:
+                logging.warning(f"Keyword augmentation failed for {cut.id}: {e}")
+                augmented_cuts.append(cut)
+
+        return CutSet.from_cuts(augmented_cuts)
+
+    def _insert_keywords_at_interruptions(self, cut, interruption_pairs, keyword_audios):
+        """
+        Insert keywords at interruption points while preserving reaction time.
+        
+        Key: Interrupted agent's timestamps stay unchanged (preserves ~0.64s reaction time).
+        Only the interrupting user turn and subsequent turns are shifted.
+        """
+        # Collect keyword info for each interruption
+        keyword_info = []
+        for agent_idx, user_idx in interruption_pairs:
+            user_sup = cut.supervisions[user_idx]
+            keyword_path = random.choice(keyword_audios)
+            kw_audio, kw_sr = sf.read(keyword_path, dtype='float32')
+
+            if kw_sr != cut.sampling_rate:
+                import librosa
+                kw_audio = librosa.resample(kw_audio, orig_sr=kw_sr, target_sr=cut.sampling_rate)
+
+            kw_duration = len(kw_audio) / cut.sampling_rate
+            kw_text = self._get_keyword_text(keyword_path)
+            keyword_info.append((user_sup.start, kw_audio, kw_duration, kw_text, agent_idx))
+
+        keyword_info.sort(key=lambda x: x[0])
+
+        # Build new supervisions with cumulative offset
+        new_supervisions = []
+
+        for i, sup in enumerate(cut.supervisions):
+            # Check if this is an interrupting user turn
+            is_interrupting_user = any(user_idx == i for _, user_idx in interruption_pairs)
+            is_interrupted_agent = any(agent_idx == i for _, _, _, _, agent_idx in keyword_info)
+
+            # Calculate offset: sum of all keyword durations inserted before this turn
+            offset = sum(kw_dur for insert_time, _, kw_dur, _, _ in keyword_info if insert_time <= sup.start)
+
+            if is_interrupted_agent:
+                # Interrupted agent: offset only from keywords before it (not including its own)
+                offset = sum(kw_dur for insert_time, _, kw_dur, _, agent_idx in keyword_info
+                            if agent_idx < i)
+                new_sup = SupervisionSegment(
+                    id=sup.id, recording_id=sup.recording_id,
+                    start=sup.start + offset, duration=sup.duration,
+                    channel=sup.channel, text=sup.text, speaker=sup.speaker,
+                    custom=sup.custom, language=getattr(sup, 'language', None)
+                )
+                new_supervisions.append(new_sup)
+
+            elif is_interrupting_user:
+                # Insert keyword supervision first
+                for insert_time, _, kw_dur, kw_text, agent_idx in keyword_info:
+                    if cut.supervisions[agent_idx + 1].id == sup.id:
+                        kw_offset = sum(d for t, _, d, _, _ in keyword_info if t < insert_time)
+                        kw_sup = SupervisionSegment(
+                            id=f"{sup.id}_keyword", recording_id=sup.recording_id,
+                            start=insert_time + kw_offset, duration=kw_dur,
+                            channel=sup.channel, text=kw_text, speaker=sup.speaker,
+                            custom={"is_keyword": True}, language=getattr(sup, 'language', None)
+                        )
+                        new_supervisions.append(kw_sup)
+                        break
+
+                # Then add shifted user turn
+                new_sup = SupervisionSegment(
+                    id=sup.id, recording_id=sup.recording_id,
+                    start=sup.start + offset, duration=sup.duration,
+                    channel=sup.channel, text=sup.text, speaker=sup.speaker,
+                    custom=sup.custom, language=getattr(sup, 'language', None)
+                )
+                new_supervisions.append(new_sup)
+            else:
+                # Regular turn: apply full offset
+                new_sup = SupervisionSegment(
+                    id=sup.id, recording_id=sup.recording_id,
+                    start=sup.start + offset, duration=sup.duration,
+                    channel=sup.channel, text=sup.text, speaker=sup.speaker,
+                    custom=sup.custom, language=getattr(sup, 'language', None)
+                )
+                new_supervisions.append(new_sup)
+
+        # Splice source audio
+        original_audio = cut.load_audio().squeeze()
+        audio_segments = []
+        last_end = 0
+
+        for insert_time, kw_audio, _, _, _ in keyword_info:
+            insert_sample = int(insert_time * cut.sampling_rate)
+            audio_segments.append(original_audio[last_end:insert_sample])
+            audio_segments.append(kw_audio)
+            last_end = insert_sample
+
+        audio_segments.append(original_audio[last_end:])
+        new_source_audio = np.concatenate(audio_segments)
+
+        # Splice target audio (insert silence where keywords are)
+        new_custom = dict(cut.custom) if cut.custom else {}
+        if 'target_audio' in new_custom:
+            original_target = cut.custom['target_audio'].load_audio().squeeze()
+            target_segments = []
+            last_end = 0
+
+            for insert_time, kw_audio, _, _, _ in keyword_info:
+                insert_sample = int(insert_time * cut.sampling_rate)
+                target_segments.append(original_target[last_end:insert_sample])
+                target_segments.append(np.zeros(len(kw_audio), dtype=np.float32))
+                last_end = insert_sample
+
+            target_segments.append(original_target[last_end:])
+            new_target_audio = np.concatenate(target_segments)
+
+            target_buffer = BytesIO()
+            sf.write(target_buffer, new_target_audio, cut.sampling_rate, format='wav')
+            target_buffer.seek(0)
+            new_custom['target_audio'] = Recording(
+                id=f"{cut.id}_kwd_target", sampling_rate=cut.sampling_rate,
+                num_samples=len(new_target_audio),
+                duration=len(new_target_audio) / cut.sampling_rate,
+                sources=[AudioSource(type="memory", channels=[0], source=target_buffer.getvalue())]
+            )
+
+        # Create new source recording
+        source_buffer = BytesIO()
+        sf.write(source_buffer, new_source_audio, cut.sampling_rate, format='wav')
+        source_buffer.seek(0)
+        new_source_recording = Recording(
+            id=f"{cut.id}_kwd", sampling_rate=cut.sampling_rate,
+            num_samples=len(new_source_audio),
+            duration=len(new_source_audio) / cut.sampling_rate,
+            sources=[AudioSource(type="memory", channels=[0], source=source_buffer.getvalue())]
+        )
+
+        return MonoCut(
+            id=f"{cut.id}_kwd", start=0,
+            duration=len(new_source_audio) / cut.sampling_rate,
+            channel=0, supervisions=new_supervisions,
+            recording=new_source_recording, custom=new_custom
+        )
+
+    def _get_keyword_text(self, keyword_path):
+        """Extract keyword text from filename (e.g., 'stop_001.wav' -> 'stop')."""
+        basename = os.path.basename(keyword_path)
+        name = os.path.splitext(basename)[0]
+        return name.split('_')[0] if '_' in name else name
+
+    # ==================== Speed Perturbation Methods ====================
+
+    def _augment_cuts_with_speed_perturbation(self, cuts: CutSet) -> CutSet:
+        """Apply speed perturbation to user turns in 2-turn conversations."""
+        augmented_cuts = []
+        for cut in cuts:
+            # Only apply to 2-turn conversations (1 user + 1 agent)
+            if len(cut.supervisions) != 2:
+                augmented_cuts.append(cut)
+                continue
+
+            # Check if it's user-agent order
+            user_sups = [s for s in cut.supervisions if s.speaker in self.input_roles]
+            agent_sups = [s for s in cut.supervisions if s.speaker in self.output_roles]
+            if len(user_sups) != 1 or len(agent_sups) != 1:
+                augmented_cuts.append(cut)
+                continue
+
+            # Apply with probability
+            if random.random() > self.speed_perturb_prob:
+                augmented_cuts.append(cut)
+                continue
+
+            try:
+                augmented_cut = self._apply_speed_perturbation_to_cut(cut)
+                augmented_cuts.append(augmented_cut)
+            except Exception as e:
+                logging.warning(f"Speed perturbation failed for {cut.id}: {e}")
+                augmented_cuts.append(cut)
+
+        return CutSet.from_cuts(augmented_cuts)
+
+    def _apply_speed_perturbation_to_cut(self, cut):
+        """
+        Apply speed perturbation to user turn in a 2-turn conversation.
+        Adjusts agent turn timing to maintain alignment.
+        """
+        # Initialize speed perturbation lazily
+        if self._speed_perturbation is None:
+            self._speed_perturbation = torchaudio.transforms.SpeedPerturbation(
+                orig_freq=cut.sampling_rate,
+                factors=self.speed_perturb_factors
+            )
+
+        # Find user and agent supervisions
+        user_sup = next(s for s in cut.supervisions if s.speaker in self.input_roles)
+        agent_sup = next(s for s in cut.supervisions if s.speaker in self.output_roles)
+
+        # Load audio
+        original_source = cut.load_audio().squeeze()
+        original_target = cut.custom['target_audio'].load_audio().squeeze() if 'target_audio' in cut.custom else None
+
+        # Extract user audio segment
+        user_start_sample = int(user_sup.start * cut.sampling_rate)
+        user_end_sample = int((user_sup.start + user_sup.duration) * cut.sampling_rate)
+        user_audio = original_source[user_start_sample:user_end_sample]
+
+        # Apply speed perturbation
+        user_audio_tensor = torch.from_numpy(user_audio).unsqueeze(0) if isinstance(user_audio, np.ndarray) else user_audio.unsqueeze(0)
+        perturbed_audio, _ = self._speed_perturbation(user_audio_tensor, torch.tensor([user_audio_tensor.shape[1]]))
+        perturbed_audio = perturbed_audio.squeeze(0).numpy()
+
+        # Calculate duration change
+        new_user_duration = len(perturbed_audio) / cut.sampling_rate
+        delta = new_user_duration - user_sup.duration
+
+        # Build new source audio: [before_user] + [perturbed_user] + [after_user]
+        new_source_segments = [
+            original_source[:user_start_sample],
+            perturbed_audio,
+            original_source[user_end_sample:]
+        ]
+        new_source_audio = np.concatenate(new_source_segments)
+
+        # Adjust target audio: insert/remove silence at user_end position
+        if original_target is not None:
+            delta_samples = int(delta * cut.sampling_rate)
+            if delta_samples > 0:
+                # User got longer: insert silence in target
+                silence = np.zeros(delta_samples, dtype=np.float32)
+                new_target_segments = [
+                    original_target[:user_end_sample],
+                    silence,
+                    original_target[user_end_sample:]
+                ]
+            elif delta_samples < 0:
+                # User got shorter: remove samples from target (silence region after user)
+                remove_samples = abs(delta_samples)
+                new_target_segments = [
+                    original_target[:user_end_sample],
+                    original_target[user_end_sample + remove_samples:]
+                ]
+            else:
+                new_target_segments = [original_target]
+            new_target_audio = np.concatenate(new_target_segments)
+        else:
+            new_target_audio = None
+
+        # Build new supervisions
+        new_user_sup = SupervisionSegment(
+            id=user_sup.id, recording_id=user_sup.recording_id,
+            start=user_sup.start, duration=new_user_duration,
+            channel=user_sup.channel, text=user_sup.text, speaker=user_sup.speaker,
+            custom=user_sup.custom, language=getattr(user_sup, 'language', None)
+        )
+
+        new_agent_sup = SupervisionSegment(
+            id=agent_sup.id, recording_id=agent_sup.recording_id,
+            start=agent_sup.start + delta, duration=agent_sup.duration,
+            channel=agent_sup.channel, text=agent_sup.text, speaker=agent_sup.speaker,
+            custom=agent_sup.custom, language=getattr(agent_sup, 'language', None)
+        )
+
+        # Sort supervisions by start time
+        new_supervisions = sorted([new_user_sup, new_agent_sup], key=lambda s: s.start)
+
+        # Create new recordings
+        source_buffer = BytesIO()
+        sf.write(source_buffer, new_source_audio, cut.sampling_rate, format='wav')
+        source_buffer.seek(0)
+        new_source_recording = Recording(
+            id=f"{cut.id}_sp", sampling_rate=cut.sampling_rate,
+            num_samples=len(new_source_audio),
+            duration=len(new_source_audio) / cut.sampling_rate,
+            sources=[AudioSource(type="memory", channels=[0], source=source_buffer.getvalue())]
+        )
+
+        new_custom = dict(cut.custom) if cut.custom else {}
+        if new_target_audio is not None:
+            target_buffer = BytesIO()
+            sf.write(target_buffer, new_target_audio, cut.sampling_rate, format='wav')
+            target_buffer.seek(0)
+            new_custom['target_audio'] = Recording(
+                id=f"{cut.id}_sp_target", sampling_rate=cut.sampling_rate,
+                num_samples=len(new_target_audio),
+                duration=len(new_target_audio) / cut.sampling_rate,
+                sources=[AudioSource(type="memory", channels=[0], source=target_buffer.getvalue())]
+            )
+
+        return MonoCut(
+            id=f"{cut.id}_sp", start=0,
+            duration=len(new_source_audio) / cut.sampling_rate,
+            channel=0, supervisions=new_supervisions,
+            recording=new_source_recording, custom=new_custom
+        )
 
 
 def collate_first_turn_audio(
