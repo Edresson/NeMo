@@ -1503,6 +1503,18 @@ class NanoGenCodec(LightningModule, HFHubMixin):
             codebook_logits_rescored = codebook_logits.clone()
             codebook_logits_rescored[indices_to_remove] = float('-inf')
             codebook_probs = torch.softmax(codebook_logits_rescored / temperature, dim=-1) # (B, num_tokens_per_codebook)
+            if torch.isnan(codebook_probs).any() or torch.isinf(codebook_probs).any():
+                print("NaN/Inf detected", codebook_probs)
+                raise RuntimeError("Invalid codebook_probs")
+
+            if (codebook_probs < 0).any():
+                print("Negative probs detected", codebook_probs.min())
+                raise RuntimeError("Negative probability")
+
+            if codebook_probs.sum(dim=-1).eq(0).any():
+                print("Zero-sum probability row!")
+                raise RuntimeError("All-zero probability vector")
+
             codebook_preds = torch.multinomial(codebook_probs, 1) # (B, 1)
             if use_cfg:
                 codebook_preds[actual_batch_size:] = codebook_preds[:actual_batch_size]
