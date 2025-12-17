@@ -108,8 +108,9 @@ def setup_speech_encoder(model: torch.nn.Module, pretrained_weights: bool = True
             # Override with user-specified encoder parameters
             if user_encoder_config:
                 for key, value in user_encoder_config.items():
-                    if value is not None:  # Only override if user explicitly set a value
+                    if value is not None:  # Only override if user explicitly set a valu
                         model.cfg.perception.encoder[key] = value
+
         model.perception = AudioPerceptionModule(model.cfg.perception).train()
         model.perception.load_state_dict(asr.state_dict(), strict=False)
     else:

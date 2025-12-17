@@ -67,6 +67,105 @@ from nemo.utils import logging
 from nemo.collections.tts.modules import transformer_2501
 
 
+def _build_fade_mask(start, dur, T, fade_len, device):
+    if fade_len <= 0:
+        return torch.ones((start.shape[0], T), device=device)
+
+    t = torch.arange(T, device=device)[None, :]
+
+    left = (t - start[:, None]).clamp(0, fade_len) / fade_len
+    right = ((start + dur)[:, None] - t).clamp(0, fade_len) / fade_len
+
+    return torch.minimum(left, right).clamp(0.0, 1.0)
+
+
+def generate_silence_like(
+    audio: torch.Tensor,
+    sample_rate: int,
+    *,
+    pure_prob: float = 0.15,
+    near_prob: float = 0.35,
+    insert_prob: float = 0.50,
+    noise_std_min: float = 1e-6,
+    noise_std_max: float = 1e-4,
+    min_silence_sec: float = 0.2,
+    max_silence_sec: float = 2.0,
+    fade_ms: int = 20,
+):
+    """
+    audio: [B, T] or [B, C, T]
+    returns: same shape, dtype, device
+    """
+
+    # -----------------------------
+    # Validate probabilities
+    # -----------------------------
+    total = pure_prob + near_prob + insert_prob
+    if not abs(total - 1.0) < 1e-6:
+        raise ValueError(
+            f"pure_prob + near_prob + insert_prob must sum to 1.0 (got {total})"
+        )
+
+    device = audio.device
+    dtype = audio.dtype
+    out = audio.clone()
+
+    B = audio.shape[0]
+    T = audio.shape[-1]
+
+    # -----------------------------
+    # Choose silence mode
+    # -----------------------------
+    r = torch.rand(1).item()
+
+    if r < pure_prob:
+        return torch.zeros_like(audio)
+
+    if r < pure_prob + near_prob:
+        noise_std = torch.empty(
+            1, device=device, dtype=dtype
+        ).uniform_(noise_std_min, noise_std_max)
+        return torch.randn_like(audio) * noise_std
+
+    # -----------------------------
+    # Insert silence (vectorized)
+    # -----------------------------
+
+    dur_sec = torch.empty(B, device=device).uniform_(
+        min_silence_sec, max_silence_sec
+    )
+    dur = (dur_sec * sample_rate).long()
+    dur = torch.clamp(dur, min=0, max=T // 2)
+
+    max_start = torch.clamp(T - dur, min=1)
+    start = (torch.rand(B, device=device) * max_start).long()
+
+    t = torch.arange(T, device=device)[None, :]
+    silence_mask = (t >= start[:, None]) & (t < (start + dur)[:, None])
+
+    while silence_mask.ndim < out.ndim:
+        silence_mask = silence_mask.unsqueeze(1)
+
+    noise_std = torch.empty(
+        B, device=device, dtype=dtype
+    ).uniform_(noise_std_min, noise_std_max)
+
+    while noise_std.ndim < out.ndim:
+        noise_std = noise_std.unsqueeze(-1)
+
+    noise = torch.randn_like(out) * noise_std
+
+    fade_len = int(sample_rate * fade_ms / 1000)
+    if fade_len > 0:
+        fade = _build_fade_mask(start, dur, T, fade_len, device)
+        while fade.ndim < out.ndim:
+            fade = fade.unsqueeze(1)
+        noise = noise * fade
+
+    out = torch.where(silence_mask, noise, out)
+    return out
+
+
 def get_mask_from_lengths(
     lengths: torch.Tensor = None,
     x: torch.Tensor = None,
@@ -95,6 +194,172 @@ def get_mask_from_lengths(
     ids = torch.arange(0, max_len, device=lengths.device, dtype=lengths.dtype)
     mask = ids < lengths.unsqueeze(1)
     return mask
+
+def stft_energy_to_codec_frames(
+    power: torch.Tensor,          # (B, T_stft)
+    audio_lens: torch.Tensor,     # (B,) in samples
+    hop_length: int,
+    codec_frame_samples: int,
+):
+    """
+    Returns:
+        energy: (B, T_codec)
+        codec_lens: (B,)
+    """
+
+    B, T_stft = power.shape
+    device = power.device
+
+    # STFT frames per codec frame (float)
+    stft_per_codec = codec_frame_samples / hop_length
+
+    # Number of codec frames per batch item
+    codec_lens = torch.div(
+        audio_lens,
+        codec_frame_samples,
+        rounding_mode="floor"
+    )
+
+    max_codec_len = codec_lens.max().item()
+
+    # ---- Pad STFT power so pooling is safe ----
+    needed_stft = int(torch.ceil(
+        torch.tensor(max_codec_len * stft_per_codec)
+    ).item())
+
+    if T_stft < needed_stft:
+        power = F.pad(power, (0, needed_stft - T_stft))
+
+    # ---- Pool ----
+    # Treat time as spatial dimension
+    power = power.unsqueeze(1)  # (B, 1, T_stft)
+
+    kernel_size = int(round(stft_per_codec))
+    stride = kernel_size
+
+    pooled = F.avg_pool1d(
+        power,
+        kernel_size=kernel_size,
+        stride=stride,
+        ceil_mode=False,
+    ).squeeze(1)  # (B, T_codec)
+    
+
+    mask = get_mask_from_lengths(codec_lens).float()
+    pooled = match_time_length(pooled, codec_lens.max().item())
+    pooled = pooled * mask
+
+    return pooled, codec_lens
+
+def match_time_length(x, target_len):
+    """
+    x: (B, T)
+    """
+    B, T = x.shape
+    if T > target_len:
+        x = x[:, :target_len]
+    elif T < target_len:
+        pad = target_len - T
+        x = torch.nn.functional.pad(x, (0, pad))
+    return x
+
+def generate_multiturn_speaking_mask(input_ids: torch.Tensor, bos_token_id: int = 0, eos_token_id: int = 1):
+    """
+    Efficient, batched speaking mask generator that marks 1 between <bos> and <eos> pairs.
+    If <eos> is missing after a <bos>, mask continues to end. Handles multiple turns.
+
+    Args:
+        input_ids (torch.Tensor): LongTensor of shape (B, T)
+        bos_token_id (int): Token ID for <bos>
+        eos_token_id (int): Token ID for <eos>
+
+    Returns:
+        torch.Tensor: FloatTensor of shape (B, T), with 1.0 for speaking, 0.0 for silence.
+
+    Note BOS is considered as speaking (1) and EOS as non speaking 0
+    """
+    device = input_ids.device
+    bos_mask = (input_ids == bos_token_id).to(torch.int32).to(device)
+    eos_mask = (input_ids == eos_token_id).to(torch.int32).to(device)
+    bos_cumsum = torch.cumsum(bos_mask, dim=1)
+    eos_cumsum = torch.cumsum(eos_mask, dim=1)
+    speaking_mask = (bos_cumsum > eos_cumsum).to(torch.float32)
+    return speaking_mask.long()
+
+
+def generate_loss_scale_from_turns(
+    input_ids,
+    bos_token_id=1,
+    eos_token_id=2,
+    speaking_scale=1.0,
+    silence_scale=1.5,
+):
+    speaking_mask = generate_multiturn_speaking_mask(
+        input_ids,
+        bos_token_id,
+        eos_token_id,
+    )
+    loss_scale = (
+        speaking_scale * speaking_mask
+        + silence_scale * (1.0 - speaking_mask)
+    )
+    return loss_scale
+
+
+class CodecEnergyExtractor(torch.nn.Module):
+    def __init__(
+        self,
+        sample_rate: int,
+        codec_frame_ms: float,
+        stft_win_ms: float = 46.44,
+        stft_hop_ms: float = 11.61,
+        log_energy: bool = True,
+        eps: float = 1e-6,
+    ):
+        super().__init__()
+
+        self.sample_rate = sample_rate
+        self.codec_frame_samples = int(sample_rate * codec_frame_ms / 1000)
+
+        self.win_length = int(sample_rate * stft_win_ms / 1000)
+        self.hop_length = int(sample_rate * stft_hop_ms / 1000)
+
+        self.log_energy = log_energy
+        self.eps = eps
+
+        self.register_buffer(
+            "window",
+            torch.hann_window(self.win_length),
+            persistent=False,
+        )
+
+    @torch.no_grad()
+    def forward(self, audio, audio_lens):
+        # STFT
+        stft = torch.stft(
+            audio,
+            n_fft=self.win_length,
+            hop_length=self.hop_length,
+            win_length=self.win_length,
+            window=self.window,
+            return_complex=True,
+            center=True,
+        )
+
+        # (B, T_stft)
+        power = stft.abs().pow(2).mean(dim=1)
+
+        if self.log_energy:
+            power = torch.log(power + self.eps)
+
+        energy, codec_lens = stft_energy_to_codec_frames(
+            power,
+            audio_lens,
+            hop_length=self.hop_length,
+            codec_frame_samples=self.codec_frame_samples,
+        )
+
+        return energy, codec_lens
 
 
 class GroupedCodec(NeuralModule):
@@ -372,6 +637,12 @@ class NanoGenCodec(LightningModule, HFHubMixin):
             self.vector_quantizer = FiniteScalarQuantizer(self.cfg.fsq_quantizer_levels)
             self.quantizer_projection = nn.Linear(bottleneck_dim, self.decoder.config.hidden_size)
 
+        self.use_energy_head = self.cfg.get("use_energy_head", None)
+        if self.use_energy_head:
+            self.energy_loss_scale = self.cfg.get('energy_loss_scale', 0.2)
+            self.energy_extractor = CodecEnergyExtractor(self.target_sample_rate, cfg.data.frame_length*1000)
+            self.energy_head = nn.Linear(self.decoder.config.hidden_size, 1)
+
         # cached for quicker audio decoding
         self.register_buffer(
             "_control_codes",
@@ -604,7 +875,25 @@ class NanoGenCodec(LightningModule, HFHubMixin):
         # EARTTS dataloader add as default a eos token on the first text and a silence on audio, ignore it
         batch["target_audio"] = batch["target_audio"][:, self.target_samples_per_frame:]
         batch["input_text_tokens"] = batch["input_text_tokens"][:, 1:]
-        
+        batch["target_audio_lens"] = batch["target_audio_lens"] - self.target_samples_per_frame
+
+
+        if self.training and (self.cfg.get("empty_turn_probability", 0.0) > 0):
+            # Randomly decide whether this batch gets emptied
+            if torch.rand(1).item() < self.cfg.empty_turn_probability:
+
+                # add silence augmentation
+                batch["target_audio"] = generate_silence_like(
+                    batch["target_audio"],
+                    sample_rate=self.target_sample_rate,
+                    pure_prob=self.cfg.get("empty_turn_pure_prob", 0.15),
+                    near_prob=self.cfg.get("empty_turn_near_prob", 0.35),
+                    insert_prob=self.cfg.get("empty_turn_insert_prob", 0.50),
+                )
+
+                # Replace all non-BOS/EOS with PAD
+                batch["input_text_tokens"] = torch.full_like(batch["input_text_tokens"], self.text_pad_id)
+
         input_text_tokens = batch["input_text_tokens"]
 
         # encoder embedding
@@ -727,6 +1016,22 @@ class NanoGenCodec(LightningModule, HFHubMixin):
         # create loss scale mask by copying seq_mask to include mask sequence
         loss_scale = seq_mask.clone().float()
 
+        if self.cfg.get("silence_loss_scale", None) is not None: 
+            loss_scale = generate_loss_scale_from_turns(
+                input_text_tokens[:, 1:],
+                bos_token_id=self.text_bos_id,
+                eos_token_id=self.text_eos_id,
+                speaking_scale=1.0,
+                silence_scale=self.cfg.silence_loss_scale,
+            )
+            loss_scale = loss_scale * seq_mask.float()
+
+        gt_energy = None
+        if self.use_energy_head:
+            gt_energy, _ = self.energy_extractor(batch["target_audio"], batch["target_audio_lens"])
+            gt_energy = match_time_length(gt_energy, input_embeds.size(1))
+
+
         # debug samples:
         if (
             self.cfg.get("debug_dataloader_audios_path", None)
@@ -839,6 +1144,7 @@ class NanoGenCodec(LightningModule, HFHubMixin):
             "text_tokens": input_text_tokens,
             "audio_labels": audio_labels,
             "seq_mask": seq_mask,
+            "gt_energy": gt_energy,
             "loss_scale": loss_scale,
         }
 
@@ -1054,7 +1360,6 @@ class NanoGenCodec(LightningModule, HFHubMixin):
         )
 
         codebook_loss, loss_mask = self.compute_loss(forward_outputs["logits"], inputs["audio_labels"],  inputs["output_lens"], loss_scale=inputs["loss_scale"])
-
         # local transformer
         local_transformer_logits = None
         if self.use_local_transformer:
@@ -1071,6 +1376,7 @@ class NanoGenCodec(LightningModule, HFHubMixin):
             local_transformer_loss = torch.tensor(0.0, device=self.device)
 
         loss = codebook_loss * self.parallel_codebook_loss_scale + local_transformer_loss * self.local_transformer_loss_scale
+
         num_frames = inputs["input_lens"].sum()
         B, T = inputs["input_embeds"].shape[:2]
         ans = {
@@ -1098,6 +1404,18 @@ class NanoGenCodec(LightningModule, HFHubMixin):
                 )
                 ans["loss"] = ans["loss"] + (text_loss * self.text_loss_scale)
                 ans["text_loss"] = text_loss
+
+        if self.use_energy_head:
+            energy_pred = self.energy_head(forward_outputs["backbone_out"]).squeeze(-1)
+            with loss_parallel():
+                energy_loss = torch.nn.functional.smooth_l1_loss(
+                    energy_pred * inputs["loss_scale"],
+                    inputs["gt_energy"] * inputs["loss_scale"],
+                    reduction="sum",
+                )
+                energy_loss = energy_loss / inputs["loss_scale"].sum().clamp_min(1.0)
+                ans["loss"] = ans["loss"] + (energy_loss * self.energy_loss_scale)
+                ans["energy_loss"] = energy_loss
 
         self.log_dict(ans, on_step=True)
         return ans
@@ -1271,7 +1589,6 @@ class NanoGenCodec(LightningModule, HFHubMixin):
 
     def test_step(self, *args, **kwargs):
         return self.validation_step(*args, **kwargs)
-
 
     def sample_codes_from_logits(self, all_code_logits_t, temperature=0.7, topk=80, unfinished_items={}, finished_items={}):
         # all_code_logits_t: (B, num_codebooks * num_tokens_per_codebook), logits at a given timestep
