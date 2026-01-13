@@ -93,7 +93,7 @@ from torch.nn.utils.rnn import pad_sequence
 def collate_and_tokenize_custom(
     batch,
     model,
-    text_to_speech_ratio=3.5,
+    extra_duration_thrshould=1.3,
     sample_rate=22050,
     root_path=None
 ):
@@ -115,21 +115,10 @@ def collate_and_tokenize_custom(
         padding_value=model.text_pad_id
     )
 
-    # Expand text length to match speech
-    B, L = input_ids.shape
-    target_len = max(int(text_to_speech_ratio * L), L)
-
-    padded_input_ids = torch.full(
-        (B, target_len),
-        fill_value=model.text_pad_id,
-        dtype=input_ids.dtype,
-        device=input_ids.device
-    )
-    padded_input_ids[:, :L] = input_ids
-
     # --- AUDIO LOADING ---
     audio_list = []
     audio_lengths = []
+    target_num_frames = []
 
     for s in batch:
         audio_path = s["context_audio_filepath"]
@@ -142,7 +131,17 @@ def collate_and_tokenize_custom(
         audio_list.append(wav)
         audio_lengths.append(len(wav))
 
+        # target duration
+        tdur_audio_path = s["audio_filepath"]
+        if root_path is not None:
+            tdur_audio_path = os.path.join(root_path, tdur_audio_path)
+
+        wav_dur, sr_ = librosa.load(tdur_audio_path, sr=sample_rate, mono=True)
+        tdur = wav_dur.shape[0] // model.target_samples_per_frame 
+        target_num_frames.append(tdur * extra_duration_thrshould)
+
     max_audio_len = max(audio_lengths)
+    B = len(audio_lengths)
 
     padded_audio = torch.zeros(
         (B, max_audio_len),
@@ -156,12 +155,25 @@ def collate_and_tokenize_custom(
 
     audio_lengths = torch.tensor(audio_lengths, dtype=torch.long)
 
+    # Expand text length to match speech
+    B, L = input_ids.shape
+    target_len = int(max(target_num_frames))
+
+    padded_input_ids = torch.full(
+        (B, target_len),
+        fill_value=model.text_pad_id,
+        dtype=input_ids.dtype,
+        device=input_ids.device
+    )
+    padded_input_ids[:, :L] = input_ids
+
     return {
         "input_ids": padded_input_ids,
         "raw_text": test_sentences,
         "context_audio": padded_audio,
         "context_audio_lengths": audio_lengths,
         "target_audio_paths": [s["audio_filepath"] for s in batch],
+        "target_num_frames": target_num_frames,
     }
 
 @hydra_runner(config_path="conf", config_name="duplex_eartts")
@@ -182,7 +194,7 @@ def inference(cfg):
 
 
     for batch_id, batch in enumerate(read_jsonl_batches(cfg.datasets_json_path, cfg.batch_size)):
-        inputs = collate_and_tokenize_custom(batch, model, text_to_speech_ratio=3.5, sample_rate=model.target_sample_rate, root_path=cfg.audio_dir)
+        inputs = collate_and_tokenize_custom(batch, model, extra_duration_thrshould=1.3, sample_rate=model.target_sample_rate, root_path=cfg.audio_dir)
         
         model.set_init_inputs(
             speaker_audio=inputs["context_audio"],
@@ -203,8 +215,9 @@ def inference(cfg):
         audio_len = audio_len.cpu()
 
         for i in range(audio.size(0)):
-            wav = audio[i, : audio_len[i]].numpy()
-
+            wav_dur = int(inputs["target_num_frames"][i] * model.target_samples_per_frame)
+            # wav = audio[i, : audio_len[i]].numpy()
+            wav = audio[i, : wav_dur].numpy() # use precomputed estimated duration to avoid longer audios
             # Use original target audio filename
             target_path = inputs["target_audio_paths"][i]
             base_name = os.path.basename(target_path)
