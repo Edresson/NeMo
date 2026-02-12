@@ -826,12 +826,14 @@ class DuplexEARTTS(LightningModule, HFHubMixin):
             
             dataloader_init_inputs = copy.deepcopy(init_inputs)
             """
+            sp = dataset_batch.get("system_prompts_raw")
+            system_prompt = sp[0] if sp else None
 
             # set init inputs and get it
             self.set_init_inputs(
                 speaker_audio=dataset_batch["audio_prompt"],
                 speaker_audio_lens=dataset_batch["audio_prompt_lens"],
-                system_prompt=dataset_batch["system_prompts_raw"][0], # use the first position of the batch as system prompt
+                system_prompt=system_prompt, # use the first position of the batch as system prompt
             )
             init_inputs = self.get_init_inputs(B=inputs["subword_ids"].size(0))
 
