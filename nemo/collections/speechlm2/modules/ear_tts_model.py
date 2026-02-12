@@ -1309,6 +1309,7 @@ class RVQEARTTSModel(nn.Module):
         ignore_eos_flag_stop: bool = False,
         asr_speech_tokens_emb: Tensor | None = None,
         audio_prompt_lantent: Tensor | None = None,
+        dataset_type: list[str] | None = None,
     ) -> RVQEARTTSOutput:
         """
         Performs a forward pass handling training, generation, or single-step inference.
@@ -1388,8 +1389,19 @@ class RVQEARTTSModel(nn.Module):
 
             if self.config.get("use_audio_prompt_frozen_projection", False):
                 if audio_prompt_lantent is None:
-                    W = self.audio_prompt_projection_W.to(code_embed.device, code_embed.dtype)
-                    audio_prompt_lantent = torch.nn.functional.linear(code_embed, W.T)
+                    # Training-only anti-cloning augmentation for pure TTS batches.
+                    all_tts = (
+                        training
+                        and dataset_type is not None
+                        and len(dataset_type) == code_embed.size(0)
+                        and all(str(p).strip().lower() == "tts" for p in dataset_type)
+                    )
+                    if all_tts and torch.rand(1, device=code_embed.device).item() < 0.3:
+                        perm = torch.randperm(code_embed.size(0), device=code_embed.device)
+                        audio_prompt_lantent = code_embed[perm]
+                    else:
+                        W = self.audio_prompt_projection_W.to(code_embed.device, code_embed.dtype)
+                        audio_prompt_lantent = torch.nn.functional.linear(code_embed, W.T)
 
                 code_embed = torch.where(
                     pre_bos_mask,
