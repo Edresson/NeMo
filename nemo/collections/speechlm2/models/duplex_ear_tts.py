@@ -1346,6 +1346,7 @@ class DuplexEARTTS(LightningModule, HFHubMixin):
         generation_config=None,
         ignore_eos_flag_stop=True,
         asr_speech_tokens_emb=None,
+        global_prompt_audio_embedding=None,
     ):
         """
         Runs a single autoregressive prediction step to infer audio codec codes.
@@ -1389,6 +1390,7 @@ class DuplexEARTTS(LightningModule, HFHubMixin):
             "subword_ids": current_subword_id,
             "subword_mask": current_subword_mask,
             "past_key_values": past_key_values,
+            "global_prompt_audio_embedding": global_prompt_audio_embedding,
             "use_cache": True,
             "guidance_enabled": guidance_enabled,
             "generation_config": generation_config,
@@ -1515,6 +1517,7 @@ class DuplexEARTTS(LightningModule, HFHubMixin):
             code, _, _ = self.tts_model.generate_step(outputs.hidden_states[:, -1:], **generation_config)
 
         past_key_values = outputs["past_key_values"]
+        global_prompt_audio_embedding = outputs["global_prompt_audio_embedding"]
 
         # use the text tokens to stop generation
         max_steps = next_subword_ids.size(-1)
@@ -1556,6 +1559,7 @@ class DuplexEARTTS(LightningModule, HFHubMixin):
                 guidance_enabled=guidance_enabled,
                 generation_config=generation_config,
                 asr_speech_tokens_emb=asr_speech_tokens_emb,
+                global_prompt_audio_embedding=global_prompt_audio_embedding,
                 ignore_eos_flag_stop=True,
             )  
 

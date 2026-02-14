@@ -351,6 +351,7 @@ class RVQEARTTSOutput:
     hidden_states: Tensor | None = None
     past_key_values: Tensor | None = None
     audio_prompt_lantent: Tensor | None = None
+    global_prompt_audio_embedding: Tensor | None = None
 
     codes: Tensor | None = None
     lm_logits: Tensor | None = None
@@ -833,6 +834,56 @@ class SubwordEmbedding(nn.Module):
         return self.subword_emb(token_ids)
 
 
+class PromptConditioner(nn.Module):
+    def __init__(self, d_model: int):
+        super().__init__()
+        self.to_add = nn.Linear(d_model, d_model, bias=False)
+        self.gate_logit = nn.Parameter(torch.tensor(-2.0))  # sigmoid ≈ 0.12 at init
+
+    def forward(self, code_embed: torch.Tensor, e_prompt: torch.Tensor, pre_bos_mask: torch.Tensor):
+        """
+        code_embed: [B, T, D]
+        e_prompt:   [B, D]
+        pre_bos_mask: [B, T, 1] bool
+        """
+        g = torch.sigmoid(self.gate_logit)  # scalar
+        add = self.to_add(e_prompt).unsqueeze(1)  # [B, 1, D]
+        return torch.where(pre_bos_mask, code_embed, code_embed + g * add)
+
+
+class AttentiveStatsPooling(nn.Module):
+    def __init__(self, d_model: int, d_attn: int = 128, out_dim: int | None = None):
+        super().__init__()
+        self.attn = nn.Sequential(
+            nn.Linear(d_model, d_attn),
+            nn.Tanh(),
+            nn.Linear(d_attn, 1),
+        )
+        out_dim = out_dim or d_model
+        self.proj = nn.Linear(2 * d_model, out_dim)
+        self.out_ln = nn.LayerNorm(out_dim)
+
+    def forward(self, x: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
+        """
+        x:    [B, T, D]
+        mask: [B, T] with 1 for valid frames, 0 for pad/invalid
+        returns: [B, out_dim]
+        """
+        # attention logits
+        logits = self.attn(x).squeeze(-1)  # [B, T]
+        logits = logits.masked_fill(mask == 0, torch.finfo(logits.dtype).min)
+
+        w = F.softmax(logits, dim=-1).unsqueeze(-1)  # [B, T, 1]
+
+        mu = (w * x).sum(dim=1)  # [B, D]
+        ex2 = (w * (x * x)).sum(dim=1)  # [B, D]
+        var = (ex2 - mu * mu).clamp_min(1e-6)
+        std = torch.sqrt(var)  # [B, D]
+
+        pooled = torch.cat([mu, std], dim=-1)  # [B, 2D]
+        return self.out_ln(self.proj(pooled)) # [B, out_dim]
+
+
 class CharAwareSubwordEncoder(nn.Module):
     """
     An encoder that creates subword embeddings from character-level embeddings.
@@ -1117,12 +1168,14 @@ class RVQEARTTSModel(nn.Module):
                 self.hidden_size, self.hidden_size, self.hidden_size, self.config.num_quantizers
             )
 
-        if self.config.get("audio_prompt_encoder_config", None):
+        if self.config.get("audio_prompt_global_encoder_config", None):
             # Dedicated projection for audio prompt (pre-BOS)
-            ape_cfg = OmegaConf.to_container(self.config.audio_prompt_encoder_config, resolve=True)
+            ape_cfg = OmegaConf.to_container(self.config.audio_prompt_global_encoder_config, resolve=True)
             model_type = ape_cfg.pop("type")  # remove "type" from kwargs
             ape_cfg = AutoConfig.for_model(model_type, **ape_cfg)
-            self.audio_prompt_encoder = AutoModel.from_config(ape_cfg)
+            self.audio_prompt_global_encoder = AutoModel.from_config(ape_cfg)
+            self.prompt_asp = AttentiveStatsPooling(d_model=self.hidden_size, d_attn=128, out_dim=self.hidden_size)
+            self.audio_prompt_global_conditioner = PromptConditioner(d_model=self.hidden_size)
 
         if self.config.get("use_audio_prompt_frozen_projection", False):
             with fp32_precision():
@@ -1309,6 +1362,7 @@ class RVQEARTTSModel(nn.Module):
         ignore_eos_flag_stop: bool = False,
         asr_speech_tokens_emb: Tensor | None = None,
         audio_prompt_lantent: Tensor | None = None,
+        global_prompt_audio_embedding: Tensor | None = None,
         dataset_type: list[str] | None = None,
     ) -> RVQEARTTSOutput:
         """
@@ -1370,23 +1424,6 @@ class RVQEARTTSModel(nn.Module):
             # Apply projection to model size 
             code_embed = self.embed_code(code_embed)
 
-            # Choose projection
-            if self.config.get("audio_prompt_encoder_config", None):
-                # Dedicated projection for audio prompt (pre-BOS)
-                if audio_prompt_lantent is None:
-                    prompt_attn_mask = pre_bos_mask.squeeze(-1).long()
-                    audio_prompt_lantent = self.audio_prompt_encoder(
-                        inputs_embeds=code_embed,
-                        attention_mask=prompt_attn_mask,
-                        return_dict=True,
-                    ).last_hidden_state
-
-                code_embed = torch.where(
-                    pre_bos_mask,
-                    audio_prompt_lantent,
-                    code_embed,
-                )
-
             if self.config.get("use_audio_prompt_frozen_projection", False):
                 if audio_prompt_lantent is None:
                     # Training-only anti-cloning augmentation for pure TTS batches.
@@ -1409,11 +1446,33 @@ class RVQEARTTSModel(nn.Module):
                     code_embed,
                 )
 
+            if self.config.get("audio_prompt_global_encoder_config", None):
+                if global_prompt_audio_embedding is None:
+                    prompt_attn_mask = pre_bos_mask.squeeze(-1).long()  # [B,T]
+
+                    frame_emb = self.audio_prompt_global_encoder(
+                        inputs_embeds=code_embed,
+                        attention_mask=prompt_attn_mask,
+                        return_dict=True,
+                    ).last_hidden_state
+
+                    global_prompt_audio_embedding = self.prompt_asp(frame_emb, prompt_attn_mask)  # [B,D]
+
+                code_embed = self.audio_prompt_global_conditioner(code_embed, global_prompt_audio_embedding, pre_bos_mask)
+
+                if training and torch.rand(1, device=code_embed.device).item() < 0.1:
+                    null = torch.zeros_like(code_embed)
+                    code_embed = torch.where(pre_bos_mask, null, code_embed)
+                
             # Add BOS embedding
             code_embeds = code_embed + bos_mask * self.bos_emb
 
         else:  # Inference
             code_embeds = self.embed_code(self.depthsum_embedding(code))
+            if self.config.get("audio_prompt_global_encoder_config", None):
+                mask = torch.zeros_like(code_embeds[..., :1], dtype=torch.bool)  # [B,T,1]
+                code_embeds = self.audio_prompt_global_conditioner(code_embeds, global_prompt_audio_embedding, mask)
+
             uncond_dec_flag = torch.zeros(code.size(0), 1, 1, device=code.device, dtype=torch.bool)
 
         if guidance_enabled:
@@ -1487,6 +1546,7 @@ class RVQEARTTSModel(nn.Module):
                     hidden_states=hidden_states,
                     past_key_values=backbone_outputs.past_key_values,
                     audio_prompt_lantent=audio_prompt_lantent,
+                    global_prompt_audio_embedding=global_prompt_audio_embedding,
                 )
             else:
                 if teacher_forcing_inference:
@@ -1503,6 +1563,7 @@ class RVQEARTTSModel(nn.Module):
                     lm_logits=lm_logits,
                     eos_flag=eos_flag,
                     hidden_states=hidden_states,
+                    global_prompt_audio_embedding=global_prompt_audio_embedding,
                 )
 
     @torch.no_grad()

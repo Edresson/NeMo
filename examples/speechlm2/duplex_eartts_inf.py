@@ -111,7 +111,7 @@ def collate_and_tokenize_custom(
     sample_rate=22050,
     root_path=None,
     drop_BOS=False,
-    add_begining_pad_tokens=False,
+    add_beginning_pad_tokens=False,
 ):
     tokenized_list = []
     
@@ -165,7 +165,7 @@ def collate_and_tokenize_custom(
                     )
                 )
 
-    if add_begining_pad_tokens:
+    if add_beginning_pad_tokens:
         pad_len = 25
         prefix = torch.full((pad_len,), model.text_pad_id, dtype=torch.long, device=model.device)
         for i in range(len(tokenized_list)):
@@ -306,7 +306,7 @@ def inference(cfg):
     intelligibility = Intelligibility("stt_en_fastconformer_transducer_large", reuse_asr_hyps=False).reset()
 
     for batch_id, batch in enumerate(read_jsonl_batches(cfg.datasets_json_path, cfg.batch_size, max_batches=None)):
-        inputs = collate_and_tokenize_custom(batch, model, extra_duration_thrshould=1.5, sample_rate=model.target_sample_rate, root_path=cfg.audio_dir, drop_BOS=cfg.get("drop_BOS", False),  add_begining_pad_tokens=cfg.get("add_begining_pad_tokens", True))
+        inputs = collate_and_tokenize_custom(batch, model, extra_duration_thrshould=1.5, sample_rate=model.target_sample_rate, root_path=cfg.audio_dir, drop_BOS=cfg.get("drop_BOS", False),  add_beginning_pad_tokens=cfg.get("add_beginning_pad_tokens", False))
         if cfg.get("user_custom_speaker_reference", None):
             wav, sr = librosa.load(cfg.model.inference_speaker_reference, sr=model.target_sample_rate, mono=True)
             wav = torch.as_tensor(wav, dtype=target_dtype).unsqueeze(0)
