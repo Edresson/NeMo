@@ -1433,7 +1433,7 @@ class RVQEARTTSModel(nn.Module):
                         and len(dataset_type) == code_embed.size(0)
                         and all(str(p).strip().lower() == "tts" for p in dataset_type)
                     )
-                    if all_tts and torch.rand(1, device=code_embed.device).item() < 0.3:
+                    if self.config.get("force_no_audio_cond_latent_on_prompt", False) and all_tts and torch.rand(1, device=code_embed.device).item() < 0.3:
                         perm = torch.randperm(code_embed.size(0), device=code_embed.device)
                         audio_prompt_lantent = code_embed[perm]
                     else:

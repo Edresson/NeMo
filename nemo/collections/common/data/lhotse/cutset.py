@@ -48,7 +48,8 @@ from nemo.collections.common.data.lhotse.text_adapters import (
     TextTurn,
 )
 from nemo.collections.common.parts.preprocessing.manifest import get_full_path
-
+from lhotse.audio import AudioSource
+from lhotse.cut.mixed import MixedCut, MixTrack
 
 def read_cutset_from_config(config: Union[DictConfig, dict]) -> Tuple[CutSet, bool]:
     """
@@ -406,6 +407,103 @@ def parse_and_combine_datasets(
     return cuts, tarred_status[0]
 
 
+import os
+import soundfile as sf
+def debug_dump_duplex_cut(cut, out_dir="./debug_lhote_concat_new", max_chars=120):
+    os.makedirs(out_dir, exist_ok=True)
+    base = os.path.join(out_dir, str(cut.id))
+
+    src_audio = cut.load_audio()
+    sf.write(base + "_source.wav", src_audio.T, samplerate=16000)
+
+    tgt_audio = cut.load_target_audio()
+    sf.write(base + "_target.wav", tgt_audio.T, samplerate=16000)
+
+    with open(base + "_turns.txt", "w", encoding="utf-8") as f:
+        for s in cut.supervisions:
+            start = float(s.start)
+            end = float(s.start + s.duration)
+            speaker = getattr(s, "speaker", "UNK")
+            text = getattr(s, "text", "") or ""
+            if len(text) > max_chars:
+                text = text[:max_chars] + "..."
+            f.write(f"{start:.3f}\t{end:.3f}\t{speaker}\t{text}\n")
+
+    print("Debug save at:", out_dir)
+
+@data_type_parser("lhotse_concat")
+def read_lhotse_concat(config: DictConfig) -> tuple[CutSet, bool]:
+    """
+    Lazily concatenate cuts from an inner data source up to a specified max duration.
+
+    Uses a greedy sequential algorithm: iterates through source cuts and appends
+    each one to the current accumulator. When adding the next cut would exceed
+    ``max_duration``, yields the accumulated cut and starts a new one.
+
+    Config options:
+
+    - ``max_duration``: Maximum duration (in seconds) for concatenated cuts.
+    - ``gap``: Duration of silence (in seconds) inserted between concatenated cuts (default: 0.0).
+    - ``input_cfg``: Inner data source configuration (same format as top-level ``input_cfg``).
+
+    Example config::
+
+        input_cfg:
+          - type: lhotse_concat
+            max_duration: 30.0
+            gap: 0.5
+            input_cfg:
+              - type: lhotse
+                cuts_path: /path/to/cuts.jsonl.gz
+    """
+    max_duration = config.max_duration
+    gap = config.get("gap", 0.0)
+
+    cuts, is_tarred = read_cutset_from_config(config)
+
+    cuts = CutSet(LazyConcatCuts(source=cuts, max_duration=max_duration, gap=gap))
+    return cuts, is_tarred
+
+class LazyConcatCuts:
+    """
+    Lazily concatenates consecutive cuts from a source up to a maximum duration.
+
+    Greedy sequential algorithm: iterate through source cuts and append each one
+    to the current accumulator. When adding the next cut would exceed ``max_duration``,
+    yield the accumulator and start fresh. Cuts that individually exceed ``max_duration``
+    are yielded as-is (never dropped).
+    """
+
+    def __init__(self, source, max_duration: float, gap: float = 0.0):
+        self.source = source
+        self.max_duration = max_duration
+        self.gap = gap
+
+    def __iter__(self):
+        acc = None
+        acc_duration = 0.0
+        for cut in self.source:
+            cut_dur = cut.duration
+            gap_dur = self.gap if acc is not None else 0.0
+            new_duration = acc_duration + gap_dur + cut_dur
+            if acc is not None and new_duration > self.max_duration:
+                # debug_dump_duplex_cut(acc)
+                yield acc
+                acc = cut
+                acc_duration = cut_dur
+            elif acc is None:
+                acc = cut
+                acc_duration = cut_dur
+            else:
+                if self.gap > 0:
+                    acc = acc.pad(acc.duration + self.gap).append(cut)
+                else:
+                    acc = acc.append(cut)
+                acc_duration = new_duration
+        if acc is not None:
+            # debug_dump_duplex_cut(acc)
+            yield acc
+
 @data_type_parser(["lhotse", "lhotse_shar"])
 def read_lhotse_manifest(config) -> tuple[CutSet, bool]:
     """Read paths to Lhotse manifest files and create a CutSet."""
@@ -673,6 +771,430 @@ def read_s2s_duplex_reverse_role(config) -> Tuple[CutSet, bool]:
         # Optional stronger assertions (object identity)
         assert new_cut.recording is old_target_audio, f"{new_cut.id}: recording object not swapped"
         assert new_cut.target_audio is old_recording, f"{new_cut.id}: target_audio object not swapped"
+
+        new_cut.formatter = "s2s_duplex_reverse_role"
+        return new_cut
+
+    cuts = cuts.map(convert_cut_fn)
+    return cuts, is_tarred
+
+@data_type_parser(["s2s_duplex_reverse_role_aug"])
+def read_s2s_duplex_reverse_role_aug(config) -> Tuple[CutSet, bool]:
+    cuts, is_tarred = read_cutset_from_config(config)
+
+    # Roles coming from config
+    agent_roles = config.get("agent_roles", ["agent", "Agent", "Assistant", "assistant"])
+    user_roles = config.get("user_roles", ["user", "User"])
+
+    agent_roles_set = {r.lower() for r in agent_roles}
+    user_roles_set = {r.lower() for r in user_roles}
+
+    target_agent_name = config.get("target_agent_name", "agent")
+    target_user_name = config.get("target_user_name", "user")
+
+    # Augmentation knobs
+    augment_to = config.get("augment_to", None)  # seconds, e.g. 300.0 for 5 min
+    augment_silence_range = config.get("augment_silence_range", [1.0, 6.0])  # seconds
+    augment_max_turn_uses = config.get("augment_max_turn_uses", None)  # optional cap; None = unlimited
+
+    def create_recording_from_array(samples: np.ndarray, sampling_rate: int, recording_id: str) -> Recording:
+        """samples: (C, N) float32"""
+        with io.BytesIO() as buffer:
+            sf.write(buffer, samples.T, samplerate=sampling_rate, format="WAV")
+            buffer.seek(0)
+            return Recording.from_bytes(buffer.read(), recording_id=recording_id)
+    
+    def create_recording_from_array_fast(samples: np.ndarray, sampling_rate: int, recording_id: str) -> Recording:
+        """samples: (C, N) float32"""
+        assert samples.ndim == 2, f"Expected (C,N), got {samples.shape}"
+        assert samples.dtype == np.float32, f"Expected float32, got {samples.dtype}"
+
+        # Encode to WAV bytes (required by your lhotse's AudioSource(type='memory'))
+        buf = io.BytesIO()
+        # PCM_16 is typically smaller/faster than float WAV and is well-supported
+        sf.write(buf, samples.T, samplerate=sampling_rate, format="WAV", subtype="PCM_16")
+        wav_bytes = buf.getvalue()
+
+        return Recording(
+            id=recording_id,
+            sources=[
+                AudioSource(
+                    type="memory",
+                    channels=list(range(samples.shape[0])),
+                    source=wav_bytes,  # <-- bytes (fixes your AssertionError)
+                )
+            ],
+            sampling_rate=sampling_rate,
+            num_samples=samples.shape[1],
+            duration=samples.shape[1] / sampling_rate,
+        )
+
+
+    def swap_speaker(role: str) -> str:
+        if role is None:
+            return role
+        role_l = role.lower()
+        if role_l in user_roles_set:
+            return target_agent_name
+        if role_l in agent_roles_set:
+            return target_user_name
+        return role
+
+    def _load_segment(rec: Recording, start: float, duration: float):
+        # Recording.load_audio returns shape (C, N)
+        return rec.load_audio(offset=start, duration=duration)
+
+    def debug_dump_duplex_cut(cut, out_dir="./debug_aug", max_chars=120):
+        """
+        Save:
+        - source audio waveform
+        - target audio waveform
+        - turns txt file with timing
+        """
+        import os
+        os.makedirs(out_dir, exist_ok=True)
+
+        base = os.path.join(out_dir, cut.id)
+
+        # ---- save source waveform ----
+        src_audio = cut.recording.load_audio()  # (C, N)
+        sf.write(
+            base + "_source.wav",
+            src_audio.T,
+            samplerate=cut.recording.sampling_rate,
+        )
+
+        # ---- save target waveform ----
+        tgt_audio = cut.target_audio.load_audio()
+        sf.write(
+            base + "_target.wav",
+            tgt_audio.T,
+            samplerate=cut.target_audio.sampling_rate,
+        )
+
+        # ---- save supervision turns ----
+        txt_path = base + "_turns.txt"
+        with open(txt_path, "w", encoding="utf-8") as f:
+            for s in cut.supervisions:
+                start = float(s.start)
+                end = float(s.start + s.duration)
+                speaker = getattr(s, "speaker", "UNK")
+
+                text = getattr(s, "text", "")
+                if text is None:
+                    text = ""
+
+                # optional trimming for readability
+                if len(text) > max_chars:
+                    text = text[:max_chars] + "..."
+
+                f.write(f"{start:.3f}\t{end:.3f}\t{speaker}\t{text}\n")
+
+        print(f"[DEBUG] dumped cut -> {base}_*.wav/txt")
+
+    def _augment_by_random_turns_conversation(new_cut: Cut, target_dur: float) -> Cut:
+        """
+        Build a longer cut by sampling turns in conversational order:
+
+            User -> silence -> Agent -> silence -> ...
+
+        Uses shuffle-without-replacement so we avoid repeating the same turns
+        until the pool is exhausted, then reshuffles automatically.
+        """
+        if not getattr(new_cut, "supervisions", None):
+            return new_cut
+
+        rec_a = new_cut.recording
+        rec_b = new_cut.target_audio
+
+        sr = config.get("sample_rate", None) or rec_a.sampling_rate
+        sil_lo, sil_hi = float(augment_silence_range[0]), float(augment_silence_range[1])
+
+        user_name = target_user_name
+        agent_name = target_agent_name
+
+        # ---- collect valid turns ----
+        turns = [
+            s for s in new_cut.supervisions
+            if getattr(s, "duration", 0.0) > 0.0 and getattr(s, "speaker", None)
+        ]
+
+        user_turns = [s for s in turns if str(s.speaker).lower() == user_name.lower()]
+        agent_turns = [s for s in turns if str(s.speaker).lower() == agent_name.lower()]
+
+        if not user_turns or not agent_turns:
+            return new_cut
+
+        # ---- shuffle pools (without replacement) ----
+        user_pool = user_turns[:]
+        agent_pool = agent_turns[:]
+        random.shuffle(user_pool)
+        random.shuffle(agent_pool)
+
+        ui = 0
+        ai = 0
+
+        def next_user():
+            nonlocal ui, user_pool
+            if ui >= len(user_pool):
+                user_pool = user_turns[:]
+                random.shuffle(user_pool)
+                ui = 0
+            s = user_pool[ui]
+            ui += 1
+            return s
+
+        def next_agent():
+            nonlocal ai, agent_pool
+            if ai >= len(agent_pool):
+                agent_pool = agent_turns[:]
+                random.shuffle(agent_pool)
+                ai = 0
+            s = agent_pool[ai]
+            ai += 1
+            return s
+
+        # ---- buffers ----
+        out_a = []
+        out_b = []
+        out_sups = []
+        cur_t = 0.0
+
+        def append_silence(sil_s: float):
+            nonlocal cur_t
+            if sil_s <= 0:
+                return
+            n = int(round(sil_s * sr))
+            if n <= 0:
+                return
+            ch_a = out_a[0].shape[0] if out_a else rec_a.num_channels
+            ch_b = out_b[0].shape[0] if out_b else rec_b.num_channels
+            out_a.append(np.zeros((ch_a, n), dtype=np.float32))
+            out_b.append(np.zeros((ch_b, n), dtype=np.float32))
+            cur_t += n / sr
+
+        def append_turn(s):
+            nonlocal cur_t
+            seg_a = rec_a.load_audio(offset=s.start, duration=s.duration).astype(np.float32, copy=False)
+            seg_b = rec_b.load_audio(offset=s.start, duration=s.duration).astype(np.float32, copy=False)
+
+            out_a.append(seg_a)
+            out_b.append(seg_b)
+
+            out_sups.append(fastcopy(s, start=cur_t))
+            cur_t += float(s.duration)
+
+            # silence only AFTER turn (no start latency increase)
+            if cur_t < target_dur:
+                append_silence(random.uniform(sil_lo, sil_hi))
+
+        # ---- build conversation ----
+        while cur_t < target_dur:
+            append_turn(next_user())
+            if cur_t >= target_dur:
+                break
+            append_turn(next_agent())
+
+        # ---- stitch waveform ----
+        wav_a = np.concatenate(out_a, axis=1)
+        wav_b = np.concatenate(out_b, axis=1)
+
+        new_dur = wav_a.shape[1] / sr
+
+        rec_a_new = create_recording_from_array(wav_a, sr, recording_id=f"{new_cut.id}_aug_rec")
+        rec_b_new = create_recording_from_array(wav_b, sr, recording_id=f"{new_cut.id}_aug_tar")
+
+        new_cut.recording = rec_a_new
+        new_cut.target_audio = rec_b_new
+        new_cut.duration = new_dur
+        new_cut.supervisions = out_sups
+
+        return new_cut
+
+    def _augment_by_random_turns_conversation_fast(new_cut: Cut, target_dur: float) -> Cut:
+        """
+        Build a longer cut by sampling turns in conversational order:
+
+            User -> silence -> Agent -> silence -> ...
+
+        Uses shuffle-without-replacement; when exhausted, reshuffles.
+        Silence is added ONLY after each turn.
+        """
+        sups = getattr(new_cut, "supervisions", None)
+        if not sups:
+            return new_cut
+
+        rec_a = new_cut.recording
+        rec_b = new_cut.target_audio
+
+        sr = config.get("sample_rate", None) or rec_a.sampling_rate
+        sil_lo, sil_hi = float(augment_silence_range[0]), float(augment_silence_range[1])
+
+        user_name = str(target_user_name).lower()
+        agent_name = str(target_agent_name).lower()
+
+        # ---- collect valid turns ----
+        turns = [
+            s for s in sups
+            if getattr(s, "duration", 0.0) > 0.0 and getattr(s, "speaker", None) is not None
+        ]
+        user_turns = [s for s in turns if str(s.speaker).lower() == user_name]
+        agent_turns = [s for s in turns if str(s.speaker).lower() == agent_name]
+        if not user_turns or not agent_turns:
+            return new_cut
+
+        # ---- shuffle pools (without replacement) ----
+        rng = random  # local alias
+        user_pool = user_turns[:]
+        agent_pool = agent_turns[:]
+        rng.shuffle(user_pool)
+        rng.shuffle(agent_pool)
+        ui = 0
+        ai = 0
+
+        def next_user():
+            nonlocal ui, user_pool
+            if ui >= len(user_pool):
+                user_pool = user_turns[:]
+                rng.shuffle(user_pool)
+                ui = 0
+            s = user_pool[ui]
+            ui += 1
+            return s
+
+        def next_agent():
+            nonlocal ai, agent_pool
+            if ai >= len(agent_pool):
+                agent_pool = agent_turns[:]
+                rng.shuffle(agent_pool)
+                ai = 0
+            s = agent_pool[ai]
+            ai += 1
+            return s
+
+        # ---- load FULL audio once (major speedup vs per-turn decoding) ----
+        full_a = rec_a.load_audio().astype(np.float32, copy=False)  # [C, N]
+        full_b = rec_b.load_audio().astype(np.float32, copy=False)  # [C, N]
+
+        # Determine channels robustly
+        ch_a = full_a.shape[0]
+        ch_b = full_b.shape[0]
+
+        # ---- plan conversation (same behavior: add silence after each turn) ----
+        plan = []  # list of (sup, new_start_time)
+        out_sups = []
+        cur_t = 0.0
+        target_dur_f = float(target_dur)
+
+        # We keep the same "grow beyond target_dur" behavior via silence/turn append,
+        # but we will cap final allocation to exactly the realized length.
+        while cur_t < target_dur_f:
+            s = next_user()
+            plan.append((s, cur_t))
+            cur_t += float(s.duration)
+            if cur_t >= target_dur_f:
+                break
+            cur_t += rng.uniform(sil_lo, sil_hi)
+
+            s = next_agent()
+            plan.append((s, cur_t))
+            cur_t += float(s.duration)
+            if cur_t >= target_dur_f:
+                break
+            cur_t += rng.uniform(sil_lo, sil_hi)
+
+        # Realized duration (matches old behavior: whatever we ended up with)
+        total_samples = int(round(cur_t * sr))
+        if total_samples <= 0:
+            return new_cut
+
+        # ---- preallocate output once (silence is already zeros) ----
+        wav_a = np.zeros((ch_a, total_samples), dtype=np.float32)
+        wav_b = np.zeros((ch_b, total_samples), dtype=np.float32)
+
+        # ---- fill by slicing ----
+        src_len_a = full_a.shape[1]
+        src_len_b = full_b.shape[1]
+        src_len = min(src_len_a, src_len_b)  # defensive: keep both aligned
+
+        for sup, new_start in plan:
+            # where to write in output
+            dst0 = int(round(float(new_start) * sr))
+            dur_samp = int(round(float(sup.duration) * sr))
+            if dur_samp <= 0:
+                continue
+            dst1 = min(total_samples, dst0 + dur_samp)
+            if dst0 >= total_samples or dst1 <= dst0:
+                continue
+
+            # slice from source (view, no decode)
+            s0 = int(round(float(sup.start) * sr))
+            s1 = s0 + (dst1 - dst0)
+
+            # clip to source length
+            if s0 < 0:
+                shift = -s0
+                s0 = 0
+                dst0 += shift
+            if s0 >= src_len or dst0 >= total_samples:
+                continue
+            s1 = min(src_len, s1)
+            dst1 = min(total_samples, dst0 + (s1 - s0))
+            if dst1 <= dst0:
+                continue
+
+            wav_a[:, dst0:dst1] = full_a[:, s0:s1]
+            wav_b[:, dst0:dst1] = full_b[:, s0:s1]
+
+            out_sups.append(fastcopy(sup, start=float(new_start)))
+
+        new_dur = total_samples / sr
+
+        rec_a_new = create_recording_from_array_fast(wav_a, sr, recording_id=f"{new_cut.id}_aug_rec")
+        rec_b_new = create_recording_from_array_fast(wav_b, sr, recording_id=f"{new_cut.id}_aug_tar")
+
+        new_cut.recording = rec_a_new
+        new_cut.target_audio = rec_b_new
+        new_cut.duration = new_dur
+        new_cut.supervisions = out_sups
+        return new_cut
+
+    def convert_cut_fn(cut: Cut) -> Cut:
+        new_cut = fastcopy(cut)
+
+        # swap supervisions speakers
+        if getattr(new_cut, "supervisions", None):
+            new_sups = []
+            for s in new_cut.supervisions:
+                s2 = fastcopy(s)
+                s2.speaker = swap_speaker(getattr(s2, "speaker", None))
+                new_sups.append(s2)
+            new_cut.supervisions = new_sups
+
+        # swap audio streams
+        old_recording = new_cut.recording
+        old_target_audio = new_cut.target_audio
+        old_rec_id = old_recording.id
+        old_tar_id = old_target_audio.id
+
+        new_cut.recording = old_target_audio
+        new_cut.target_audio = old_recording
+
+        # keep duration consistent
+        if hasattr(new_cut, "duration"):
+            new_cut.duration = new_cut.recording.duration
+
+        # Debug assertions
+        assert new_cut.target_audio.id == old_rec_id, f"{new_cut.id}: recording swap failed"
+        assert new_cut.recording.id == old_tar_id, f"{new_cut.id}: target_audio swap failed"
+        assert new_cut.recording is old_target_audio, f"{new_cut.id}: recording object not swapped"
+        assert new_cut.target_audio is old_recording, f"{new_cut.id}: target_audio object not swapped"
+
+        # ---- NEW: augment-to-long by remixing turns ----
+        if augment_to is not None and new_cut.duration < float(augment_to):
+            new_cut = _augment_by_random_turns_conversation_fast(new_cut, target_dur=float(augment_to))
+            # debug_dump_duplex_cut(new_cut)
+            # exit()
 
         new_cut.formatter = "s2s_duplex_reverse_role"
         return new_cut

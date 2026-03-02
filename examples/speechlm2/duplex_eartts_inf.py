@@ -48,7 +48,8 @@ from nemo.utils.trainer_utils import resolve_trainer_cfg
 
 from nemo.collections.speechlm2.parts.metrics.asr_cer_wer import Intelligibility
 
-torch.cuda.set_device(int(os.environ["LOCAL_RANK"]))
+local_rank = int(os.environ.get("LOCAL_RANK", 0))
+torch.cuda.set_device(local_rank)
 
 import json
 
@@ -112,6 +113,9 @@ def collate_and_tokenize_custom(
     root_path=None,
     drop_BOS=False,
     add_beginning_pad_tokens=False,
+    add_eos=False,
+    pad_factor_text_speech=10,
+    force_interruption=False,
 ):
     tokenized_list = []
     
@@ -133,13 +137,43 @@ def collate_and_tokenize_custom(
                 seg_ids = seg_ids + model.tokenizer.text_to_ids(segment)
                 seg_len = len(seg_ids)
 
-                # Calculate pad length (4x the size of the text)
-                pad_len = seg_len * 10
+                # Calculate pad length (pad_factor_text_speechx the size of the text)
+                pad_len = seg_len * pad_factor_text_speech
 
                 # Construct: text + 4x pads
                 # We extend the list with the tokens and then the pad tokens
+                pad_ids = [model.text_pad_id] * pad_len
+                if force_interruption:
+                    fname = s["audio_filepath"]
+                    no_ext = fname.split(".")[0]
+                    sample_id = int(no_ext.split("_")[-1])
+
+                    case = sample_id % 3  # 0,1,2 -> ~33% each
+
+                    if case == 0:
+                        # 33%: emulate interruption where text was not fully processed
+                        # (no pad eos placement at all)
+                        if len(seg_ids) >= 2:
+                            seg_ids[-2] = model.text_eos_id
+                            seg_ids[-1] = model.text_pad_id
+                        else:
+                            # fallback: if seg_ids is too short, emulate with pad EOS at 0
+                            pad_ids[0] = model.text_eos_id
+                    elif case == 1:
+                        # 33%: put EOS at pad index 6 - so 0.5 seconds after the whole text was processed
+                        eos_idx = min(6, len(pad_ids) - 1)
+                        pad_ids[eos_idx] = model.text_eos_id
+                    else:
+                        # 33%: put EOS at pad index 0
+                        eos_idx = 0
+                        pad_ids[eos_idx] = model.text_eos_id
+                else:
+                    if add_eos: # add eos in the end of the paddding sequence keep 70% for the speech and the rest for after EOS
+                        eos_idx = int(len(pad_ids) * 0.7)
+                        pad_ids[eos_idx] = model.text_eos_id
+
                 full_ids.extend(seg_ids)
-                full_ids.extend([model.text_pad_id] * pad_len)
+                full_ids.extend(pad_ids)
 
             # Convert to tensor
             tokenized_list.append(
@@ -280,7 +314,13 @@ def collate_and_tokenize_custom(
 @hydra_runner(config_path="conf", config_name="duplex_eartts")
 def inference(cfg):
     OmegaConf.resolve(cfg)
-    torch.distributed.init_process_group(backend="nccl")
+
+    distributed = int(os.environ.get("WORLD_SIZE", "1")) > 1
+    if distributed and not torch.distributed.is_initialized():
+        torch.distributed.init_process_group(backend="nccl")
+    rank = torch.distributed.get_rank() if distributed else 0
+    world = torch.distributed.get_world_size() if distributed else 1
+
     torch.set_float32_matmul_precision("medium")
     torch.backends.cudnn.allow_tf32 = True
     torch.backends.cuda.matmul.allow_tf32 = True
@@ -306,7 +346,7 @@ def inference(cfg):
     intelligibility = Intelligibility("stt_en_fastconformer_transducer_large", reuse_asr_hyps=False).reset()
 
     for batch_id, batch in enumerate(read_jsonl_batches(cfg.datasets_json_path, cfg.batch_size, max_batches=None)):
-        inputs = collate_and_tokenize_custom(batch, model, extra_duration_thrshould=1.5, sample_rate=model.target_sample_rate, root_path=cfg.audio_dir, drop_BOS=cfg.get("drop_BOS", False),  add_beginning_pad_tokens=cfg.get("add_beginning_pad_tokens", False))
+        inputs = collate_and_tokenize_custom(batch, model, extra_duration_thrshould=1.5, sample_rate=model.target_sample_rate, root_path=cfg.audio_dir, drop_BOS=cfg.get("drop_BOS", False),  add_beginning_pad_tokens=cfg.get("add_beginning_pad_tokens", False), add_eos=cfg.get("add_eos", False), pad_factor_text_speech=cfg.get("pad_factor_text_speech", 10), force_interruption=cfg.get("force_interruption", False))
         if cfg.get("user_custom_speaker_reference", None):
             wav, sr = librosa.load(cfg.model.inference_speaker_reference, sr=model.target_sample_rate, mono=True)
             wav = torch.as_tensor(wav, dtype=target_dtype).unsqueeze(0)
