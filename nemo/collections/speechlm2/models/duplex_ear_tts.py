@@ -292,6 +292,80 @@ class DuplexEARTTS(LightningModule, HFHubMixin):
             padded_audio = F.pad(audio, (0, num_padding))
         return padded_audio, padded_len
 
+    def _apply_tiled_prompt_and_wipe(self, audio_codes: torch.Tensor, subword_ids: torch.Tensor, non_prompt_mask: torch.Tensor):
+        """
+        Extracts the prompt region, tiles it across the sequence, cleans the base prompts,
+        and wipes the prompt from the main channels to force the model to use the fused channel.
+        """
+        B, T = audio_codes.shape[:2]
+        device = audio_codes.device
+
+        # 1. Vectorized calculation of prompt lengths
+        has_ones = non_prompt_mask.any(dim=1)
+        first_ones = non_prompt_mask.float().argmax(dim=1)
+        p_lens = torch.where(has_ones, first_ones, torch.tensor(T, device=device))
+
+        # 2. Create the masking and tiling indices
+        safe_p_lens = p_lens.clamp_min(1).unsqueeze(1)
+        time_indices = torch.arange(T, device=device).unsqueeze(0)
+        gather_indices = time_indices % safe_p_lens
+        is_prompt = time_indices < p_lens.unsqueeze(1)  # Shape: [B, T]
+
+
+        # Mask out any extra frames after p_len so they never get tiled
+        base_subword_ids = torch.where(
+            is_prompt,
+            subword_ids,
+            torch.tensor(self.text_pad_id, device=device, dtype=subword_ids.dtype)
+        )
+        silence_expanded = self.codec_silence_tokens.view(1, 1, -1).expand_as(audio_codes)
+        base_audio_codes = torch.where(
+            is_prompt.unsqueeze(-1),
+            audio_codes,
+            silence_expanded
+        )
+        # -----------------------------------
+
+        # 3. Gather the tiled text and audio (using the CLEANED base tensors)
+        tiled_subword_ids = torch.gather(base_subword_ids, 1, gather_indices)
+        C = audio_codes.shape[-1]
+        gather_indices_audio = gather_indices.unsqueeze(-1).expand(-1, -1, C)
+        tiled_audio_codes = torch.gather(base_audio_codes, 1, gather_indices_audio)
+
+        # 4. Overwrite p_len == 0 cases with fallback pad IDs
+        no_prompt_mask = (p_lens == 0).unsqueeze(1)
+        tiled_subword_ids = torch.where(
+            no_prompt_mask,
+            torch.tensor(self.text_pad_id, device=device, dtype=tiled_subword_ids.dtype),
+            tiled_subword_ids
+        )
+        tiled_audio_codes = torch.where(
+            no_prompt_mask.unsqueeze(-1),
+            torch.tensor(self.speech_pad_id, device=device, dtype=tiled_audio_codes.dtype),
+            tiled_audio_codes
+        )
+
+        # 5. Wipe prompt from the main channel
+        wiped_subword_ids = torch.where(
+            is_prompt,
+            torch.tensor(self.text_pad_id, device=device, dtype=subword_ids.dtype),
+            subword_ids
+        )
+        wiped_audio_codes = torch.where(
+            is_prompt.unsqueeze(-1),
+            silence_expanded,
+            audio_codes
+        )
+
+        tiled_subword_mask = torch.ones_like(tiled_subword_ids, dtype=torch.bool)
+
+        # Return EVERYTHING needed for both Training and Inference
+        return (
+            wiped_audio_codes, wiped_subword_ids, 
+            tiled_audio_codes, tiled_subword_ids, tiled_subword_mask,
+            base_audio_codes, base_subword_ids, p_lens
+        )
+
     def prepare_inputs(self, batch: dict):
         """
         Prepare inputs, extracting audio tokens and padding if needed.
@@ -486,6 +560,25 @@ class DuplexEARTTS(LightningModule, HFHubMixin):
         else:
             context_hidden_state = None
 
+        tiled_prompt_audio_codes = None
+        tiled_prompt_subword_ids = None
+        tiled_prompt_subword_mask = None
+
+        if self.cfg.tts_config.get("use_tiled_prompt_channel", False):
+
+            (
+                target_codes_aligned, 
+                subword_ids, 
+                tiled_prompt_audio_codes, 
+                tiled_prompt_subword_ids, 
+                tiled_prompt_subword_mask,
+                _,
+                _,
+                _
+            ) = self._apply_tiled_prompt_and_wipe(
+                target_codes_aligned, subword_ids, non_prompt_mask
+            )
+
         if self._use_tp:
             tp_world_size = self.device_mesh["tensor_parallel"].size()
             if (remainder := (target_text_tokens.shape[1] - 1) % tp_world_size) != 0:
@@ -494,6 +587,10 @@ class DuplexEARTTS(LightningModule, HFHubMixin):
                 target_codes_aligned = target_codes_aligned[:, :-remainder]
                 subword_ids = subword_ids[:, :-remainder]
                 subword_mask = subword_mask[:, :-remainder]
+                if self.cfg.tts_config.get("use_tiled_prompt_channel", False):
+                    tiled_prompt_subword_ids = tiled_prompt_subword_ids[:, :-remainder]
+                    tiled_prompt_audio_codes = tiled_prompt_audio_codes[:, :-remainder]
+                    tiled_prompt_subword_mask = tiled_prompt_subword_mask[:, :-remainder]
 
         return {
             "code": target_codes_aligned,
@@ -506,6 +603,9 @@ class DuplexEARTTS(LightningModule, HFHubMixin):
             "output_lens": target_codes_lens,
             "non_prompt_mask": non_prompt_mask,
             "target_text_tokens": target_text_tokens,
+            "tiled_prompt_audio_codes": tiled_prompt_audio_codes,
+            "tiled_prompt_subword_ids": tiled_prompt_subword_ids,
+            "tiled_prompt_subword_mask": tiled_prompt_subword_mask,
         }
 
     def training_step(self, batch: dict, batch_idx: int):
@@ -525,6 +625,9 @@ class DuplexEARTTS(LightningModule, HFHubMixin):
             subword_mask=inputs["subword_mask"],
             non_prompt_mask=inputs["non_prompt_mask"],
             dataset_type=batch.get("dataset_type", None),
+            tiled_prompt_audio_codes=inputs["tiled_prompt_audio_codes"],
+            tiled_prompt_subword_ids=inputs["tiled_prompt_subword_ids"],
+            tiled_prompt_subword_mask=inputs["tiled_prompt_subword_mask"],
         )
         loss_dict = {"lm_loss": tts_output.lm_loss, "c_loss": tts_output.c_loss, "k_loss": tts_output.k_loss}
         loss = sum(loss_dict.values())
@@ -1044,6 +1147,22 @@ class DuplexEARTTS(LightningModule, HFHubMixin):
         # set the extra self.speech_pad_id at first 1 position in non_prompt_mask
         code[row_idx, pos] = self.speech_pad_id
 
+
+        if self.cfg.tts_config.get("use_tiled_prompt_channel", False):
+            (
+                code, 
+                subword_ids, 
+                tiled_prompt_audio_codes, 
+                tiled_prompt_subword_ids, 
+                tiled_prompt_subword_mask,
+                base_prompt_audio_codes,
+                base_prompt_subword_ids,
+                p_lens
+            ) = self._apply_tiled_prompt_and_wipe(
+                code, subword_ids, non_prompt_mask
+            )
+
+
         init_inputs = {
             "code": code[:, :-1],
             "audio_mask": non_prompt_mask.bool()[
@@ -1054,6 +1173,14 @@ class DuplexEARTTS(LightningModule, HFHubMixin):
             "subword_mask": subword_mask.bool()[:, :-1],
             "non_prompt_mask": non_prompt_mask.bool()[:, :-1],
         }
+
+        if self.cfg.tts_config.get("use_tiled_prompt_channel", False):
+            init_inputs["base_prompt_audio_codes"] = base_prompt_audio_codes[:, :-1]
+            init_inputs["base_prompt_subword_ids"] = base_prompt_subword_ids[:, :-1]
+            init_inputs["p_lens"] = p_lens
+            init_inputs["tiled_prompt_audio_codes"] = tiled_prompt_audio_codes[:, :-1]
+            init_inputs["tiled_prompt_subword_ids"] = tiled_prompt_subword_ids[:, :-1]
+            init_inputs["tiled_prompt_subword_mask"] = tiled_prompt_subword_mask[:, :-1]
 
         if speaker_name is not None:
             init_inputs["audio_prompt_lantent"] = self.get_audio_prompt_lantent(speaker_name)
@@ -1108,6 +1235,16 @@ class DuplexEARTTS(LightningModule, HFHubMixin):
         if self._init_input_cache.get("audio_prompt_lantent", None) is not None:
             init_inputs_names.append("audio_prompt_lantent")
 
+        if self._init_input_cache.get("base_prompt_audio_codes", None) is not None:
+            init_inputs_names.extend([
+                "base_prompt_audio_codes",
+                "base_prompt_subword_ids",
+                "tiled_prompt_audio_codes",
+                "tiled_prompt_subword_ids",
+                "tiled_prompt_subword_mask",
+                "p_lens"
+            ])
+
         init_inputs = {}
         for name in init_inputs_names:
             buf = self._init_input_cache.get(name, None)
@@ -1138,6 +1275,9 @@ class DuplexEARTTS(LightningModule, HFHubMixin):
         guidance_enabled=True,
         generation_config=None,
         ignore_eos_flag_stop=True,
+        tiled_prompt_audio_codes=None,
+        tiled_prompt_subword_ids=None,
+        tiled_prompt_subword_mask=None,
     ):
         """
         Runs a single autoregressive prediction step to infer audio codec codes.
@@ -1185,6 +1325,9 @@ class DuplexEARTTS(LightningModule, HFHubMixin):
             "guidance_enabled": guidance_enabled,
             "generation_config": generation_config,
             "ignore_eos_flag_stop": ignore_eos_flag_stop,
+            "tiled_prompt_audio_codes": tiled_prompt_audio_codes,
+            "tiled_prompt_subword_ids": tiled_prompt_subword_ids,
+            "tiled_prompt_subword_mask": tiled_prompt_subword_mask
         }
 
         outputs = self.tts_model(**inputs)
@@ -1289,6 +1432,12 @@ class DuplexEARTTS(LightningModule, HFHubMixin):
                 Length of each generated waveform in samples, shape ``(B,)``.
         """
         B = next_subword_ids.size(0)
+        
+        if self.cfg.tts_config.get("use_tiled_prompt_channel", False):
+            base_prompt_audio_codes = init_inputs.pop("base_prompt_audio_codes")
+            base_prompt_subword_ids = init_inputs.pop("base_prompt_subword_ids")
+            p_lens = init_inputs.pop("p_lens") # Shape: [B]
+            safe_p_lens = p_lens.clamp_min(1)
 
         if generation_config is None:
             generation_config = self._get_generation_config(guidance_enabled)
@@ -1333,6 +1482,22 @@ class DuplexEARTTS(LightningModule, HFHubMixin):
             else:
                 prev_subword_id = next_subword_ids[:, i - 1].unsqueeze(-1)
 
+            if self.cfg.tts_config.get("use_tiled_prompt_channel", False):
+                # t_abs and mod_idx are now tensors of Shape: [B]
+                t_abs = p_lens + i
+                mod_idx = (t_abs % safe_p_lens).unsqueeze(1) # Shape: [B, 1]
+                
+                # Gather exactly 1 frame per batch item
+                step_tiled_text = torch.gather(base_prompt_subword_ids, 1, mod_idx)
+                C = base_prompt_audio_codes.shape[-1]
+                gather_indices_audio = mod_idx.unsqueeze(-1).expand(-1, -1, C)
+                step_tiled_audio = torch.gather(base_prompt_audio_codes, 1, gather_indices_audio)
+                step_tiled_mask = torch.ones_like(step_tiled_text, dtype=torch.bool)
+            else:
+                step_tiled_audio = None
+                step_tiled_text = None
+                step_tiled_mask = None
+    
             # create subword_mask
             current_subword_mask = subword_mask[:, i].unsqueeze(-1)
 
@@ -1345,6 +1510,9 @@ class DuplexEARTTS(LightningModule, HFHubMixin):
                 guidance_enabled=guidance_enabled,
                 generation_config=generation_config,
                 ignore_eos_flag_stop=True,
+                tiled_prompt_audio_codes=step_tiled_audio,
+                tiled_prompt_subword_ids=step_tiled_text,
+                tiled_prompt_subword_mask=step_tiled_mask,
             )
 
             # cache audio tokens

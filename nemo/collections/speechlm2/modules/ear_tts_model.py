@@ -1116,6 +1116,26 @@ class RVQEARTTSModel(nn.Module):
                 self.hidden_size, self.hidden_size, self.hidden_size, self.config.num_quantizers
             )
 
+        if self.config.get("use_tiled_prompt_channel", False):
+            # 1. Fusion module to combine the tiled audio and text embeddings
+            self.prompt_fusion = GatedProjectedSumRMSNorm(
+                audio_dim=self.hidden_size,
+                text_dim=self.hidden_size,
+                hidden_dim=self.hidden_size,
+                final_norm=True,
+                num_codebooks=self.config.num_quantizers
+            )
+            
+            # 2. Projection layer to inject the fused prompt into the main backbone
+            self.prompt_channel_proj = nn.Linear(self.hidden_size, self.hidden_size)
+
+            # Initialize weights and biases to zero. 
+            # This ensures that at step 0 of training, the addition is a perfect no-op (x + 0 = x), 
+            # preventing catastrophic forgetting or sudden loss spikes when resuming from a checkpoint!
+            nn.init.zeros_(self.prompt_channel_proj.weight)
+            if self.prompt_channel_proj.bias is not None:
+                nn.init.zeros_(self.prompt_channel_proj.bias)
+
         if self.config.get("use_audio_prompt_frozen_projection", False):
             with fp32_precision():
                 U, _ = torch.linalg.qr(torch.randn(self.hidden_size, self.hidden_size))
@@ -1308,6 +1328,9 @@ class RVQEARTTSModel(nn.Module):
         asr_speech_tokens_emb: Tensor | None = None,
         audio_prompt_lantent: Tensor | None = None,
         dataset_type: list[str] | None = None,
+        tiled_prompt_audio_codes: Tensor | None = None,
+        tiled_prompt_subword_ids: Tensor | None = None,
+        tiled_prompt_subword_mask: Tensor | None = None,
     ) -> RVQEARTTSOutput:
         """
         Performs a forward pass handling training, generation, or single-step inference.
@@ -1427,6 +1450,27 @@ class RVQEARTTSModel(nn.Module):
             inputs_embeds = self.gated_fusion_audio_text(code_embeds, cond)
         else:
             inputs_embeds = code_embeds + cond
+
+        if self.config.get("use_tiled_prompt_channel", False) and tiled_prompt_audio_codes is not None:
+            # 1. Embed the tiled audio codes
+            # depthsum_embedding converts [B, T, C] raw codes -> [B, T, H]
+            tiled_audio_embeds = self.embed_code(self.depthsum_embedding(tiled_prompt_audio_codes))
+            
+            # 2. Embed the tiled text tokens
+            if self.embed_subword is not None and tiled_prompt_subword_ids is not None:
+                tiled_text_embeds = self.embed_subword(tiled_prompt_subword_ids, tiled_prompt_subword_mask)
+            else:
+                tiled_text_embeds = torch.zeros_like(tiled_audio_embeds)
+
+            # 3. Fuse them using the dedicated prompt fusion module
+            fused_tiled_prompt = self.prompt_fusion(tiled_audio_embeds, tiled_text_embeds)
+            
+            # 4. Handle CFG (Classifier-Free Guidance) batch duplication
+            if guidance_enabled and fused_tiled_prompt.size(0) != inputs_embeds.size(0):
+                fused_tiled_prompt = torch.cat([fused_tiled_prompt] * 2, 0)
+                
+            # 5. Project and inject into the main sequence
+            inputs_embeds = inputs_embeds + self.prompt_channel_proj(fused_tiled_prompt)
 
         # Main backbone pass
         backbone_outputs = self.backbone(
