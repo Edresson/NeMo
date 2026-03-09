@@ -14,6 +14,7 @@
 import random
 import re
 from copy import deepcopy
+from functools import partial
 
 import torch
 import torch.nn.functional as F
@@ -164,9 +165,25 @@ class DuplexEARTTSDataset(torch.utils.data.Dataset):
         # ensures fp32 audio load to avoid issues of duration mistakes on fp16 training
         with fp32_precision():
             source_audio, source_audio_lens = collate_audio(cuts.resample(self.source_sample_rate))
-            target_audio, target_audio_lens = collate_audio(
-                cuts.resample(self.target_sample_rate), recording_field="target_audio"
+
+            # Some lhotse versions does not resample target audio, so manually do it to be safe
+            bound_resampler = partial(
+                resample_custom_target, 
+                target_field="target_audio", 
+                target_sample_rate=self.target_sample_rate
             )
+
+            # resample target audio
+            target_cuts = cuts.map(bound_resampler)
+
+            target_audio, target_audio_lens = collate_audio(
+                target_cuts, recording_field="target_audio"
+            )
+
+            # target_audio, target_audio_lens = collate_audio(
+            #     cuts.resample(self.target_sample_rate), recording_field="target_audio"
+            # )
+
         target_text_tokens, target_token_lens = collate_token_channel(
             cuts,
             self.tokenizer,
@@ -567,6 +584,22 @@ def add_speech_delay(
     source_audio_lens = source_audio_lens + extra_source_samples
 
     return source_audio, source_audio_lens, target_audio, target_audio_lens
+
+
+def resample_custom_target(cut, target_field, target_sample_rate):
+    """
+    A pure function to resample a custom recording field within a cut.
+    """
+    new_custom = dict(cut.custom) if cut.custom else {}
+    
+    if target_field in new_custom:
+        new_custom[target_field] = new_custom[target_field].resample(target_sample_rate)
+    
+    # Keep the primary cut aligned with the target
+    new_cut = cut.resample(target_sample_rate)
+    new_cut.custom = new_custom
+    
+    return new_cut
 
 
 def collate_system_prompt(
