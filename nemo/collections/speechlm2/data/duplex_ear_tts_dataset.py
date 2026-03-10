@@ -167,7 +167,6 @@ class DuplexEARTTSDataset(torch.utils.data.Dataset):
             target_audio, target_audio_lens = collate_audio(
                 cuts.resample(self.target_sample_rate, recording_field="target_audio"), recording_field="target_audio"
             )
-
         target_text_tokens, target_token_lens = collate_token_channel(
             cuts,
             self.tokenizer,

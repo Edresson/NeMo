@@ -85,11 +85,21 @@ class GenerativeCodecEARTTS(DuplexEARTTS):
             self.target_sample_rate, 
             self.cfg.get("asr_sample_rate", 16000)
         )
-        target_audio_lens_asr_sr = (
-            batch["target_audio_lens"] / self.target_sample_rate * self.cfg.get("asr_sample_rate", 16000)
-        ).to(torch.long)
+        if self.training:
+            target_audio_lens_asr_sr = (
+                batch["target_audio_lens"] / self.target_sample_rate * self.cfg.get("asr_sample_rate", 16000)
+            ).to(torch.long)
+        else:
+            # During evaluation, treat the entire padded audio as a valid sequence.
+            # This forces the Conformer to process padding as true silence rather than 
+            # masking it, eliminating boundary artifacts during AR decoding.
+            target_audio_lens_asr_sr = torch.full(
+                (target_audio_asr_sr.shape[0],),
+                target_audio_asr_sr.shape[1],
+                dtype=torch.long,
+                device=target_audio_asr_sr.device
+            )
 
-        
         delay_frames = self.cfg.get("num_delay_speech_tokens", 0)
         if delay_frames > 0:
             # Calculate how many audio samples correspond to the delay frames at the ASR sample rate
@@ -204,7 +214,31 @@ class GenerativeCodecEARTTS(DuplexEARTTS):
 
         return audio_pred.squeeze(1), audio_len
 
-    @torch.inference_mode()
+    @torch.no_grad()
+    def validation_step(self, batch: dict, batch_idx: int):
+        for name, dataset_batch in batch.items():
+            if dataset_batch is None:
+                continue  # some dataset is exhausted
+
+            B = len(dataset_batch['sample_id'])
+
+            # run inference for a custom speaker reference
+            if self.cfg.get("inference_speaker_reference", None):
+                new_dataset_batch = copy.deepcopy(dataset_batch)
+                speaker_audio, sr = load_audio_librosa(self.cfg.inference_speaker_reference)
+                speaker_audio = resample(speaker_audio, sr, self.target_sample_rate)
+                speaker_audio = speaker_audio.repeat(B, 1).to(self.device)
+                # lengths -> [B]
+                speaker_audio_lens = torch.tensor([speaker_audio.size(1)], device=self.device).long().repeat(B)
+                new_dataset_batch["audio_prompt"] = speaker_audio
+                new_dataset_batch["audio_prompt_lens"] = speaker_audio_lens
+                self.run_evaluation_one_batch(name, new_dataset_batch, use_dataloader_init=False)
+
+            # run inference using dataloader speaker references
+            else:
+                self.run_evaluation_one_batch(name, dataset_batch, use_dataloader_init=False)
+
+    @torch.no_grad()
     def infer_codes_one_step(
         self,
         current_asr_emb,
@@ -237,7 +271,38 @@ class GenerativeCodecEARTTS(DuplexEARTTS):
         outputs = self.tts_model(**inputs)
         return outputs["codes"], outputs["past_key_values"]
 
-    @torch.inference_mode()
+    @torch.no_grad()
+    def decode_one_audio_step(self, gen_audio_codes_history, number_prev_tokens=None):
+        """
+        Decodes one step of generated audio codec tokens to raw waveform.
+
+        Args:
+            gen_audio_codes_history (torch.Tensor): Audio tokens history, shape (B, T, C).
+            number_prev_tokens (int, optional): Number of previous tokens to decode, for incremental decoding.
+
+        Returns:
+            Tuple[torch.Tensor, torch.Tensor]:
+                - audio_pred_cur_step: Latest decoded waveform chunk, shape (B, wav_to_token_ratio).
+                - audio_len: Lengths (number of samples), shape (B,).
+        """
+        with fp32_precision(), torch.no_grad():
+            if number_prev_tokens:
+                gen_audio_codes_history = gen_audio_codes_history[:, -number_prev_tokens:]
+
+            gen_audio_codes_history = replace_control_speech_codes(
+                gen_audio_codes_history, self._control_codes, self.codec_silence_tokens
+            )
+            gen_audio_codes_lens = torch.tensor(
+                [gen_audio_codes_history.size(1)] * gen_audio_codes_history.size(0), device=self.device
+            )
+            audio_pred, audio_len = self.audio_codec.decode(gen_audio_codes_history, gen_audio_codes_lens)
+
+        # return only the current/lastest audio chunk
+        audio_pred_cur_step = audio_pred.squeeze(1)[:, -self.audio_codec.config.wav_to_token_ratio :]
+        audio_len[:] = self.audio_codec.config.wav_to_token_ratio
+        return audio_pred_cur_step, audio_len
+
+    @torch.no_grad()
     def offline_inference(
         self,
         next_asr_embs: torch.Tensor,
@@ -449,7 +514,15 @@ class GenerativeCodecEARTTS(DuplexEARTTS):
 
         return init_inputs
 
-    @torch.inference_mode()
+    def on_train_epoch_start(self) -> None:
+        # Call the parent's method (which ensures codec precision)
+        super().on_train_epoch_start()
+
+        # This prevents inference tensors from leaking into the training graph
+        if hasattr(self, "_init_input_cache"):
+            self._init_input_cache.clear()
+
+    @torch.no_grad()
     def run_evaluation_one_batch(self, name, dataset_batch, use_dataloader_init=False):
         results = {}
         inputs = self.prepare_inputs(dataset_batch)
