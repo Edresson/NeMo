@@ -100,6 +100,11 @@ class GenerativeCodecEARTTS(DuplexEARTTS):
                 device=target_audio_asr_sr.device
             )
 
+        target_audio_lens_asr_sr = (
+            batch["target_audio_lens"] / self.target_sample_rate * self.cfg.get("asr_sample_rate", 16000)
+        ).to(torch.long)
+
+        
         delay_frames = self.cfg.get("num_delay_speech_tokens", 0)
         if delay_frames > 0:
             # Calculate how many audio samples correspond to the delay frames at the ASR sample rate

@@ -799,6 +799,16 @@ def read_lhotse_magpietts_data_as_s2s_duplex(config) -> Tuple[CutSet, bool]:
 
     def convert_cut_fn(cut: Cut) -> Cut:
         """Convert a single cut into the continuation format."""
+        # work around for not break with estimate_duration_bins script
+        if not hasattr(cut, "target_audio"):
+            expected_dur = cut.duration
+            if add_extra_end_sil:
+                # Approximate the added silence using the average of the range
+                expected_dur += sum(extra_end_silence_range) / 2.0
+            
+            # Return a lightweight dummy cut just for the duration bucket estimator
+            return MonoCut(id=cut.id, start=0, duration=expected_dur, channel=0)
+
         orig_agent_sup = fastcopy(cut.supervisions[0])
         target_audio_orig_dur = cut.target_audio.duration
 
