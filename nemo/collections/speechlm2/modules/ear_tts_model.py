@@ -1136,7 +1136,7 @@ class RVQEARTTSModel(nn.Module):
             if self.prompt_channel_proj.bias is not None:
                 nn.init.zeros_(self.prompt_channel_proj.bias)
 
-        if self.config.get("use_audio_prompt_frozen_projection", False):
+        if self.config.get("use_audio_prompt_frozen_projection", False) or self.config.get("use_audio_prompt_frozen_projection_tiled_prompt", False):
             with fp32_precision():
                 U, _ = torch.linalg.qr(torch.randn(self.hidden_size, self.hidden_size))
                 V, _ = torch.linalg.qr(torch.randn(self.hidden_size, self.hidden_size))
@@ -1211,6 +1211,24 @@ class RVQEARTTSModel(nn.Module):
             self.config.num_quantizers,
         ) > torch.arange(d, dtype=torch.long, device=device)
         dropped_code = code * dropout_mask + (torch.zeros_like(code) + self.config.codebook_size) * (~dropout_mask)
+
+        force_prob = getattr(self.config, "force_lower_codebooks_prob", 0.0)
+        if force_prob > 0.0:
+            # Apply per sequence (stable)
+            force_mask = torch.rand((b, 1, 1), device=device) < force_prob
+            # 50%: C0 only, 50%: partial higher codebooks
+            use_c0_only = torch.rand((b, 1, 1), device=device) < 0.5
+            # C0 only
+            c0_mask = (torch.arange(d, device=device) < 1).view(1, 1, d)
+            # Partial: 20% of total codebooks
+            k = max(1, int(0.2 * self.config.num_quantizers))
+            # Ensure at least C0 is included if desired
+            partial_mask = torch.arange(d, device=device).view(1, 1, d) < k
+            # Select regime
+            final_mask = torch.where(use_c0_only, c0_mask, partial_mask)
+            fill_value = self.config.codebook_size
+            forced_code = code * final_mask + (torch.zeros_like(code) + fill_value) * (~final_mask)
+            dropped_code = torch.where(force_mask, forced_code, dropped_code)
 
         return src_masked_code, src_code_mask, tgt_masked_code, tgt_code_mask, dropped_code
 
@@ -1329,6 +1347,7 @@ class RVQEARTTSModel(nn.Module):
         audio_prompt_lantent: Tensor | None = None,
         dataset_type: list[str] | None = None,
         tiled_prompt_audio_codes: Tensor | None = None,
+        tiled_prompt_lantent: Tensor | None = None,
         tiled_prompt_subword_ids: Tensor | None = None,
         tiled_prompt_subword_mask: Tensor | None = None,
     ) -> RVQEARTTSOutput:
@@ -1414,7 +1433,6 @@ class RVQEARTTSModel(nn.Module):
 
             # Add BOS embedding
             code_embeds = code_embed + bos_mask * self.bos_emb
-
         else:  # Inference
             code_embeds = self.embed_code(self.depthsum_embedding(code))
             uncond_dec_flag = torch.zeros(code.size(0), 1, 1, device=code.device, dtype=torch.bool)
@@ -1455,7 +1473,29 @@ class RVQEARTTSModel(nn.Module):
             # 1. Embed the tiled audio codes
             # depthsum_embedding converts [B, T, C] raw codes -> [B, T, H]
             tiled_audio_embeds = self.embed_code(self.depthsum_embedding(tiled_prompt_audio_codes))
-            
+
+            if self.config.get("use_audio_prompt_frozen_projection_tiled_prompt", False):
+                if tiled_prompt_lantent is None:
+                    # Training-only anti-cloning augmentation for pure TTS batches.
+                    all_tts = (
+                        training
+                        and dataset_type is not None
+                        and len(dataset_type) == tiled_audio_embeds.size(0)
+                        and all(str(p).strip().lower() == "tts" for p in dataset_type)
+                    )
+                    if (
+                        self.config.get("force_no_audio_cond_latent_on_prompt", False)
+                        and all_tts
+                        and torch.rand(1, device=tiled_audio_embeds.device).item() < 0.3
+                    ):
+                        perm = torch.randperm(tiled_audio_embeds.size(0), device=tiled_audio_embeds.device)
+                        tiled_audio_embeds = tiled_audio_embeds[perm]
+                    else:
+                        W = self.audio_prompt_projection_W.to(tiled_audio_embeds.device, tiled_audio_embeds.dtype)
+                        tiled_audio_embeds = torch.nn.functional.linear(tiled_audio_embeds, W.T)
+                else:
+                    tiled_audio_embeds = tiled_prompt_lantent
+
             # 2. Embed the tiled text tokens
             if self.embed_subword is not None and tiled_prompt_subword_ids is not None:
                 tiled_text_embeds = self.embed_subword(tiled_prompt_subword_ids, tiled_prompt_subword_mask)
@@ -1464,11 +1504,11 @@ class RVQEARTTSModel(nn.Module):
 
             # 3. Fuse them using the dedicated prompt fusion module
             fused_tiled_prompt = self.prompt_fusion(tiled_audio_embeds, tiled_text_embeds)
-            
+
             # 4. Handle CFG (Classifier-Free Guidance) batch duplication
             if guidance_enabled and fused_tiled_prompt.size(0) != inputs_embeds.size(0):
                 fused_tiled_prompt = torch.cat([fused_tiled_prompt] * 2, 0)
-                
+
             # 5. Project and inject into the main sequence
             inputs_embeds = inputs_embeds + self.prompt_channel_proj(fused_tiled_prompt)
 

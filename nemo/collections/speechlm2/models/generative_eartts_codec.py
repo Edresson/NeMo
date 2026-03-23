@@ -11,7 +11,52 @@ from nemo.collections.speechlm2.parts.optim_setup import is_frozen
 from nemo.collections.tts.modules.audio_codec_modules import FiniteScalarQuantizer
 from nemo.collections.speechlm2.models.duplex_ear_tts import RVQEARTTSModel, DuplexEARTTS, setup_audio_codec, replace_control_speech_codes, ensures_target_precision
 from types import SimpleNamespace
+import torch
+import torch.nn.functional as F
+from typing import List, Optional, Tuple
 
+class ImprovedFiniteScalarQuantizer(FiniteScalarQuantizer):
+    """
+    Improved Finite Scalar Quantization (iFSQ).
+    
+    Inherits from FiniteScalarQuantizer but replaces the standard tanh bounding 
+    with a distribution-matching scaled sigmoid to force a uniform distribution, 
+    maximizing codebook utilization.
+
+    References:
+        iFSQ Paper (https://arxiv.org/abs/2601.17124)
+    """
+    def __init__(self, num_levels: List[int], eps: float = 1e-3):
+        super().__init__(num_levels=num_levels, eps=eps)
+
+    def compress(self, inputs: torch.Tensor, input_len: torch.Tensor) -> torch.Tensor:
+        """Apply iFSQ compression to the input to achieve uniform bin utilization."""
+        output_scale = (self.num_levels - 1) / 2
+        # scale down a bit to avoid rounding issues
+        output_scale = output_scale * (1 - self.eps)
+        # offset for even number of levels
+        output_offset = torch.where(self.num_levels % 2 == 0, 0.5, 0.0)
+        
+        # Calculate the shift required to center even-numbered levels.
+        # For iFSQ, the activation is y = 2 * sigmoid(1.6x) - 1.
+        # The exact mathematical inverse to find the shift is x = logit((y + 1)/2) / 1.6
+        if torch.any(self.num_levels % 2 == 0):
+            y_target = output_offset / output_scale
+            # Clamp safely to avoid infinities in logit
+            y_target = torch.clamp(y_target, min=-1.0 + 1e-5, max=1.0 - 1e-5)
+            input_shift = torch.logit((y_target + 1.0) / 2.0) / 1.6
+        else:
+            # If all levels are odd (e.g., [13, 13, 13, 13, 9]), no shift is needed.
+            input_shift = torch.zeros_like(output_offset)
+
+        # ---------------------------------------------------------------------
+        # The Core iFSQ Improvement: Scaled Sigmoid instead of Tanh
+        # ---------------------------------------------------------------------
+        shifted_inputs = inputs + input_shift
+        ifsq_activation = 2.0 * torch.sigmoid(1.6 * shifted_inputs) - 1.0
+
+        output = output_scale * ifsq_activation - output_offset
+        return output
 
 class GenerativeCodecRVQEARTTSModel(RVQEARTTSModel):
     """
@@ -66,12 +111,16 @@ class GenerativeCodecEARTTS(DuplexEARTTS):
 
         # Setup the FSQ Quantizer
         self.use_fsq = self.cfg.get("fsq_quantizer_levels", None) is not None
+
         if self.use_fsq:
             bottleneck_dim = len(self.cfg.fsq_quantizer_levels)
             hidden_size = self.tts_model.hidden_size 
-
             self.quantizer_bottleneck = nn.Linear(hidden_size, bottleneck_dim)
-            self.vector_quantizer = FiniteScalarQuantizer(self.cfg.fsq_quantizer_levels)
+            if not self.cfg.get("skip_fsq", False):
+                if self.cfg.get("use_ifsq", False):
+                    self.vector_quantizer = ImprovedFiniteScalarQuantizer(self.cfg.fsq_quantizer_levels)
+                else:
+                    self.vector_quantizer = FiniteScalarQuantizer(self.cfg.fsq_quantizer_levels)
             self.quantizer_projection = nn.Linear(bottleneck_dim, hidden_size)
 
         self.frame_length = cfg["data"]["frame_length"]
@@ -132,7 +181,11 @@ class GenerativeCodecEARTTS(DuplexEARTTS):
         if self.use_fsq:
             z = self.quantizer_bottleneck(encoded)
             with fp32_precision():
-                z_q, _ = self.vector_quantizer(inputs=z.transpose(1, 2), input_len=encoded_len)
+                if not self.cfg.get("skip_fsq", False):
+                    z_q, _ = self.vector_quantizer(inputs=z.transpose(1, 2), input_len=encoded_len)
+                else:
+                    z_q = z.transpose(1, 2)
+
             z_q = z_q.transpose(1, 2).to(z.dtype)
             encoded = self.quantizer_projection(z_q)
 
@@ -471,7 +524,10 @@ class GenerativeCodecEARTTS(DuplexEARTTS):
         if self.use_fsq:
             z = self.quantizer_bottleneck(encoded)
             with fp32_precision():
-                z_q, _ = self.vector_quantizer(inputs=z.transpose(1, 2), input_len=encoded_len)
+                if not self.cfg.get("skip_fsq", False):
+                    z_q, _ = self.vector_quantizer(inputs=z.transpose(1, 2), input_len=encoded_len)
+                else:
+                    z_q = z.transpose(1, 2)
             z_q = z_q.transpose(1, 2).to(z.dtype)
             encoded = self.quantizer_projection(z_q)
 

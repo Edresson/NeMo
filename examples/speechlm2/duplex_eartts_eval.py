@@ -100,7 +100,7 @@ import soundfile as sf
 import torch
 from torch.nn.utils.rnn import pad_sequence
 
-from nemo.collections.audio.parts.utils.resampling import resample
+from nemo.collections.audio.parts.utils.transforms import resample
 
 torch.set_float32_matmul_precision("medium")
 torch.backends.cudnn.allow_tf32 = True
@@ -349,6 +349,17 @@ def inference(cfg):
     if distributed and not torch.distributed.is_initialized():
         torch.distributed.init_process_group(backend="nccl")
 
+    # 1. Dynamically determine the correct GPU for this process
+    if torch.cuda.is_available():
+        # torchrun and Slurm usually populate LOCAL_RANK
+        local_rank = int(os.environ.get("LOCAL_RANK", 0))
+        
+        # CRITICAL for Triton: Set the default CUDA device for this process
+        torch.cuda.set_device(local_rank) 
+        target_device = torch.device(f"cuda:{local_rank}")
+    else:
+        target_device = torch.device("cpu")
+
     torch.set_float32_matmul_precision("medium")
     torch.backends.cudnn.allow_tf32 = True
     torch.backends.cuda.matmul.allow_tf32 = True
@@ -357,7 +368,10 @@ def inference(cfg):
         model = DuplexEARTTS.load_from_checkpoint(
             cfg.checkpoint_path,
             cfg=OmegaConf.to_container(cfg, resolve=True),
+            map_location=target_device  # Maps weights directly to the GPU, saving RAM
         ).eval()
+        # Move the model to the target device just to be absolutely certain
+        model = model.to(target_device)
     else:
         raise ValueError("For evaluation, you must provide `cfg.checkpoint_path`.")
 
@@ -400,7 +414,7 @@ def inference(cfg):
 
             audio, audio_len = model.offline_inference(
                 next_subword_ids=inputs["input_ids"],
-                formatter="custom",
+                task="custom",
                 init_inputs=init_inputs,
             )
 

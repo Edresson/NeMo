@@ -382,7 +382,10 @@ def oomptimizer(
             cfg = OmegaConf.load(config_path)
             namespace, name = module_name.rsplit('.', maxsplit=1)
             model_cls = getattr(importlib.import_module(namespace), name)
-            model = model_cls(cfg=cfg.model, trainer=trainer).to(device)
+            if "speechlm2" in module_name:
+                model = model_cls(cfg=OmegaConf.to_container(cfg, resolve=True)).to(device)
+            else:
+                model = model_cls(cfg=cfg.model, trainer=trainer).to(device)
         model_clones.append(model)
     model = model_clones[-1]
 
