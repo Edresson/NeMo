@@ -272,7 +272,7 @@ def collate_and_tokenize_custom(
             # We map 1 token roughly to 1 frame (or whatever the model scale is).
             # Assuming 1 token ~ 1 frame in the model's alignment, we just take the input length.
             current_text_len = len(tokenized_list[i])
-            
+
             if isinstance(s["text"], list):
                 # The text tokens are already physically padded 10x.
                 # Target frames should match this structure exactly.
@@ -290,7 +290,7 @@ def collate_and_tokenize_custom(
     for i, wav in enumerate(audio_list):
         padded_audio[i, : len(wav)] = wav
 
-    # Keep on CPU (Modified for DataLoader)
+    # Keep on CPU
     audio_lengths = torch.tensor(audio_lengths, dtype=torch.long)
 
     # Expand text length to match expected output speech duration

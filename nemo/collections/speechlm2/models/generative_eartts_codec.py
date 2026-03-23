@@ -9,23 +9,31 @@ from nemo.collections.audio.parts.utils.transforms import resample
 from nemo.collections.speechlm2.parts.precision import fp32_precision
 from nemo.collections.speechlm2.parts.optim_setup import is_frozen
 from nemo.collections.tts.modules.audio_codec_modules import FiniteScalarQuantizer
-from nemo.collections.speechlm2.models.duplex_ear_tts import RVQEARTTSModel, DuplexEARTTS, setup_audio_codec, replace_control_speech_codes, ensures_target_precision
+from nemo.collections.speechlm2.models.duplex_ear_tts import (
+    RVQEARTTSModel,
+    DuplexEARTTS,
+    setup_audio_codec,
+    replace_control_speech_codes,
+    ensures_target_precision,
+)
 from types import SimpleNamespace
 import torch
 import torch.nn.functional as F
 from typing import List, Optional, Tuple
 
+
 class ImprovedFiniteScalarQuantizer(FiniteScalarQuantizer):
     """
     Improved Finite Scalar Quantization (iFSQ).
-    
-    Inherits from FiniteScalarQuantizer but replaces the standard tanh bounding 
-    with a distribution-matching scaled sigmoid to force a uniform distribution, 
+
+    Inherits from FiniteScalarQuantizer but replaces the standard tanh bounding
+    with a distribution-matching scaled sigmoid to force a uniform distribution,
     maximizing codebook utilization.
 
     References:
         iFSQ Paper (https://arxiv.org/abs/2601.17124)
     """
+
     def __init__(self, num_levels: List[int], eps: float = 1e-3):
         super().__init__(num_levels=num_levels, eps=eps)
 
@@ -36,7 +44,7 @@ class ImprovedFiniteScalarQuantizer(FiniteScalarQuantizer):
         output_scale = output_scale * (1 - self.eps)
         # offset for even number of levels
         output_offset = torch.where(self.num_levels % 2 == 0, 0.5, 0.0)
-        
+
         # Calculate the shift required to center even-numbered levels.
         # For iFSQ, the activation is y = 2 * sigmoid(1.6x) - 1.
         # The exact mathematical inverse to find the shift is x = logit((y + 1)/2) / 1.6
@@ -58,31 +66,33 @@ class ImprovedFiniteScalarQuantizer(FiniteScalarQuantizer):
         output = output_scale * ifsq_activation - output_offset
         return output
 
+
 class GenerativeCodecRVQEARTTSModel(RVQEARTTSModel):
     """
-    Overrides RVQEARTTSModel to ignore textual inputs and prioritize 
+    Overrides RVQEARTTSModel to ignore textual inputs and prioritize
     the ASR/FSQ embedding for generative codec modeling.
     """
+
     def __init__(self, config, tokenizer=None):
         super().__init__(config, tokenizer)
-        
+
         # Completely remove unused textual modules from the PyTorch registry
         # This saves VRAM and prevents FSDP gradient synchronization crashes
         if hasattr(self, 'embed_subword') and self.embed_subword is not None:
             del self.embed_subword
             self.embed_subword = None
-            
+
         if hasattr(self, 'embed_context') and self.embed_context is not None:
             del self.embed_context
             self.embed_context = None
 
     def forward(self, *args, **kwargs):
-        # Explicitly nullify text-based inputs to force the model 
+        # Explicitly nullify text-based inputs to force the model
         # to rely entirely on `asr_speech_tokens_emb`
         kwargs['subword_ids'] = None
         kwargs['subword_mask'] = None
         kwargs['context_hidden_state'] = None
-        
+
         return super().forward(*args, **kwargs)
 
 
@@ -91,21 +101,17 @@ class GenerativeCodecEARTTS(DuplexEARTTS):
     Inherits from DuplexEARTTS to instantiate an ASR encoder and FSQ quantizer,
     bypassing text conditioning for a pure generative codec approach.
     """
+
     def __init__(self, cfg: dict) -> None:
         super().__init__(cfg)
-        
+
         # Replace base TTS model with our text-ignoring class
-        self.tts_model = GenerativeCodecRVQEARTTSModel(
-            DictConfig(self.cfg.tts_config), 
-            tokenizer=self.tokenizer
-        )
+        self.tts_model = GenerativeCodecRVQEARTTSModel(DictConfig(self.cfg.tts_config), tokenizer=self.tokenizer)
         # Replace codec and also load rvq embeddings
         setup_audio_codec(self)
 
         # Temporarily mock self.llm so setup_speech_encoder works here
-        self.llm = SimpleNamespace(
-            config=SimpleNamespace(hidden_size=self.tts_model.hidden_size)
-        )
+        self.llm = SimpleNamespace(config=SimpleNamespace(hidden_size=self.tts_model.hidden_size))
         # Setup the Speech Encoder (ASR model perception)
         setup_speech_encoder(self, pretrained_weights=True)
 
@@ -114,7 +120,7 @@ class GenerativeCodecEARTTS(DuplexEARTTS):
 
         if self.use_fsq:
             bottleneck_dim = len(self.cfg.fsq_quantizer_levels)
-            hidden_size = self.tts_model.hidden_size 
+            hidden_size = self.tts_model.hidden_size
             self.quantizer_bottleneck = nn.Linear(hidden_size, bottleneck_dim)
             if not self.cfg.get("skip_fsq", False):
                 if self.cfg.get("use_ifsq", False):
@@ -127,12 +133,10 @@ class GenerativeCodecEARTTS(DuplexEARTTS):
 
     def prepare_inputs(self, batch: dict):
         inputs = super().prepare_inputs(batch)
-        
+
         # Prepare target audio for the ASR encoder
         target_audio_asr_sr = resample(
-            batch["target_audio"], 
-            self.target_sample_rate, 
-            self.cfg.get("asr_sample_rate", 16000)
+            batch["target_audio"], self.target_sample_rate, self.cfg.get("asr_sample_rate", 16000)
         )
         if self.training:
             target_audio_lens_asr_sr = (
@@ -140,41 +144,41 @@ class GenerativeCodecEARTTS(DuplexEARTTS):
             ).to(torch.long)
         else:
             # During evaluation, treat the entire padded audio as a valid sequence.
-            # This forces the Conformer to process padding as true silence rather than 
+            # This forces the Conformer to process padding as true silence rather than
             # masking it, eliminating boundary artifacts during AR decoding.
             target_audio_lens_asr_sr = torch.full(
                 (target_audio_asr_sr.shape[0],),
                 target_audio_asr_sr.shape[1],
                 dtype=torch.long,
-                device=target_audio_asr_sr.device
+                device=target_audio_asr_sr.device,
             )
 
         target_audio_lens_asr_sr = (
             batch["target_audio_lens"] / self.target_sample_rate * self.cfg.get("asr_sample_rate", 16000)
         ).to(torch.long)
 
-        
         delay_frames = self.cfg.get("num_delay_speech_tokens", 0)
         if delay_frames > 0:
             # Calculate how many audio samples correspond to the delay frames at the ASR sample rate
             samples_per_frame_asr = int(self.cfg.get("asr_sample_rate", 16000) * self.frame_length)
             delay_samples_asr = int(delay_frames * samples_per_frame_asr)
-            
+
             if target_audio_asr_sr.shape[1] > delay_samples_asr:
                 # Remove the delay samples from the start
                 shifted_audio = target_audio_asr_sr[:, delay_samples_asr:]
-                
+
                 # Pad with zeros at the end to maintain tensor shape
                 zeros_pad = torch.zeros(
-                    target_audio_asr_sr.size(0), delay_samples_asr, 
-                    device=target_audio_asr_sr.device, dtype=target_audio_asr_sr.dtype
+                    target_audio_asr_sr.size(0),
+                    delay_samples_asr,
+                    device=target_audio_asr_sr.device,
+                    dtype=target_audio_asr_sr.dtype,
                 )
                 target_audio_asr_sr = torch.cat([shifted_audio, zeros_pad], dim=1)
 
         # Generate the ASR embedding
         encoded, encoded_len = self.perception(
-            input_signal=target_audio_asr_sr, 
-            input_signal_length=target_audio_lens_asr_sr
+            input_signal=target_audio_asr_sr, input_signal_length=target_audio_lens_asr_sr
         )
 
         # Apply FSQ Quantization
@@ -202,7 +206,7 @@ class GenerativeCodecEARTTS(DuplexEARTTS):
         inputs["subword_ids"] = None
         inputs["subword_mask"] = None
         inputs["context_hidden_state"] = None
-        
+
         return inputs
 
     def training_step(self, batch: dict, batch_idx: int):
@@ -225,17 +229,19 @@ class GenerativeCodecEARTTS(DuplexEARTTS):
             tiled_prompt_audio_codes=inputs["tiled_prompt_audio_codes"],
             tiled_prompt_subword_ids=inputs["tiled_prompt_subword_ids"],
             tiled_prompt_subword_mask=inputs["tiled_prompt_subword_mask"],
-            asr_speech_tokens_emb=inputs["asr_speech_tokens_emb"], 
+            asr_speech_tokens_emb=inputs["asr_speech_tokens_emb"],
         )
-        
+
         loss_dict = {"lm_loss": tts_output.lm_loss, "c_loss": tts_output.c_loss, "k_loss": tts_output.k_loss}
         loss = sum(loss_dict.values())
         num_frames = inputs["output_lens"].sum()
         B, T = inputs["code"].shape[:2]
-        
+
         ans = {
             "loss": loss,
-            "learning_rate": torch.as_tensor(self.trainer.optimizers[0].param_groups[0]['lr'] if self._trainer is not None else 0),
+            "learning_rate": torch.as_tensor(
+                self.trainer.optimizers[0].param_groups[0]['lr'] if self._trainer is not None else 0
+            ),
             "batch_size": B,
             "sequence_length": T,
             "num_frames": num_frames.to(torch.float32),
@@ -260,7 +266,7 @@ class GenerativeCodecEARTTS(DuplexEARTTS):
             generation_config=self._get_generation_config(guidance_enabled=guidance_enabled),
             teacher_forcing_inference=True,
             guidance_enabled=guidance_enabled,
-            asr_speech_tokens_emb=inputs["asr_speech_tokens_emb"], 
+            asr_speech_tokens_emb=inputs["asr_speech_tokens_emb"],
         )
         tf_audio_codes_pred = tts_output["codes"].squeeze(2)
 
@@ -323,7 +329,7 @@ class GenerativeCodecEARTTS(DuplexEARTTS):
             "tiled_prompt_audio_codes": tiled_prompt_audio_codes,
             "tiled_prompt_subword_ids": tiled_prompt_subword_ids,
             "tiled_prompt_subword_mask": tiled_prompt_subword_mask,
-            "asr_speech_tokens_emb": current_asr_emb, 
+            "asr_speech_tokens_emb": current_asr_emb,
         }
 
         outputs = self.tts_model(**inputs)
@@ -370,9 +376,9 @@ class GenerativeCodecEARTTS(DuplexEARTTS):
         generation_config: dict = None,
         incremental_audio_decoding: bool = False,
     ) -> dict[str, torch.Tensor]:
-        
+
         B = next_asr_embs.size(0)
-        
+
         if self.cfg.tts_config.get("use_tiled_prompt_channel", False):
             base_prompt_audio_codes = init_inputs.pop("base_prompt_audio_codes")
             base_prompt_subword_ids = init_inputs.pop("base_prompt_subword_ids")
@@ -394,7 +400,7 @@ class GenerativeCodecEARTTS(DuplexEARTTS):
 
         past_key_values = outputs["past_key_values"]
         max_steps = next_asr_embs.size(1)
-        
+
         gen_audio_codes = torch.zeros(
             B, max_steps, self.tts_model.config.num_quantizers, device=self.device, dtype=torch.long
         )
@@ -405,7 +411,7 @@ class GenerativeCodecEARTTS(DuplexEARTTS):
         for i in range(max_steps):
             # Extract current step ASR embedding [B, 1, H]
             current_asr_emb = next_asr_embs[:, i].unsqueeze(1)
-            
+
             if self.cfg.tts_config.get("use_tiled_prompt_channel", False):
                 t_abs = p_lens + i
                 mod_idx = (t_abs % safe_p_lens).unsqueeze(1)
@@ -460,21 +466,21 @@ class GenerativeCodecEARTTS(DuplexEARTTS):
     def set_init_inputs(self, speaker_audio=None, speaker_audio_lens=None, system_prompt=None, speaker_name=None):
         # 1. Let the parent handle the complex setup, codec encoding, and caching of base tensors
         init_inputs = super().set_init_inputs(speaker_audio, speaker_audio_lens, system_prompt, speaker_name)
-        
+
         # 2. Recreate the exact target_audio that the parent just built so we can pass it to the ASR encoder
         with fp32_precision():
             prompt_audio_size = int(
                 ((self.data_cfg.audio_prompt_duration * self.target_sample_rate) // self.target_samples_per_frame)
                 * self.target_samples_per_frame
             )
-            
+
             if speaker_name is not None:
                 speaker_audio = torch.zeros((1, prompt_audio_size), device=self.device, dtype=torch.float32)
                 speaker_audio_lens = torch.LongTensor([speaker_audio.shape[1]]).to(self.device)
 
             B, T = speaker_audio.shape
             prompt_audio = torch.zeros(B, prompt_audio_size, device=self.device, dtype=speaker_audio.dtype)
-            
+
             for b in range(B):
                 valid_len = min(speaker_audio_lens[b].item(), T)
                 if valid_len <= 0:
@@ -486,21 +492,24 @@ class GenerativeCodecEARTTS(DuplexEARTTS):
                     repeat_factor = (prompt_audio_size + valid_len - 1) // valid_len
                     expanded = valid_segment.repeat(repeat_factor)
                     prompt_audio[b] = expanded[:prompt_audio_size]
-                    
+
             prompt_audio[:, -int(self.target_samples_per_frame * 2) :] = 0
 
             # Recreate the text pad sizing
             if system_prompt is not None and self.cfg.get("use_system_prompt", None) and system_prompt != "":
                 text_prompt = torch.as_tensor(
                     [self.tokenizer.bos] + self.tokenizer.text_to_ids(system_prompt) + [self.tokenizer.eos],
-                    dtype=torch.long, device=self.device,
+                    dtype=torch.long,
+                    device=self.device,
                 )
             else:
                 text_prompt = torch.tensor([self.tokenizer.eos], dtype=torch.long, device=self.device)
 
             pad_size = text_prompt.size(-1) * self.target_samples_per_frame
-            pad_audio = torch.zeros(pad_size, device=prompt_audio.device, dtype=prompt_audio.dtype).unsqueeze(0).repeat(B, 1)
-            
+            pad_audio = (
+                torch.zeros(pad_size, device=prompt_audio.device, dtype=prompt_audio.dtype).unsqueeze(0).repeat(B, 1)
+            )
+
             target_audio = torch.cat([pad_audio, prompt_audio], dim=1)
             target_audio_len = torch.tensor([target_audio.size(-1)] * B, dtype=torch.long, device=self.device)
 
@@ -516,10 +525,17 @@ class GenerativeCodecEARTTS(DuplexEARTTS):
             delay_samples_asr = int(delay_frames * samples_per_frame_asr)
             if target_audio_asr_sr.shape[1] > delay_samples_asr:
                 shifted_audio = target_audio_asr_sr[:, delay_samples_asr:]
-                zeros_pad = torch.zeros(target_audio_asr_sr.size(0), delay_samples_asr, device=target_audio_asr_sr.device, dtype=target_audio_asr_sr.dtype)
+                zeros_pad = torch.zeros(
+                    target_audio_asr_sr.size(0),
+                    delay_samples_asr,
+                    device=target_audio_asr_sr.device,
+                    dtype=target_audio_asr_sr.dtype,
+                )
                 target_audio_asr_sr = torch.cat([shifted_audio, zeros_pad], dim=1)
 
-        encoded, encoded_len = self.perception(input_signal=target_audio_asr_sr, input_signal_length=target_audio_lens_asr_sr)
+        encoded, encoded_len = self.perception(
+            input_signal=target_audio_asr_sr, input_signal_length=target_audio_lens_asr_sr
+        )
 
         if self.use_fsq:
             z = self.quantizer_bottleneck(encoded)
@@ -567,7 +583,7 @@ class GenerativeCodecEARTTS(DuplexEARTTS):
             init_inputs_names.append("asr_speech_tokens_emb")
 
         init_inputs = super().get_init_inputs(B, init_inputs_names)
-        
+
         # Ensure textual inputs are explicitly None so the generative codec relies strictly on ASR
         init_inputs["subword_ids"] = None
         init_inputs["subword_mask"] = None
@@ -612,17 +628,15 @@ class GenerativeCodecEARTTS(DuplexEARTTS):
                 system_prompt=system_prompt,
             )
             init_inputs = self.get_init_inputs(B=inputs["code"].size(0))
-            
+
             # Inject corresponding prompt portion of the ASR embedding into init_inputs
             target_len = init_inputs["code"].shape[1]
-            init_inputs["asr_speech_tokens_emb"] = torch.stack([
-                asr_emb[i, :target_len] for i in range(asr_emb.size(0))
-            ])
+            init_inputs["asr_speech_tokens_emb"] = torch.stack(
+                [asr_emb[i, :target_len] for i in range(asr_emb.size(0))]
+            )
 
         # Slice remaining ASR embeddings to represent the 'next' sequences to generate
-        next_asr_embs = torch.stack([
-            asr_emb[i, plen:] for i, plen in enumerate(dataset_batch["prompt_lens"])
-        ])
+        next_asr_embs = torch.stack([asr_emb[i, plen:] for i, plen in enumerate(dataset_batch["prompt_lens"])])
 
         results["audio"], results["audio_len"] = self.offline_inference(
             next_asr_embs=next_asr_embs,
@@ -635,14 +649,15 @@ class GenerativeCodecEARTTS(DuplexEARTTS):
         ]
 
         results["audio_tf"] = results["audio_tf"][:, -int(next_asr_embs.size(1) * self.target_samples_per_frame) :]
-        
+
         target_audio_no_prompt = dataset_batch["target_audio"][
             :, -int(next_asr_embs.size(1) * self.target_samples_per_frame) :
         ]
         target_audio_no_prompt_lens = dataset_batch["target_audio_lens"] - (
             torch.tensor(
                 dataset_batch["prompt_lens"], dtype=torch.long, device=dataset_batch["target_audio_lens"].device
-            ) * self.target_samples_per_frame
+            )
+            * self.target_samples_per_frame
         )
 
         with fp32_precision():
@@ -652,8 +667,10 @@ class GenerativeCodecEARTTS(DuplexEARTTS):
             metric_audio_pred = resample(metric_audio_pred, self.target_sample_rate, 16000)
             metric_audio_pred_lens = (metric_audio_pred_lens / self.target_sample_rate * 16000).to(torch.long)
             target_audio_no_prompt_16khz = resample(target_audio_no_prompt, self.target_sample_rate, 16000)
-            target_audio_no_prompt_lens_16khz = (target_audio_no_prompt_lens / self.target_sample_rate * 16000).to(torch.long)
-            
+            target_audio_no_prompt_lens_16khz = (target_audio_no_prompt_lens / self.target_sample_rate * 16000).to(
+                torch.long
+            )
+
             if self.cfg.get("use_GT_transcriptions_for_metrics", True):
                 target_asr_texts = self.asr_bleu.asr.transcribe(
                     [
@@ -687,13 +704,15 @@ class GenerativeCodecEARTTS(DuplexEARTTS):
                 refs=dataset_batch["target_texts"],
                 pred_audio=target_audio_no_prompt_16khz,
                 pred_audio_lens=target_audio_no_prompt_lens_16khz,
-                asr_hyps=(metric_text if self.cfg.get("use_GT_transcriptions_for_metrics", True) else None), 
+                asr_hyps=(metric_text if self.cfg.get("use_GT_transcriptions_for_metrics", True) else None),
             )
 
             self.secs.update(
                 name=name,
                 target_audio=resample(dataset_batch["target_audio"], self.target_sample_rate, 16000),
-                target_audio_lens=(dataset_batch["target_audio_lens"] / self.target_sample_rate * 16000).to(torch.long),
+                target_audio_lens=(dataset_batch["target_audio_lens"] / self.target_sample_rate * 16000).to(
+                    torch.long
+                ),
                 pred_audio=resample(results["audio"], self.target_sample_rate, 16000),
                 pred_audio_lens=(results["audio_len"] / self.target_sample_rate * 16000).to(torch.long),
             )
@@ -715,9 +734,9 @@ class GenerativeCodecEARTTS(DuplexEARTTS):
                 pred_audio_sr=self.target_sample_rate,
                 user_audio=dataset_batch["source_audio"].float(),
                 user_audio_sr=self.source_sample_rate,
-                eou_pred=None, 
+                eou_pred=None,
                 fps=self.target_fps,
                 results=results if self.cfg.get("dump_tokens_text", False) else None,
                 tokenizer=self.tokenizer,
             )
-
+                                 

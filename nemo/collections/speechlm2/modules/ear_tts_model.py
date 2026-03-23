@@ -1123,20 +1123,22 @@ class RVQEARTTSModel(nn.Module):
                 text_dim=self.hidden_size,
                 hidden_dim=self.hidden_size,
                 final_norm=True,
-                num_codebooks=self.config.num_quantizers
+                num_codebooks=self.config.num_quantizers,
             )
-            
+
             # 2. Projection layer to inject the fused prompt into the main backbone
             self.prompt_channel_proj = nn.Linear(self.hidden_size, self.hidden_size)
 
-            # Initialize weights and biases to zero. 
-            # This ensures that at step 0 of training, the addition is a perfect no-op (x + 0 = x), 
+            # Initialize weights and biases to zero.
+            # This ensures that at step 0 of training, the addition is a perfect no-op (x + 0 = x),
             # preventing catastrophic forgetting or sudden loss spikes when resuming from a checkpoint!
             nn.init.zeros_(self.prompt_channel_proj.weight)
             if self.prompt_channel_proj.bias is not None:
                 nn.init.zeros_(self.prompt_channel_proj.bias)
 
-        if self.config.get("use_audio_prompt_frozen_projection", False) or self.config.get("use_audio_prompt_frozen_projection_tiled_prompt", False):
+        if self.config.get("use_audio_prompt_frozen_projection", False) or self.config.get(
+            "use_audio_prompt_frozen_projection_tiled_prompt", False
+        ):
             with fp32_precision():
                 U, _ = torch.linalg.qr(torch.randn(self.hidden_size, self.hidden_size))
                 V, _ = torch.linalg.qr(torch.randn(self.hidden_size, self.hidden_size))
