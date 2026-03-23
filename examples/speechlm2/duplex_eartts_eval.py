@@ -94,11 +94,13 @@ Usage:
 
 import json
 import os
+from functools import partial
 
 import librosa
 import soundfile as sf
 import torch
 from torch.nn.utils.rnn import pad_sequence
+from torch.utils.data import Dataset, DataLoader
 
 from nemo.collections.audio.parts.utils.transforms import resample
 
@@ -111,54 +113,35 @@ from omegaconf import OmegaConf
 
 from nemo.collections.speechlm2.models.duplex_ear_tts import DuplexEARTTS
 from nemo.collections.speechlm2.parts.metrics.asr_cer_wer import Intelligibility
+from nemo.collections.speechlm2.parts.metrics.secs import SECS
 from nemo.core.config import hydra_runner
 
-torch.cuda.set_device(int(os.environ["LOCAL_RANK"]))
+# Use .get() to avoid crashing when running a single GPU without torchrun
+if torch.cuda.is_available():
+    torch.cuda.set_device(int(os.environ.get("LOCAL_RANK", 0)))
 
 
-def read_jsonl_batches(
-    file_path,
-    batch_size,
-    drop_last=False,
-    max_batches=None,  # <-- DEBUG OPTION
-):
+class EvalJSONLDataset(Dataset):
     """
-    Reads a JSONL file and yields batches of size batch_size.
-
-    Args:
-        file_path (str): Path to the JSONL file
-        batch_size (int): Number of samples per batch
-        drop_last (bool): If True, drop the last incomplete batch
-        max_batches (int or None): If set, only yield this many batches (debug mode)
-
-    Yields:
-        List[dict]: A batch of samples
+    Standard PyTorch Dataset for reading JSONL evaluation files.
     """
-    batch = []
-    num_batches = 0
+    def __init__(self, file_path):
+        self.samples = []
+        with open(file_path, "r", encoding="utf-8") as f:
+            for line_idx, line in enumerate(f, 1):
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    self.samples.append(json.loads(line))
+                except json.JSONDecodeError as e:
+                    raise ValueError(f"Invalid JSON on line {line_idx}: {e}")
 
-    with open(file_path, "r", encoding="utf-8") as f:
-        for line_idx, line in enumerate(f, 1):
-            line = line.strip()
-            if not line:
-                continue
+    def __len__(self):
+        return len(self.samples)
 
-            try:
-                sample = json.loads(line)
-            except json.JSONDecodeError as e:
-                raise ValueError(f"Invalid JSON on line {line_idx}: {e}")
-
-            batch.append(sample)
-
-            if len(batch) == batch_size:
-                yield batch
-                batch = []
-                num_batches += 1
-                if max_batches is not None and num_batches >= max_batches:
-                    return
-
-    if batch and not drop_last:
-        yield batch
+    def __getitem__(self, idx):
+        return self.samples[idx]
 
 
 def collate_and_tokenize_custom(
@@ -195,6 +178,7 @@ def collate_and_tokenize_custom(
                 # Construct: text + 4x pads
                 # We extend the list with the tokens and then the pad tokens
                 pad_ids = [model.text_pad_id] * pad_len
+                
                 if force_interruption:
                     fname = s["audio_filepath"]
                     no_ext = fname.split(".")[0]
@@ -220,17 +204,16 @@ def collate_and_tokenize_custom(
                         eos_idx = 0
                         pad_ids[eos_idx] = model.text_eos_id
                 else:
-                    if (
-                        add_eos
-                    ):  # add eos in the end of the paddding sequence keep 70% for the speech and the rest for after EOS
+                    if add_eos: 
+                        # add eos in the end of the paddding sequence keep 70% for the speech and the rest for after EOS
                         eos_idx = int(len(pad_ids) * 0.7)
                         pad_ids[eos_idx] = model.text_eos_id
 
                 full_ids.extend(seg_ids)
                 full_ids.extend(pad_ids)
 
-            # Convert to tensor
-            tokenized_list.append(torch.as_tensor(full_ids, dtype=torch.long, device=model.device))
+            # Convert to CPU tensor (Modified for DataLoader)
+            tokenized_list.append(torch.as_tensor(full_ids, dtype=torch.long))
 
         else:
             # Standard String Handling
@@ -238,13 +221,12 @@ def collate_and_tokenize_custom(
                 torch.as_tensor(
                     [model.tokenizer.bos] + model.tokenizer.text_to_ids(text_data),
                     dtype=torch.long,
-                    device=model.device,
                 )
             )
 
     if add_beginning_pad_tokens:
         pad_len = 25
-        prefix = torch.full((pad_len,), model.text_pad_id, dtype=torch.long, device=model.device)
+        prefix = torch.full((pad_len,), model.text_pad_id, dtype=torch.long)
         for i in range(len(tokenized_list)):
             tokenized_list[i] = torch.cat([prefix, tokenized_list[i]])
 
@@ -289,9 +271,8 @@ def collate_and_tokenize_custom(
             # If text was a list, it already has physical pads (1 + 4 ratio).
             # We map 1 token roughly to 1 frame (or whatever the model scale is).
             # Assuming 1 token ~ 1 frame in the model's alignment, we just take the input length.
-
             current_text_len = len(tokenized_list[i])
-
+            
             if isinstance(s["text"], list):
                 # The text tokens are already physically padded 10x.
                 # Target frames should match this structure exactly.
@@ -304,27 +285,26 @@ def collate_and_tokenize_custom(
     # audio padding
     max_audio_len = max(audio_lengths)
     B = len(audio_lengths)
-
     padded_audio = torch.zeros((B, max_audio_len), dtype=torch.float32)
 
     for i, wav in enumerate(audio_list):
         padded_audio[i, : len(wav)] = wav
 
-    padded_audio = padded_audio.to(model.device)
+    # Keep on CPU (Modified for DataLoader)
     audio_lengths = torch.tensor(audio_lengths, dtype=torch.long)
 
     # Expand text length to match expected output speech duration
     B, L = input_ids.shape
     target_len = int(max(target_num_frames))
-
+    
     # Ensure target_len is at least as long as the input text
     # (prevents truncation if calc was slightly off)
     target_len = max(target_len, L)
 
     padded_input_ids = torch.full(
-        (B, target_len), fill_value=model.text_pad_id, dtype=input_ids.dtype, device=input_ids.device
+        (B, target_len), fill_value=model.text_pad_id, dtype=input_ids.dtype
     )
-
+    
     # Copy the actual tokens (which might already contain list-based padding)
     padded_input_ids[:, :L] = input_ids
 
@@ -349,13 +329,9 @@ def inference(cfg):
     if distributed and not torch.distributed.is_initialized():
         torch.distributed.init_process_group(backend="nccl")
 
-    # 1. Dynamically determine the correct GPU for this process
+    # Dynamically determine the correct GPU for this process
     if torch.cuda.is_available():
-        # torchrun and Slurm usually populate LOCAL_RANK
         local_rank = int(os.environ.get("LOCAL_RANK", 0))
-        
-        # CRITICAL for Triton: Set the default CUDA device for this process
-        torch.cuda.set_device(local_rank) 
         target_device = torch.device(f"cuda:{local_rank}")
     else:
         target_device = torch.device("cpu")
@@ -368,39 +344,61 @@ def inference(cfg):
         model = DuplexEARTTS.load_from_checkpoint(
             cfg.checkpoint_path,
             cfg=OmegaConf.to_container(cfg, resolve=True),
-            map_location=target_device  # Maps weights directly to the GPU, saving RAM
+            map_location=target_device  
         ).eval()
-        # Move the model to the target device just to be absolutely certain
         model = model.to(target_device)
     else:
         raise ValueError("For evaluation, you must provide `cfg.checkpoint_path`.")
 
     target_dtype = getattr(torch, cfg.get("inference_dtype", "float32"))
-    # Move and cast
     if target_dtype != torch.float32:
         model.to(dtype=target_dtype)
 
     intelligibility = Intelligibility("stt_en_fastconformer_transducer_large", reuse_asr_hyps=False).reset()
+    secs_metric = SECS("titanet_large").reset()
 
-    for batch_id, batch in enumerate(read_jsonl_batches(cfg.datasets_json_path, cfg.batch_size, max_batches=None)):
-        inputs = collate_and_tokenize_custom(
-            batch,
-            model,
-            extra_duration_thrshould=1.5,
-            sample_rate=model.target_sample_rate,
-            root_path=cfg.audio_dir,
-            add_beginning_pad_tokens=cfg.get("add_beginning_pad_tokens", True),
-            add_eos=cfg.get("add_eos", True),
-            pad_factor_text_speech=cfg.get("pad_factor_text_speech", 10),
-            force_interruption=cfg.get("force_interruption", False),
-        )
+    # Initialize the Dataset
+    eval_dataset = EvalJSONLDataset(cfg.datasets_json_path)
+
+    # Use partial to bind the model and config parameters to the collate function
+    collate_fn = partial(
+        collate_and_tokenize_custom,
+        model=model,
+        extra_duration_thrshould=1.5,
+        sample_rate=model.target_sample_rate,
+        root_path=cfg.audio_dir,
+        add_beginning_pad_tokens=cfg.get("add_beginning_pad_tokens", True),
+        add_eos=cfg.get("add_eos", True),
+        pad_factor_text_speech=cfg.get("pad_factor_text_speech", 10),
+        force_interruption=cfg.get("force_interruption", False),
+    )
+
+    # Initialize the DataLoader
+    dataloader = DataLoader(
+        dataset=eval_dataset,
+        batch_size=cfg.batch_size,
+        collate_fn=collate_fn,
+        num_workers=cfg.get("num_workers", 4), 
+        pin_memory=True, 
+        shuffle=False,
+        drop_last=False
+    )
+
+    if cfg.get("user_custom_speaker_reference", None):
+        wav, sr = librosa.load(cfg.model.inference_speaker_reference, sr=model.target_sample_rate, mono=True)
+        speaker_wav = torch.as_tensor(wav, dtype=target_dtype).unsqueeze(0).to(model.device)
+
+    # Iterate over the DataLoader
+    for batch_id, inputs in enumerate(dataloader):
+        
+        # Move required tensors to the GPU immediately
+        inputs["input_ids"] = inputs["input_ids"].to(model.device)
+        inputs["context_audio"] = inputs["context_audio"].to(model.device)
+        inputs["context_audio_lengths"] = inputs["context_audio_lengths"].to(model.device)
+
         if cfg.get("user_custom_speaker_reference", None):
-            wav, sr = librosa.load(cfg.model.inference_speaker_reference, sr=model.target_sample_rate, mono=True)
-            wav = torch.as_tensor(wav, dtype=target_dtype).unsqueeze(0)
-            inputs["context_audio"] = wav.expand(inputs["input_ids"].size(0), *wav.shape[1:])
-            inputs["context_audio_lengths"][:] = wav.size(-1)
-            inputs["context_audio"] = inputs["context_audio"].to(model.device)
-            inputs["context_audio_lengths"] = inputs["context_audio_lengths"].to(model.device).long()
+            inputs["context_audio"] = speaker_wav.expand(inputs["input_ids"].size(0), *speaker_wav.shape[1:])
+            inputs["context_audio_lengths"][:] = speaker_wav.size(-1)
 
         use_autocast = target_dtype != torch.float32
         autocast_ctx = torch.amp.autocast(device_type="cuda", dtype=target_dtype) if use_autocast else nullcontext()
@@ -419,8 +417,9 @@ def inference(cfg):
             )
 
         audio = audio.float()
+        
         # reset audio len to the actual size removing extra long audio padding
-        audio_len = (torch.tensor(inputs["target_num_frames"]) * model.target_samples_per_frame).int()
+        audio_len = (torch.tensor(inputs["target_num_frames"], device=audio.device) * model.target_samples_per_frame).int()
 
         # resample audio to the asr sampling rate
         metric_audio_pred = resample(audio, model.target_sample_rate, 16000)
@@ -434,14 +433,22 @@ def inference(cfg):
             asr_hyps=None,
         )
 
+        secs_metric.update(
+            name="dataset",
+            target_audio=resample(inputs["context_audio"], model.target_sample_rate, 16000),
+            target_audio_lens=(inputs["context_audio_lengths"] / model.target_sample_rate * 16000).to(torch.long),
+            pred_audio=metric_audio_pred,
+            pred_audio_lens=metric_audio_pred_lens,
+        )
+
         # save audio to cfg.out_dir
         os.makedirs(cfg.out_dir, exist_ok=True)
-
         audio = audio.detach().cpu().float()
         audio_len = audio_len.cpu()
 
         for i in range(audio.size(0)):
             wav = audio[i, : audio_len[i]].numpy()
+            
             # Use original target audio filename
             target_path = inputs["target_audio_paths"][i]
             base_name = os.path.basename(target_path)
@@ -452,12 +459,17 @@ def inference(cfg):
                 wav,
                 samplerate=model.target_sample_rate,
             )
-
             print(f"Saved: {out_path}")
 
+    print("\n--- Evaluation Metrics ---")
+    
     cer_wer = intelligibility.compute()
     for k, m in cer_wer.items():
-        print(k, m)
+        print(f"Intelligibility - {k}: {m}")
+
+    secs_scores = secs_metric.compute()
+    for k, m in secs_scores.items():
+        print(f"SECS - {k}: {m}")
 
 
 if __name__ == "__main__":
