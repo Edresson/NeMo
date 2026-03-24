@@ -20,6 +20,7 @@ from types import SimpleNamespace
 import torch
 import torch.nn.functional as F
 from typing import List, Optional, Tuple
+from nemo.collections.speechlm2.models import SALM, SALMWithAsrDecoder
 
 
 class ImprovedFiniteScalarQuantizer(FiniteScalarQuantizer):
@@ -110,42 +111,71 @@ class GenerativeCodecEARTTS(DuplexEARTTS):
         # Replace codec and also load rvq embeddings
         setup_audio_codec(self)
 
-        # Temporarily mock self.llm so setup_speech_encoder works here
-        self.llm = SimpleNamespace(config=SimpleNamespace(hidden_size=self.tts_model.hidden_size))
-        # Setup the Speech Encoder (ASR model perception)
-        setup_speech_encoder(self, pretrained_weights=True)
+        if self.cfg.get("use_pretrained_quantizer", False):
+            self.use_fsq = False
+            self.perception = SALM.from_pretrained(self.cfg.pretrained_quantizer_name_or_path).perception
+            self.quantizer_projection = nn.Linear(self.perception.cfg.output_dim, self.tts_model.hidden_size)
+        else:
+            # Temporarily mock self.llm so setup_speech_encoder works here
+            self.llm = SimpleNamespace(config=SimpleNamespace(hidden_size=self.tts_model.hidden_size))
+            # Setup the Speech Encoder (ASR model perception)
+            setup_speech_encoder(self, pretrained_weights=True)
+            # Setup the FSQ Quantizer
+            self.use_fsq = self.cfg.get("fsq_quantizer_levels", None) is not None
 
-        # Setup the FSQ Quantizer
-        self.use_fsq = self.cfg.get("fsq_quantizer_levels", None) is not None
-
-        if self.use_fsq:
-            bottleneck_dim = len(self.cfg.fsq_quantizer_levels)
-            hidden_size = self.tts_model.hidden_size
-            self.quantizer_bottleneck = nn.Linear(hidden_size, bottleneck_dim)
-            if not self.cfg.get("skip_fsq", False):
-                if self.cfg.get("use_ifsq", False):
-                    self.vector_quantizer = ImprovedFiniteScalarQuantizer(self.cfg.fsq_quantizer_levels)
-                else:
-                    self.vector_quantizer = FiniteScalarQuantizer(self.cfg.fsq_quantizer_levels)
-            self.quantizer_projection = nn.Linear(bottleneck_dim, hidden_size)
+            if self.use_fsq:
+                bottleneck_dim = len(self.cfg.fsq_quantizer_levels)
+                hidden_size = self.tts_model.hidden_size
+                self.quantizer_bottleneck = nn.Linear(hidden_size, bottleneck_dim)
+                if not self.cfg.get("skip_fsq", False):
+                    if self.cfg.get("use_ifsq", False):
+                        self.vector_quantizer = ImprovedFiniteScalarQuantizer(self.cfg.fsq_quantizer_levels)
+                    else:
+                        self.vector_quantizer = FiniteScalarQuantizer(self.cfg.fsq_quantizer_levels)
+                self.quantizer_projection = nn.Linear(bottleneck_dim, hidden_size)
 
         self.frame_length = cfg["data"]["frame_length"]
 
     def prepare_inputs(self, batch: dict):
+        delay_frames = self.cfg.get("num_delay_speech_tokens", 0)
+
+        # -------------------------------------------------------------------
+        # 1. THE PAD: Push target_audio forward in time to protect the start
+        # -------------------------------------------------------------------
+        if delay_frames > 0:
+            # Calculate samples at the TARGET output sample rate
+            samples_per_frame_out = int(self.target_sample_rate * self.frame_length)
+            delay_samples_out = int(delay_frames * samples_per_frame_out)
+            
+            zeros_pad = torch.zeros(
+                batch["target_audio"].size(0),
+                delay_samples_out,
+                device=batch["target_audio"].device,
+                dtype=batch["target_audio"].dtype,
+            )
+            # Pad the BEGINNING
+            batch["target_audio"] = torch.cat([zeros_pad, batch["target_audio"]], dim=1)
+            
+            # CRITICAL: Increase the lengths so the end of the real audio isn't masked!
+            batch["target_audio_lens"] = batch["target_audio_lens"] + delay_samples_out
+
+        # The parent will now extract TTS codes where index 0 is pure silence if delay_frames > 0, 
+        # preserving your real audio later in the sequence.
         inputs = super().prepare_inputs(batch)
 
-        # Prepare target audio for the ASR encoder
+        # -------------------------------------------------------------------
+        # 2. Resample for the ASR Encoder
+        # -------------------------------------------------------------------
         target_audio_asr_sr = resample(
             batch["target_audio"], self.target_sample_rate, self.cfg.get("asr_sample_rate", 16000)
         )
+        
         if self.training:
             target_audio_lens_asr_sr = (
                 batch["target_audio_lens"] / self.target_sample_rate * self.cfg.get("asr_sample_rate", 16000)
             ).to(torch.long)
         else:
             # During evaluation, treat the entire padded audio as a valid sequence.
-            # This forces the Conformer to process padding as true silence rather than
-            # masking it, eliminating boundary artifacts during AR decoding.
             target_audio_lens_asr_sr = torch.full(
                 (target_audio_asr_sr.shape[0],),
                 target_audio_asr_sr.shape[1],
@@ -153,45 +183,49 @@ class GenerativeCodecEARTTS(DuplexEARTTS):
                 device=target_audio_asr_sr.device,
             )
 
-        target_audio_lens_asr_sr = (
-            batch["target_audio_lens"] / self.target_sample_rate * self.cfg.get("asr_sample_rate", 16000)
-        ).to(torch.long)
-
-        delay_frames = self.cfg.get("num_delay_speech_tokens", 0)
+        # -------------------------------------------------------------------
+        # 3. THE CUT: Shift ASR audio backward (into the future)
+        # -------------------------------------------------------------------
         if delay_frames > 0:
-            # Calculate how many audio samples correspond to the delay frames at the ASR sample rate
             samples_per_frame_asr = int(self.cfg.get("asr_sample_rate", 16000) * self.frame_length)
             delay_samples_asr = int(delay_frames * samples_per_frame_asr)
 
             if target_audio_asr_sr.shape[1] > delay_samples_asr:
-                # Remove the delay samples from the start
+                # Cut the padding we added earlier off the start
                 shifted_audio = target_audio_asr_sr[:, delay_samples_asr:]
 
-                # Pad with zeros at the end to maintain tensor shape
-                zeros_pad = torch.zeros(
+                # Pad the END to maintain tensor shape
+                zeros_pad_end = torch.zeros(
                     target_audio_asr_sr.size(0),
                     delay_samples_asr,
                     device=target_audio_asr_sr.device,
                     dtype=target_audio_asr_sr.dtype,
                 )
-                target_audio_asr_sr = torch.cat([shifted_audio, zeros_pad], dim=1)
+                target_audio_asr_sr = torch.cat([shifted_audio, zeros_pad_end], dim=1)
+                
+                # CRITICAL: Subtract the shifted amount from the lens so the ASR
+                # encoder doesn't treat the new zeros at the end as real speech.
+                target_audio_lens_asr_sr = torch.clamp(target_audio_lens_asr_sr - delay_samples_asr, min=1)
 
         # Generate the ASR embedding
         encoded, encoded_len = self.perception(
             input_signal=target_audio_asr_sr, input_signal_length=target_audio_lens_asr_sr
         )
 
-        # Apply FSQ Quantization
-        if self.use_fsq:
-            z = self.quantizer_bottleneck(encoded)
-            with fp32_precision():
-                if not self.cfg.get("skip_fsq", False):
-                    z_q, _ = self.vector_quantizer(inputs=z.transpose(1, 2), input_len=encoded_len)
-                else:
-                    z_q = z.transpose(1, 2)
+        if self.cfg.get("use_pretrained_quantizer", False):
+            encoded = self.quantizer_projection(encoded)
+        else:
+            # Apply FSQ Quantization
+            if self.use_fsq:
+                z = self.quantizer_bottleneck(encoded)
+                with fp32_precision():
+                    if not self.cfg.get("skip_fsq", False):
+                        z_q, _ = self.vector_quantizer(inputs=z.transpose(1, 2), input_len=encoded_len)
+                    else:
+                        z_q = z.transpose(1, 2)
 
-            z_q = z_q.transpose(1, 2).to(z.dtype)
-            encoded = self.quantizer_projection(z_q)
+                z_q = z_q.transpose(1, 2).to(z.dtype)
+                encoded = self.quantizer_projection(z_q)
 
         # Align sequence lengths to the target codes
         target_len = inputs["code"].shape[1]
@@ -536,16 +570,18 @@ class GenerativeCodecEARTTS(DuplexEARTTS):
         encoded, encoded_len = self.perception(
             input_signal=target_audio_asr_sr, input_signal_length=target_audio_lens_asr_sr
         )
-
-        if self.use_fsq:
-            z = self.quantizer_bottleneck(encoded)
-            with fp32_precision():
-                if not self.cfg.get("skip_fsq", False):
-                    z_q, _ = self.vector_quantizer(inputs=z.transpose(1, 2), input_len=encoded_len)
-                else:
-                    z_q = z.transpose(1, 2)
-            z_q = z_q.transpose(1, 2).to(z.dtype)
-            encoded = self.quantizer_projection(z_q)
+        if self.cfg.get("use_pretrained_quantizer", False):
+            encoded = self.quantizer_projection(encoded)
+        else:
+            if self.use_fsq:
+                z = self.quantizer_bottleneck(encoded)
+                with fp32_precision():
+                    if not self.cfg.get("skip_fsq", False):
+                        z_q, _ = self.vector_quantizer(inputs=z.transpose(1, 2), input_len=encoded_len)
+                    else:
+                        z_q = z.transpose(1, 2)
+                z_q = z_q.transpose(1, 2).to(z.dtype)
+                encoded = self.quantizer_projection(z_q)
 
         # The parent init_inputs drops the last frame (`[:, :-1]`), so target_len is code length + 1
         target_len = init_inputs["code"].shape[1] + 1
@@ -739,4 +775,3 @@ class GenerativeCodecEARTTS(DuplexEARTTS):
                 results=results if self.cfg.get("dump_tokens_text", False) else None,
                 tokenizer=self.tokenizer,
             )
-                                 

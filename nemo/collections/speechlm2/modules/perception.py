@@ -21,6 +21,8 @@ from nemo.collections.asr.models import ASRModel
 from nemo.collections.asr.modules.conformer_encoder import ConformerMultiLayerFeatureExtractor
 from nemo.collections.asr.parts.mixins import TranscribeConfig
 from nemo.core import Exportable, NeuralModule, typecheck
+from nemo.collections.tts.modules.audio_codec_modules import FiniteScalarQuantizer
+from nemo.collections.speechlm2.parts.precision import fp32_precision
 
 
 class AudioPerceptionModule(NeuralModule, Exportable):
@@ -333,3 +335,35 @@ class MultiLayerProjectionConnector(nn.Module):
         audio_signal = torch.cat(audio_signal, dim=1).transpose(1, 2)
         projected = self.proj(audio_signal).transpose(1, 2)
         return projected, length[0]
+
+
+class FSQConnector(NeuralModule, Exportable):
+    """User to pass encoder's representations as-is to the LLM."""
+
+    def __init__(
+        self,
+        d_model,
+        quantizer_levels,
+        *args,
+        **kwargs,
+    ):
+        super().__init__()
+        bottleneck_dim = len(quantizer_levels)
+        # Bottleneck projection → Quantizer → Projection back
+        self.quantizer_bottleneck = nn.Linear(d_model, bottleneck_dim)
+        self.vector_quantizer = FiniteScalarQuantizer(quantizer_levels)
+        self.quantizer_projection = nn.Linear(bottleneck_dim, d_model)
+
+    def forward(self, audio_signal, length=None, *args, **kwargs):
+        # Apply quantization: Linear → FSQ → Linear
+        z = self.quantizer_bottleneck(audio_signal.transpose(1, 2))
+        dtype = z.dtype
+        # keep finite scalar quantization on FP32
+        with fp32_precision():
+            # add tanh to avoid overflow
+            # z = torch.tanh(z)
+            z_q, _ = self.vector_quantizer(inputs=z.transpose(1, 2), input_len=None)
+        # make sure that it is runing in the right dtype
+        z_q = z_q.transpose(1, 2).to(dtype)
+        z_o = self.quantizer_projection(z_q).transpose(1, 2)
+        return z_o, length
