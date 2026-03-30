@@ -21,6 +21,417 @@ import torch
 import torch.nn.functional as F
 from typing import List, Optional, Tuple
 from nemo.collections.speechlm2.models import SALM, SALMWithAsrDecoder
+import gc
+
+import numpy as np
+import math
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+from transformers import MimiConfig
+from transformers.models.mimi.modeling_mimi import MimiEncoder, MimiTransformerModel, MimiConv1d, MimiConvTranspose1d, MimiDecoder
+from nemo.core.classes.module import NeuralModule
+from nemo.collections.tts.parts.utils.helpers import get_mask_from_lengths
+
+from nemo.collections.common.parts.utils import ClampActivation
+from nemo.collections.tts.modules.audio_codec_modules import CodecActivation, CausalConv1dNorm
+
+
+
+
+from typing import Optional, Tuple
+
+import torch
+from torch import nn
+from torch.nn.utils import weight_norm, remove_weight_norm
+from nemo.collections.asr.parts.submodules.causal_convs import CausalConv1D
+from transformers import MimiModel
+
+class ConvNeXtBlock(nn.Module):
+    """ConvNeXt Block adapted from https://github.com/facebookresearch/ConvNeXt to 1D audio signal.
+
+    Args:
+        dim (int): Number of input channels.
+        intermediate_dim (int): Dimensionality of the intermediate layer.
+        layer_scale_init_value (float, optional): Initial value for the layer scale. None means no scaling.
+            Defaults to None.
+        adanorm_num_embeddings (int, optional): Number of embeddings for AdaLayerNorm.
+            None means non-conditional LayerNorm. Defaults to None.
+    """
+
+    def __init__(
+        self,
+        dim: int,
+        intermediate_dim: int = 1152,
+        layer_scale_init_value: float = 1.0,
+    ):
+        super().__init__()
+        self.dwconv = nn.Conv1d(dim, dim, kernel_size=7, padding=3, groups=dim)  # depthwise conv
+        # self.dwconv = CausalConv1D(dim, dim, kernel_size=7, padding=None, groups=dim)  # depthwise conv
+        self.norm = nn.LayerNorm(dim, eps=1e-6)
+        self.pwconv1 = nn.Linear(dim, intermediate_dim)  # pointwise/1x1 convs, implemented with linear layers
+        self.act = nn.GELU()
+        self.pwconv2 = nn.Linear(intermediate_dim, dim)
+        self.gamma = (
+            nn.Parameter(layer_scale_init_value * torch.ones(dim), requires_grad=True)
+            if layer_scale_init_value > 0
+            else None
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        residual = x
+        x = self.dwconv(x)
+        x = x.transpose(1, 2)  # (B, C, T) -> (B, T, C)
+        x = self.norm(x)
+        x = self.pwconv1(x)
+        x = self.act(x)
+        x = self.pwconv2(x)
+        if self.gamma is not None:
+            x = self.gamma * x
+        x = x.transpose(1, 2)  # (B, T, C) -> (B, C, T)
+
+        x = residual + x
+        return x
+
+class TemporalSmoothingHead(nn.Module):
+    def __init__(self, in_channels=882, kernel_size=5, out_kernel_size=3, pad_mode="zeros", output_activation="clamp", activation="half_snake"):
+        super().__init__()
+        
+        self.pre_conv = CausalConv1dNorm(in_channels=in_channels, out_channels=in_channels, kernel_size=kernel_size, pad_mode=pad_mode)
+        self.pre_activation = CodecActivation(activation, channels=in_channels)
+        self.post_conv = CausalConv1dNorm(in_channels=in_channels, out_channels=in_channels, kernel_size=out_kernel_size, pad_mode=pad_mode)
+        if output_activation == "tanh":
+            self.out_activation = nn.Tanh()
+        elif output_activation == "clamp":
+            self.out_activation = ClampActivation()
+
+    def forward(self, x, x_len):
+        out = x.transpose(1, 2)
+        out = self.pre_conv(inputs=out, input_len=x_len)
+        out = self.pre_activation(out)
+        # [B, 1, T_audio]
+        out = self.post_conv(inputs=out, input_len=x_len)
+        out = self.out_activation(out)
+        return out.transpose(1, 2)
+
+from contextlib import contextmanager
+@contextmanager
+def default_precision(dtype=torch.float32):
+    default_dtype = torch.get_default_dtype()
+    torch.set_default_dtype(dtype)
+    try:
+        yield
+    finally:
+        torch.set_default_dtype(default_dtype)
+
+
+class ReshapeTransformerEncoder(NeuralModule):
+    """
+    Transformer Audio encoder.
+
+    Args:
+        output_dim: Dimension of encoder output.
+    """
+
+    def __init__(
+        self,
+        samples_per_frame: int,
+        audio_proj_size: int = 1024, 
+        output_dim: int = 32,
+        n_layers: int = 8,
+        d_model: int = 1024,
+        d_ffn: int = 4096,
+        is_causal: bool = True,
+        sliding_window_size: int = 12,
+        max_position_embeddings: int = 8000,
+        rope_theta: float = 10000.0,
+        attn_implementation: str = "eager",
+    ):
+        super().__init__()
+
+        self.is_causal = is_causal
+        self.samples_per_frame = samples_per_frame
+        self.audio_proj_size = audio_proj_size
+        self.output_dim = output_dim
+
+        self.config = MimiConfig()
+        self.config._attn_implementation = attn_implementation
+        self.config.max_position_embeddings = max_position_embeddings
+        self.config.rope_theta = rope_theta
+
+        self.config.use_causal_conv = is_causal
+        self.config.num_hidden_layers = n_layers
+        self.config.intermediate_size = d_ffn
+        self.config.hidden_size = d_model
+        self.config.sliding_window = sliding_window_size
+        self.layers = MimiTransformerModel(self.config)
+
+        self.inp_projection_no_bias = nn.Linear(samples_per_frame, audio_proj_size, bias=False)
+        self.inp_projection = nn.Linear(audio_proj_size, d_model)
+        self.out_projection = nn.Linear(d_model, output_dim)
+
+    def forward(self, audio, audio_len):
+        encoded_len = audio_len
+        B, T = audio.size()
+        audio = audio.reshape(B, -1, self.samples_per_frame) # B, T, F, where 7 is the number of samples per frame that controls the frame rate
+        with default_precision(torch.float32):
+            encoded_len = (audio_len / self.samples_per_frame).long()
+
+        if self.is_causal:
+            mask = get_mask_from_lengths(encoded_len)
+        else:
+            # mask none does not apply causal mask
+            mask = None
+
+        out = self.inp_projection_no_bias(audio)
+        out = self.inp_projection(out)
+
+        out = self.layers(out, attention_mask=mask)[0]
+        # out projection
+        encoded = self.out_projection(out).transpose(1, 2)
+        return encoded, encoded_len
+
+
+class ReshapeTransformerDecoder(NeuralModule):
+    """
+    Transformer Audio Decoder.
+
+    Args:
+        input_dim: Dimension of encoder output.
+    """
+
+    def __init__(
+        self,
+        samples_per_frame: int,
+        audio_proj_size: int = 1024, 
+        input_dim: int = 32,
+        n_layers: int = 8,
+        d_model: int = 1024,
+        d_ffn: int = 4096,
+        is_causal: bool = True,
+        sliding_window_size: int = 12,
+        max_position_embeddings: int = 8000,
+        rope_theta: float = 10000.0,
+        attn_implementation: str = "eager",
+        use_conv_pos: bool = False,
+        num_pos_conv_blocks: int = 1,
+        use_temporal_smoth_head: bool = False,
+    ):
+        super().__init__()
+
+        self.samples_per_frame = samples_per_frame
+        self.audio_proj_size = audio_proj_size
+        self.is_causal = is_causal
+        self.use_conv_pos = use_conv_pos
+        self.use_temporal_smoth_head = use_temporal_smoth_head
+
+        self.config = MimiConfig()
+        self.config._attn_implementation = attn_implementation
+        self.config.max_position_embeddings = max_position_embeddings
+        self.config.rope_theta = rope_theta
+
+        self.config.use_causal_conv = is_causal
+        self.config.num_hidden_layers = n_layers
+        self.config.intermediate_size = d_ffn
+        self.config.hidden_size = d_model
+        self.config.sliding_window = sliding_window_size
+        self.layers = MimiTransformerModel(self.config)
+
+        self.inp_projection = nn.Linear(input_dim, d_model)
+        self.out_projection = nn.Linear(d_model, audio_proj_size)
+        self.out_projection_no_bias = nn.Linear(audio_proj_size, samples_per_frame, bias=False)
+
+        # add ConvNeXt based conv pos
+        if self.use_conv_pos:
+            self.conv_pos = nn.ModuleList(
+            [
+                ConvNeXtBlock(
+                    dim=d_model
+                )
+                for _ in range(num_pos_conv_blocks)
+            ]
+        )
+
+        if self.use_temporal_smoth_head:
+            self.temporal_smoth_head = TemporalSmoothingHead(d_model)
+
+    def forward(self, inputs, input_len):
+        if self.is_causal:
+            mask = get_mask_from_lengths(input_len)
+        else:
+            # mask none does not apply causal mask
+            mask = None
+
+        encoded_len = input_len
+        out = self.inp_projection(inputs.transpose(1, 2))
+        out = self.layers(out, attention_mask=mask)[0]
+
+        if self.use_conv_pos:
+            out = out.transpose(1, 2)
+            for conv_block in self.conv_pos:
+                out = conv_block(out)
+            out = out.transpose(1, 2)
+
+        if self.use_temporal_smoth_head:
+            out = self.temporal_smoth_head(out, input_len)
+
+        out = self.out_projection(out)
+        audio = self.out_projection_no_bias(out)
+
+        # resample audio to size
+        audio = audio.reshape(inputs.size(0), -1)
+        audio_len = (input_len*self.samples_per_frame).int()
+        return audio, audio_len
+
+
+class MimiAudioEncoder(NeuralModule):
+    def __init__(self, config, out_size=32):
+        super().__init__()
+        self.is_causal = config.use_causal_conv
+
+        # get Mimi default config
+        self.config = config
+        self.config._attn_implementation = "eager"
+
+        # define upsampling rate
+        self.downsampling_rate = self.config.sampling_rate / self.config.frame_rate
+
+        self.encoder = MimiEncoder(self.config)
+        self.encoder_transformer = MimiTransformerModel(self.config)
+
+        # extra downsample requeried because MiMiEncoder works in a different frame rate
+        self.use_extra_downsample = self.encodec_frame_rate != self.config.frame_rate
+        if self.use_extra_downsample:
+            self.downsample = MimiConv1d(
+                self.config,
+                self.config.hidden_size,
+                self.config.hidden_size,
+                kernel_size=2 * int(self.encodec_frame_rate / self.config.frame_rate),
+                stride=2,
+                bias=False,
+                pad_mode="replicate",
+            )
+
+        self.out_projection = MimiConv1d(
+            self.config,
+            self.config.hidden_size,
+            out_size,
+            kernel_size=1,
+            stride=1,
+            bias=False,
+            pad_mode="replicate",
+        )
+
+    @property
+    def encodec_frame_rate(self) -> int:
+        hop_length = np.prod(self.config.upsampling_ratios)
+        return math.ceil(self.config.sampling_rate / hop_length)
+
+    def forward(self, input_signal, input_signal_length):
+        audio = input_signal
+        audio_len = input_signal_length
+
+        if self.is_causal:
+            mask = get_mask_from_lengths(audio_len)
+        else:
+            # mask none does not apply causal mask
+            mask = None
+
+        audio = audio.unsqueeze(1)
+        embeddings = self.encoder(audio)
+        embeddings = self.encoder_transformer(
+            embeddings.transpose(1, 2), attention_mask=mask
+        )[0].transpose(1, 2)
+
+        if self.use_extra_downsample:
+            embeddings = self.downsample(embeddings)
+
+        embeddings = self.out_projection(embeddings)
+
+        # compute output_len based on downsampling rate
+        output_len = (audio_len / self.downsampling_rate).long()
+        return embeddings.transpose(1, 2), output_len
+
+
+class MimiAudioDecoder(NeuralModule):
+    def __init__(self, input_size=32, sampling_rate=24000, upsampling_ratios=[8, 6, 5, 4], frame_rate=12.5, is_causal=True, hidden_size=512, sliding_window=250, num_transformer_layers=8):
+        super().__init__()
+        self.is_causal = is_causal
+
+        # get Mimi default config
+        self.config = MimiConfig()
+        self.config._attn_implementation = "eager"
+
+        # redefine configs based on nemo configs
+        self.config.frame_rate = frame_rate
+        self.config.sampling_rate = sampling_rate
+        self.config.upsampling_ratios = upsampling_ratios
+        self.config.use_causal_conv = is_causal
+        self.config.hidden_size = hidden_size
+        self.config.sliding_window = sliding_window
+        self.config.num_hidden_layers = num_transformer_layers
+
+        # define upsampling rate
+        self.upsampling_rate = self.config.sampling_rate / self.config.frame_rate
+
+        self.decoder_transformer = MimiTransformerModel(self.config)
+        self.decoder = MimiDecoder(self.config)
+
+        # extra upsampling requeried because MiMiEncoder works in a different frame rate
+        self.use_extra_upsample = self.encodec_frame_rate != self.config.frame_rate
+        if self.use_extra_upsample:
+            self.upsample = MimiConvTranspose1d(
+                self.config,
+                self.config.hidden_size,
+                self.config.hidden_size,
+                kernel_size=2 * int(self.encodec_frame_rate / self.config.frame_rate),
+                stride=2,
+                bias=False,
+                groups=self.config.upsample_groups,
+            )
+
+        self.in_projection = MimiConv1d(
+            self.config,
+            input_size,
+            self.config.hidden_size,
+            kernel_size=1,
+            stride=1,
+            bias=False,
+            pad_mode="replicate",
+        )
+
+    @property
+    def encodec_frame_rate(self) -> int:
+        hop_length = np.prod(self.config.upsampling_ratios)
+        return math.ceil(self.config.sampling_rate / hop_length)
+
+    def forward(self, inputs, input_len, past_key_values=None, return_dict=None, return_past_key_values=False):
+        if self.is_causal:
+            mask = get_mask_from_lengths(input_len)
+        else:
+            # mask none does not apply causal mask
+            mask = None
+
+        embeddings = self.in_projection(inputs)
+        if self.use_extra_upsample:
+            embeddings = self.upsample(embeddings)
+
+        decoder_outputs = self.decoder_transformer(
+            embeddings.transpose(1, 2), attention_mask=mask, past_key_values=past_key_values, return_dict=return_dict
+        )
+
+        embeddings = decoder_outputs[0].transpose(1, 2)
+        outputs = self.decoder(embeddings).squeeze(1)
+        # compute output len based on the upsampling rate
+        output_len = (input_len * self.upsampling_rate).long()
+        if return_past_key_values:
+            if return_dict:
+                past_key_values = decoder_outputs.get("past_key_values")
+            elif len(decoder_outputs) > 1:
+                past_key_values = decoder_outputs[1]
+            return outputs, past_key_values
+        return outputs, output_len
 
 
 class ImprovedFiniteScalarQuantizer(FiniteScalarQuantizer):
@@ -112,21 +523,84 @@ class GenerativeCodecEARTTS(DuplexEARTTS):
         setup_audio_codec(self)
 
         if self.cfg.get("use_pretrained_quantizer", False):
-            self.use_fsq = False
-            self.perception = SALM.from_pretrained(self.cfg.pretrained_quantizer_name_or_path).perception
+            # Load the massive full model to the CPU, NOT the GPU.
+            # This prevents your VRAM from spiking during initialization.
+            full_salm = SALM.from_pretrained(
+                self.cfg.pretrained_quantizer_name_or_path, 
+                map_location="cpu"
+            )
+            
+            # 2. Extract the 600M perception module
+            self.perception = full_salm.perception
+            # 3. Sever the tie so the parent model doesn't hold onto the perception weights
+            del full_salm.perception 
+            # 4. Delete the massive parent model (the ~400M leftover params)
+            del full_salm
+            # 5. Force Python's Garbage Collector to immediately free the system RAM
+            gc.collect()
+            # Force PyTorch to release any cached memory
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+
+            # Create the projection
             self.quantizer_projection = nn.Linear(self.perception.cfg.output_dim, self.tts_model.hidden_size)
+            
         else:
-            # Temporarily mock self.llm so setup_speech_encoder works here
-            self.llm = SimpleNamespace(config=SimpleNamespace(hidden_size=self.tts_model.hidden_size))
-            # Setup the Speech Encoder (ASR model perception)
-            setup_speech_encoder(self, pretrained_weights=True)
+            if self.cfg.get("use_mimi_encoder", False):
+                mimi_model = MimiModel.from_pretrained("kyutai/mimi")
+                pre_quant_hidden = mimi_model.config.hidden_size
+
+                self.perception = MimiAudioEncoder(
+                    out_size=pre_quant_hidden, 
+                    config=mimi_model.config
+                )
+
+                state_dict_to_load = mimi_model.state_dict()
+
+                # 1. Get the total number of keys in your custom model
+                total_model_keys = len(self.perception.state_dict().keys())
+                
+                # 2. Load the weights
+                load_result = self.perception.load_state_dict(state_dict_to_load, strict=False)
+                missing_keys = load_result.missing_keys
+                unexpected_keys = load_result.unexpected_keys
+                
+                # 3. Calculate how many keys were successfully restored
+                restored_keys_count = total_model_keys - len(missing_keys)
+                
+                # 4. Print the diagnostic information
+                print(f"--- Mimi Encoder Weight Loading ---")
+                print(f"Total keys in self.perception: {total_model_keys}")
+                print(f"Successfully restored keys: {restored_keys_count}")
+                print(f"-----------------------------------")
+
+                # Optional: Print warnings if crucial weights are missing
+                if missing_keys:
+                    print(f"Warning: {len(missing_keys)} Missing keys when loading Mimi encoder: {missing_keys[:5]}...")
+                if unexpected_keys:
+                    print(f"Warning: {len(unexpected_keys)} Unexpected keys when loading Mimi encoder: {unexpected_keys[:5]}...")
+
+                self.cfg.asr_sample_rate = mimi_model.config.sampling_rate
+
+                # Cleanup
+                del state_dict_to_load
+                del mimi_model
+                gc.collect()
+                print("Hereeee")
+            else:
+                # Temporarily mock self.llm so setup_speech_encoder works here
+                self.llm = SimpleNamespace(config=SimpleNamespace(hidden_size=self.tts_model.hidden_size))
+                # Setup the Speech Encoder (ASR model perception)
+                setup_speech_encoder(self, pretrained_weights=True)
+                pre_quant_hidden = self.tts_model.hidden_size
+
             # Setup the FSQ Quantizer
             self.use_fsq = self.cfg.get("fsq_quantizer_levels", None) is not None
 
             if self.use_fsq:
                 bottleneck_dim = len(self.cfg.fsq_quantizer_levels)
                 hidden_size = self.tts_model.hidden_size
-                self.quantizer_bottleneck = nn.Linear(hidden_size, bottleneck_dim)
+                self.quantizer_bottleneck = nn.Linear(pre_quant_hidden, bottleneck_dim)
                 if not self.cfg.get("skip_fsq", False):
                     if self.cfg.get("use_ifsq", False):
                         self.vector_quantizer = ImprovedFiniteScalarQuantizer(self.cfg.fsq_quantizer_levels)
@@ -138,26 +612,45 @@ class GenerativeCodecEARTTS(DuplexEARTTS):
 
     def prepare_inputs(self, batch: dict):
         delay_frames = self.cfg.get("num_delay_speech_tokens", 0)
-
-        # -------------------------------------------------------------------
-        # 1. THE PAD: Push target_audio forward in time to protect the start
-        # -------------------------------------------------------------------
         if delay_frames > 0:
-            # Calculate samples at the TARGET output sample rate
+            # Get the exact prompt end in TOKENS/FRAMES (Assuming uniform prompt length in batch)
+            prompt_end_frame = batch["non_prompt_mask"][0].float().argmax().item()
+
+            # Convert token boundary to TARGET AUDIO SAMPLES
             samples_per_frame_out = int(self.target_sample_rate * self.frame_length)
+            prompt_end_sample_out = int(prompt_end_frame * samples_per_frame_out)
             delay_samples_out = int(delay_frames * samples_per_frame_out)
             
-            zeros_pad = torch.zeros(
+            zeros_pad_out = torch.zeros(
                 batch["target_audio"].size(0),
                 delay_samples_out,
                 device=batch["target_audio"].device,
                 dtype=batch["target_audio"].dtype,
             )
-            # Pad the BEGINNING
-            batch["target_audio"] = torch.cat([zeros_pad, batch["target_audio"]], dim=1)
             
-            # CRITICAL: Increase the lengths so the end of the real audio isn't masked!
+            # Pad the audio exactly at the prompt boundary
+            batch["target_audio"] = torch.cat([
+                batch["target_audio"][:, :prompt_end_sample_out], 
+                zeros_pad_out, 
+                batch["target_audio"][:, prompt_end_sample_out:]
+            ], dim=1)
+            
+            # Increase the audio lengths
             batch["target_audio_lens"] = batch["target_audio_lens"] + delay_samples_out
+
+            # Pad non_prompt_mask
+            mask_delay_pad = torch.ones(
+                batch["non_prompt_mask"].size(0), 
+                delay_frames, 
+                device=self.device, 
+                dtype=batch["non_prompt_mask"].dtype
+            )
+            
+            batch["non_prompt_mask"] = torch.cat([
+                batch["non_prompt_mask"][:, :prompt_end_frame], 
+                mask_delay_pad, 
+                batch["non_prompt_mask"][:, prompt_end_frame:]
+            ], dim=1)
 
         # The parent will now extract TTS codes where index 0 is pure silence if delay_frames > 0, 
         # preserving your real audio later in the sequence.
@@ -184,15 +677,25 @@ class GenerativeCodecEARTTS(DuplexEARTTS):
             )
 
         # -------------------------------------------------------------------
-        # 3. THE CUT: Shift ASR audio backward (into the future)
+        # 3. THE CUT: Shift ASR audio backward (into the future) and wipe prompt
         # -------------------------------------------------------------------
         if delay_frames > 0:
+            # Safely get the integer index of the prompt boundary
+            prompt_end_frame = batch["non_prompt_mask"][0].float().argmax().item()
+            
             samples_per_frame_asr = int(self.cfg.get("asr_sample_rate", 16000) * self.frame_length)
             delay_samples_asr = int(delay_frames * samples_per_frame_asr)
+            prompt_end_sample_asr = int(prompt_end_frame * samples_per_frame_asr)
 
-            if target_audio_asr_sr.shape[1] > delay_samples_asr:
-                # Cut the padding we added earlier off the start
-                shifted_audio = target_audio_asr_sr[:, delay_samples_asr:]
+            # Check if audio is long enough to contain Prompt + Delay
+            if target_audio_asr_sr.shape[1] > (prompt_end_sample_asr + delay_samples_asr):
+                
+                # Identify where the delay ends and the real audio begins
+                delay_end_sample_asr = prompt_end_sample_asr + delay_samples_asr
+
+                # Cut out the delay from the middle!
+                prompt_part = target_audio_asr_sr[:, :prompt_end_sample_asr]
+                real_audio_part = target_audio_asr_sr[:, delay_end_sample_asr:]
 
                 # Pad the END to maintain tensor shape
                 zeros_pad_end = torch.zeros(
@@ -201,10 +704,12 @@ class GenerativeCodecEARTTS(DuplexEARTTS):
                     device=target_audio_asr_sr.device,
                     dtype=target_audio_asr_sr.dtype,
                 )
-                target_audio_asr_sr = torch.cat([shifted_audio, zeros_pad_end], dim=1)
-                
-                # CRITICAL: Subtract the shifted amount from the lens so the ASR
-                # encoder doesn't treat the new zeros at the end as real speech.
+                # Zero out the prompt portion safely (In-place operation)
+                prompt_part[:, :] = 0.0
+                # Re-assemble: Prompt + Real Audio (shifted left) + Pad
+                target_audio_asr_sr = torch.cat([prompt_part, real_audio_part, zeros_pad_end], dim=1)
+            
+                # Correct the sequence lengths
                 target_audio_lens_asr_sr = torch.clamp(target_audio_lens_asr_sr - delay_samples_asr, min=1)
 
         # Generate the ASR embedding
@@ -421,6 +926,8 @@ class GenerativeCodecEARTTS(DuplexEARTTS):
 
         if generation_config is None:
             generation_config = self._get_generation_config(guidance_enabled)
+        
+        print("Doing inference with the following generation_config:", generation_config, "CFG enabled?", guidance_enabled)
 
         init_inputs.update({"use_cache": True, "past_key_values": None, "guidance_enabled": guidance_enabled})
 
@@ -473,6 +980,14 @@ class GenerativeCodecEARTTS(DuplexEARTTS):
                 tiled_prompt_subword_ids=step_tiled_text,
                 tiled_prompt_subword_mask=step_tiled_mask,
             )
+
+            # --- THE AR SILENCE BYPASS ---
+            # Forcibly overwrite the sampler's predictions with absolute silence 
+            # during the algorithmic delay window to prevent hallucination cascades.
+            delay_frames = self.cfg.get("num_delay_speech_tokens", 0)
+            if i < delay_frames and self.cfg.get("force_silence_on_delay", False):
+                for q in range(code.size(2)):
+                    code[:, :, q] = self.codec_silence_tokens[q]
 
             gen_audio_codes[:, i] = code.squeeze(1)
 
@@ -553,19 +1068,19 @@ class GenerativeCodecEARTTS(DuplexEARTTS):
         target_audio_lens_asr_sr = (target_audio_len / self.target_sample_rate * asr_sr).to(torch.long)
 
         # Apply the exact same lookahead shift we designed earlier!
-        delay_frames = self.cfg.get("num_delay_speech_tokens", 0)
-        if delay_frames > 0:
-            samples_per_frame_asr = int(self.cfg.get("asr_sample_rate", 16000) * self.frame_length)
-            delay_samples_asr = int(delay_frames * samples_per_frame_asr)
-            if target_audio_asr_sr.shape[1] > delay_samples_asr:
-                shifted_audio = target_audio_asr_sr[:, delay_samples_asr:]
-                zeros_pad = torch.zeros(
-                    target_audio_asr_sr.size(0),
-                    delay_samples_asr,
-                    device=target_audio_asr_sr.device,
-                    dtype=target_audio_asr_sr.dtype,
-                )
-                target_audio_asr_sr = torch.cat([shifted_audio, zeros_pad], dim=1)
+        # delay_frames = self.cfg.get("num_delay_speech_tokens", 0)
+        # if delay_frames > 0:
+        #     samples_per_frame_asr = int(self.cfg.get("asr_sample_rate", 16000) * self.frame_length)
+        #     delay_samples_asr = int(delay_frames * samples_per_frame_asr)
+        #     if target_audio_asr_sr.shape[1] > delay_samples_asr:
+        #         shifted_audio = target_audio_asr_sr[:, delay_samples_asr:]
+        #         zeros_pad = torch.zeros(
+        #             target_audio_asr_sr.size(0),
+        #             delay_samples_asr,
+        #             device=target_audio_asr_sr.device,
+        #             dtype=target_audio_asr_sr.dtype,
+        #         )
+        #         target_audio_asr_sr = torch.cat([shifted_audio, zeros_pad], dim=1)
 
         encoded, encoded_len = self.perception(
             input_signal=target_audio_asr_sr, input_signal_length=target_audio_lens_asr_sr
@@ -695,6 +1210,17 @@ class GenerativeCodecEARTTS(DuplexEARTTS):
             )
             * self.target_samples_per_frame
         )
+
+        results["audio_len"] = target_audio_no_prompt_lens.clone()
+        delay_frames = self.cfg.get("num_delay_speech_tokens", 0) + 4 # give more 0.32s to avoid cuts given it is a generative model
+        if delay_frames:
+            samples_per_frame_out = int(self.target_sample_rate * self.frame_length)
+            delay_samples_out = int(delay_frames * samples_per_frame_out)
+            results["audio_len"] = results["audio_len"] + delay_samples_out
+        
+        # Cap the recon_lens so it doesn't exceed the actual generated tensor size
+        max_generated_samples = results["audio"].shape[1]
+        results["audio_len"] = torch.clamp(results["audio_len"], max=max_generated_samples)
 
         with fp32_precision():
             metric_audio_pred = results["audio"]
