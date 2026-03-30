@@ -1081,7 +1081,7 @@ class GenerativeCodecEARTTS(DuplexEARTTS):
         #             dtype=target_audio_asr_sr.dtype,
         #         )
         #         target_audio_asr_sr = torch.cat([shifted_audio, zeros_pad], dim=1)
-
+        target_audio_asr_sr = target_audio_asr_sr * 0.0
         encoded, encoded_len = self.perception(
             input_signal=target_audio_asr_sr, input_signal_length=target_audio_lens_asr_sr
         )

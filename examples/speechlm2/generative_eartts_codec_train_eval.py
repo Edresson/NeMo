@@ -253,7 +253,7 @@ def inference(cfg):
                             z_q = z.transpose(1, 2)
                     z_q = z_q.transpose(1, 2).to(z.dtype)
                     encoded = model.quantizer_projection(z_q)
-        
+
             # --- C. RECONSTRUCTION INFERENCE ---
             recon_audio, recon_lens = model.offline_inference(
                 next_asr_embs=encoded,
@@ -264,15 +264,11 @@ def inference(cfg):
             # return len is the whole audio reset it consideting 
             recon_lens = audio_lengths.clone()
             # add delay frames if used
-            delay_frames = model.cfg.get("num_delay_speech_tokens", 0) # give more 0.32s to avoid cuts given it is a generative model
+            delay_frames = model.cfg.get("num_delay_speech_tokens", 0) + 4 # give more 0.32s to avoid cuts given it is a generative model
             if delay_frames:
                 samples_per_frame_out = int(model.target_sample_rate * model.frame_length)
                 delay_samples_out = int(delay_frames * samples_per_frame_out)
                 recon_lens = recon_lens + delay_samples_out
-
-                # remove first audio tokens dedicated for the delay:
-                # recon_lens = recon_lens - model.cfg.get("num_delay_speech_tokens", 0)
-                # recon_audio = recon_audio[:, ]
 
             # Cap the recon_lens so it doesn't exceed the actual generated tensor size
             max_generated_samples = recon_audio.shape[1]
