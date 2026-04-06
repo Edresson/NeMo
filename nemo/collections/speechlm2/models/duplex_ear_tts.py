@@ -1841,6 +1841,7 @@ def setup_audio_codec(model):
         p.requires_grad = False
 
     model.audio_codec.eval()
+    model.audio_codec.to(model.device)
 
     assert callable(model.tts_model.set_rvq_embs)
 

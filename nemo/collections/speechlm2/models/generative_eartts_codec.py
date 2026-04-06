@@ -586,7 +586,6 @@ class GenerativeCodecEARTTS(DuplexEARTTS):
                 del state_dict_to_load
                 del mimi_model
                 gc.collect()
-                print("Hereeee")
             else:
                 # Temporarily mock self.llm so setup_speech_encoder works here
                 self.llm = SimpleNamespace(config=SimpleNamespace(hidden_size=self.tts_model.hidden_size))

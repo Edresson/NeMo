@@ -1585,6 +1585,7 @@ def read_nemo_tarred_to_duplex(config) -> tuple[CutSet, bool]:
 
     # Load the cuts using the original parser
     cuts, is_tarred = read_nemo_manifest(nemo_config)
+    # cuts, is_tarred = read_cutset_from_config(nemo_config)
 
     # Apply the conversion using functools.partial to make it picklable
     convert_fn = partial(_convert_tarred_to_duplex, agent_silence_duration=agent_silence_duration)
