@@ -201,7 +201,9 @@ class DuplexS2SExternalSpeechDecoderModel(LightningModule, HFHubMixin):
         self.advance_text_channel_by = self.cfg.get("advance_text_channel_by", None)
 
         # if self.cfg.get("speech_generation", None):
+        # if self.cfg.get("use_speech_decoder", None):
         self.tts_model = DuplexEARTTS(OmegaConf.to_container(self.cfg.speech_generation, resolve=True))
+
         self.target_fps = self.tts_model.target_fps
 
         # compute source fps
@@ -249,7 +251,7 @@ class DuplexS2SExternalSpeechDecoderModel(LightningModule, HFHubMixin):
         if self.cfg.get("pretrained_s2s_model", None):
             if os.path.isdir(self.cfg.pretrained_s2s_model):
                 # Hugging Face format
-                state_dict = load_file(os.path.join(self.cfg.pretrained_s2s_model, "model.safetensors"))
+                state_dict = load_file(os.path.join(self.cfg.pretrained_s2s_model, "model.safetensors"), device="cpu")
                 self.load_state_dict(state_dict, strict=False)
             else:
                 self.init_from_model_from_ckpt(self.cfg.pretrained_s2s_model)
