@@ -1114,8 +1114,8 @@ def read_s2s_duplex_overlap_as_s2s_duplex(config) -> Tuple[CutSet, bool]:
     return cuts, is_tarred
 
 
-@data_type_parser(["lhotse_magpietts_data_as_continuation"])
-def read_lhotse_magpietts_data_as_s2s_duplex(config) -> Tuple[CutSet, bool]:
+@data_type_parser(["lhotse_magpietts_data_as_continuation_new"])
+def read_lhotse_magpietts_data_as_s2s_duplex_new(config) -> Tuple[CutSet, bool]:
     cuts, is_tarred = read_cutset_from_config(config)
 
     add_extra_end_sil = config.get("add_extra_end_silence", False)
@@ -1145,6 +1145,143 @@ def read_lhotse_magpietts_data_as_s2s_duplex(config) -> Tuple[CutSet, bool]:
         add_extra_begin_sil=add_extra_begin_sil,
         extra_begin_silence_range=extra_begin_silence_range
     ))
+
+    return cuts, is_tarred
+
+
+@data_type_parser(["lhotse_magpietts_data_as_continuation"])
+def read_lhotse_magpietts_data_as_s2s_duplex(config) -> Tuple[CutSet, bool]:
+    """
+    Convert MagpieTTS dataset cuts into the Duplex S2S format, with optional
+    `context_audio` that can be used as a speaker reference.
+
+    Args:
+        config: Dictionary containing parser options:
+            - add_extra_end_silence (bool): Whether to add extra silence at the end.
+            - extra_end_silence_range (List[float]): Range of extra silence duration.
+            - max_cer (float): Maximum allowed character error rate.
+            - min_context_speaker_similarity (float): Minimum similarity score.
+            - target_speaker (str, optional): Target speaker filter.
+            - sample_rate (int): Audio sample rate for resampling.
+
+    Returns:
+        Tuple[CutSet, bool]: Converted cuts and a flag indicating if data was tarred.
+    """
+    cuts, is_tarred = read_cutset_from_config(config)
+
+    add_extra_end_sil = config.get("add_extra_end_silence", False)
+    extra_end_silence_range = config.get("extra_end_silence_range", [0.5, 6.0])
+    sample_rate = config.get("sample_rate", 22050)
+
+    max_cer = config.get("max_cer", 0.03)
+    min_context_speaker_similarity = config.get("min_context_speaker_similarity", 0.6)
+    target_speaker = config.get("target_speaker", None)
+    keep_flag = "pass"
+
+    def create_recording_from_array(samples: np.ndarray, sampling_rate: int, recording_id: str) -> Recording:
+        """Convert a numpy array into a Lhotse Recording object."""
+        with io.BytesIO() as buffer:
+            sf.write(buffer, samples.T, samplerate=sampling_rate, format='WAV')
+            buffer.seek(0)
+            return Recording.from_bytes(buffer.read(), recording_id=recording_id)
+
+    def convert_cut_fn(cut: Cut) -> Cut:
+        """Convert a single cut into the continuation format."""
+        orig_agent_sup = deepcopy(cut.supervisions[0])
+        target_audio_orig_dur = cut.target_audio.duration
+
+        # Resample audios
+        cut.target_audio = cut.target_audio.resample(sample_rate)
+        if cut.has_custom("context_audio"):
+            cut.context_audio = cut.context_audio.resample(sample_rate)
+        total_duration = cut.target_audio.duration
+
+        # Prepare MonoCuts
+        cut_target = MonoCut(
+            id=f"{cut.id}_target",
+            start=0.0,
+            duration=total_duration,
+            channel=0,
+            recording=cut.target_audio,
+            supervisions=[],
+        )
+
+        zero_audio = np.zeros((1, int(total_duration * sample_rate)), dtype=np.float32)
+        source_recording = create_recording_from_array(zero_audio, sample_rate, recording_id=f"{cut.id}_source")
+
+        cut_source = MonoCut(
+            id=f"{cut.id}_source",
+            start=0.0,
+            duration=total_duration,
+            channel=0,
+            recording=source_recording,
+            supervisions=[],
+        )
+
+        # Save to memory
+        cut_source = cut_source.move_to_memory(audio_format='wav')
+        cut_target = cut_target.move_to_memory(audio_format='wav')
+
+        # Create user and agent supervisions
+        user_sup = fastcopy(orig_agent_sup, start=0.0, duration=0.08, speaker="user", text="dummy text")
+        agent_sup = fastcopy(orig_agent_sup, start=0.0, duration=target_audio_orig_dur - 0.08, speaker="agent")
+
+        # Optionally add extra silence
+        if add_extra_end_sil:
+            sil_duration = random.uniform(*extra_end_silence_range)
+            cut_target = cut_target.pad(duration=total_duration + sil_duration, direction="right")
+            cut_source = cut_source.pad(duration=total_duration + sil_duration, direction="right")
+            cut_source = cut_source.to_mono().move_to_memory(audio_format='wav')
+            cut_target = cut_target.to_mono().move_to_memory(audio_format='wav')
+            agent_sup.duration += sil_duration + 1.0
+            user_sup.duration += sil_duration
+
+        # Assemble final cut
+        cut_source.supervisions = [user_sup, agent_sup]
+        cut_source.target_audio = cut_target.recording
+        cut_source.duration = cut_target.duration
+        if cut.has_custom("context_audio"):
+            cut_source.context_audio = cut.context_audio
+        if cut.has_custom("context_codes"):
+            cut_source.context_codes = cut.context_codes
+        if cut.has_custom("target_codes"):
+            cut_source.target_codes = cut.target_codes
+        if cut.has_custom("lang"):
+            cut_source.lang = cut_source.lang
+        if cut.has_custom("ipa"):
+            cut_source.ipa = cut_source.ipa
+
+        cut_source.task = "lhotse_magpietts_data_as_continuation"
+        return cut_source
+
+    # Filters
+    def filter_cer_fn(cut: Cut) -> bool:
+        return (
+            len(cut.supervisions) == 0
+            or not cut.supervisions[0].has_custom("cer")
+            or cut.supervisions[0].cer <= max_cer
+        )
+
+    def filter_val_flag_fn(cut: Cut) -> bool:
+        return not cut.has_custom("validation_status") or cut.validation_status == keep_flag
+
+    def filter_secs_fn(cut: Cut) -> bool:
+        return (
+            len(cut.supervisions) == 0
+            or not cut.supervisions[0].has_custom("context_speaker_similarity")
+            or cut.supervisions[0].context_speaker_similarity >= min_context_speaker_similarity
+        )
+
+    def filter_target_speaker_fn(cut: Cut) -> bool:
+        return len(cut.supervisions) == 0 or target_speaker is None or target_speaker in cut.supervisions[0].speaker
+
+    # Apply filters
+    cuts = (
+        cuts.filter(filter_cer_fn).filter(filter_val_flag_fn).filter(filter_secs_fn).filter(filter_target_speaker_fn)
+    )
+
+    # Convert cuts
+    cuts = cuts.map(convert_cut_fn)
 
     return cuts, is_tarred
 
