@@ -148,7 +148,7 @@ class MagpieTTSLhotseMultiturnDataset(torch.utils.data.Dataset):
             are not set externally. Defaults to None.
         text_context_remapping: Dict defining mapping of multiple text contexts to a single text context.
         text_context_remapping_prob: Probability of remapping the original text context to a remapped text context.
-        phoneme_turn_max_words_to_drop: Turns with this many words or fewer keep phoneme tokens as pad_id.
+        phoneme_turn_max_words_to_drop: Turns with this many words or fewer keep empty phoneme string.
     """
 
     def __init__(
