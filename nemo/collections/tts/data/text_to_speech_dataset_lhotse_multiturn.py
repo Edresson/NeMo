@@ -834,15 +834,15 @@ def build_phoneme_channel(
                 dropout_applied = True
                 continue
 
-            if _count_words_ignoring_punctuation(supervision.text) <= phoneme_turn_max_words_to_drop:
-                continue
-
             if isinstance(phoneme_tokenizer, IPABPETokenizer):
                 ipa_text = _get_supervision_ipa_text(supervision)
                 if language in ignore_phoneme_languages:
                     ipa_text = ""
             else:
                 ipa_text = supervision.text
+            
+            if _count_words_ignoring_punctuation(supervision.text) <= phoneme_turn_max_words_to_drop:
+                ipa_text = ""
 
             phoneme_ids = phoneme_tokenizer.encode(ipa_text)
             phoneme_ids = [bos_id] + phoneme_ids + [eos_id]
