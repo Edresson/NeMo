@@ -11,6 +11,9 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import gc
+import json
+import os
 import random
 import tempfile
 import time
@@ -26,6 +29,7 @@ from nemo_automodel import NeMoAutoModelForCausalLM
 from nemo_automodel.components.models.nemotron_v3.cache import NemotronHybridCache
 from lightning.pytorch import Trainer
 from omegaconf import DictConfig, OmegaConf
+from safetensors import safe_open
 from torch import nn
 from transformers import AutoConfig, AutoModelForCausalLM
 
@@ -516,57 +520,458 @@ class EasyMagpieTTSInferenceModel(ModelPT):
             )
 
         elif self.decoder_type in ('nemo_automodel', 'automodel'):
-            automodel_config_source = cfg.get('automodel_config_source', 'nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16')
-            self.transformer_backend_config = AutoConfig.from_pretrained(
-                automodel_config_source,
-                trust_remote_code=True,
-            )
-            self.transformer_backend_config = _replace_config_values(
-                self.transformer_backend_config,
-                _get_nemotron_h_config_dict(cfg),
+
+            automodel_pretrained_checkpoint = cfg.get(
+                "automodel_pretrained_checkpoint",
+                None,
             )
 
-            automodel_kwargs = _to_dict(cfg.get('automodel_kwargs', {}))
-            logging.info("NeMo AutoModel kwargs: %s", automodel_kwargs)
-            # Some Automodel NemotronV3 builds leave mixer tensors from scratch init uninitialized after
-            # from_config(); reset those tensors before running Automodel's regular init/rescaling path.
-            with torch.device('cpu'):
-                automodel_model = NeMoAutoModelForCausalLM.from_config(
-                    self.transformer_backend_config, **automodel_kwargs
-                )
-            _initialize_automodel_scratch_parameters(automodel_model)
-            buffer_device = (
-                torch.device(f'cuda:{torch.cuda.current_device()}')
-                if torch.cuda.is_available()
-                else torch.device('cpu')
+            automodel_kwargs = _to_dict(
+                cfg.get("automodel_kwargs", {})
             )
-            automodel_dtype = next(
-                (
-                    param.dtype
-                    for param in automodel_model.parameters()
-                    if param.is_floating_point() and not param.is_meta
-                ),
-                torch.bfloat16,
-            )
-            if hasattr(automodel_model, 'initialize_weights'):
-                automodel_model.initialize_weights(buffer_device=buffer_device, dtype=automodel_dtype)
-            elif hasattr(getattr(automodel_model, 'model', None), 'initialize_weights'):
-                automodel_model.model.initialize_weights(buffer_device=buffer_device)
-            if self.disable_lm_text_head:
-                # The custom AutoModel CausalLM wrapper always calls lm_head, even
-                # when only hidden states are requested. Keep that wrapper contract
-                # without allocating or evaluating the vocabulary projection.
-                automodel_model.lm_head = nn.Identity()
-            self.decoder = automodel_model
-            if self.decoder is None:
-                raise AttributeError("NeMo AutoModel causal LM did not expose a `model` decoder.")
-            self.lm_text_head = None if self.disable_lm_text_head else getattr(automodel_model, 'lm_head', None)
+
             logging.info(
-                f"NeMo AutoModel config: source={automodel_config_source}, "
-                f"hidden_size={self.transformer_backend_config.hidden_size}, "
-                f"num_hidden_layers={self.transformer_backend_config.num_hidden_layers}"
+                "NeMo AutoModel kwargs: %s",
+                automodel_kwargs,
             )
 
+            if automodel_pretrained_checkpoint:
+                # ============================================================
+                # PRETRAINED PATH
+                #
+                # 1. Read only the nested Nemotron-H LLM config.
+                # 2. Instantiate the *native* NeMo AutoModel implementation
+                #    using our desired backend.
+                # 3. Extract language_model.* tensors from the multimodal HF
+                #    checkpoint.
+                # 4. Let NeMo's state_dict_adapter convert HF -> native format.
+                # ============================================================
+
+                logging.info(
+                    "Loading pretrained Nemotron-H weights from: %s",
+                    automodel_pretrained_checkpoint,
+                )
+
+                # ------------------------------------------------------------
+                # Read outer config, but use ONLY its nested LLM config.
+                #
+                # This avoids instantiating NemotronH_Nano_VL_V2 and therefore
+                # avoids vision/audio models entirely.
+                # ------------------------------------------------------------
+                outer_config = AutoConfig.from_pretrained(
+                    automodel_pretrained_checkpoint,
+                    trust_remote_code=True,
+                    local_files_only=True,
+                )
+
+                if not hasattr(outer_config, "llm_config"):
+                    raise AttributeError(
+                        "Pretrained checkpoint config does not expose `llm_config`."
+                    )
+
+                self.transformer_backend_config = outer_config.llm_config
+
+                logging.info(
+                    "Pretrained Nemotron-H config: "
+                    "hidden_size=%s, "
+                    "num_hidden_layers=%s, "
+                    "n_routed_experts=%s, "
+                    "num_experts_per_tok=%s",
+                    self.transformer_backend_config.hidden_size,
+                    self.transformer_backend_config.num_hidden_layers,
+                    self.transformer_backend_config.n_routed_experts,
+                    self.transformer_backend_config.num_experts_per_tok,
+                )
+
+                # ------------------------------------------------------------
+                # IMPORTANT:
+                #
+                # Instantiate native NeMo AutoModel from the nested LLM config.
+                #
+                # automodel_kwargs contains:
+                #   backend.attn=sdpa
+                #   backend.linear=torch
+                #   backend.rms_norm=torch_fp32
+                #   backend.rope_fusion=true
+                #   backend.experts=torch_mm
+                #   backend.dispatcher=deepep
+                #   backend.dispatcher_num_sms=20
+                #   moe_overrides.aux_loss_coeff=0.001
+                # ------------------------------------------------------------
+                with torch.device("cpu"):
+                    automodel_model = (
+                        NeMoAutoModelForCausalLM.from_config(
+                            self.transformer_backend_config,
+                            **automodel_kwargs,
+                        )
+                    )
+
+                logging.info(
+                    "Instantiated native NeMo AutoModel: %s",
+                    type(automodel_model),
+                )
+
+                if not hasattr(automodel_model, "state_dict_adapter"):
+                    raise AttributeError(
+                        "Native Nemotron-H model does not expose "
+                        "`state_dict_adapter`."
+                    )
+
+                logging.info(
+                    "State dict adapter: %s",
+                    type(automodel_model.state_dict_adapter),
+                )
+
+                # ------------------------------------------------------------
+                # Read HF checkpoint shards.
+                #
+                # Only retain:
+                #
+                #   language_model.*
+                #
+                # and strip the leading:
+                #
+                #   language_model.
+                #
+                # Example:
+                #
+                # language_model.backbone.layers.1....
+                #
+                # becomes:
+                #
+                # backbone.layers.1....
+                #
+                # which is exactly what NemotronV3StateDictAdapter expects.
+                # ------------------------------------------------------------
+                index_path = os.path.join(
+                    automodel_pretrained_checkpoint,
+                    "model.safetensors.index.json",
+                )
+
+                if not os.path.isfile(index_path):
+                    raise FileNotFoundError(
+                        f"Missing safetensors index: {index_path}"
+                    )
+
+                with open(index_path, "r") as f:
+                    index = json.load(f)
+
+                shard_files = list(
+                    dict.fromkeys(
+                        index["weight_map"].values()
+                    )
+                )
+
+                hf_llm_state = {}
+
+                total_checkpoint_tensors = 0
+                language_model_tensors = 0
+
+                for shard_idx, shard_file in enumerate(shard_files):
+                    shard_path = os.path.join(
+                        automodel_pretrained_checkpoint,
+                        shard_file,
+                    )
+
+                    logging.info(
+                        "Reading HF shard %d/%d: %s",
+                        shard_idx + 1,
+                        len(shard_files),
+                        shard_file,
+                    )
+
+                    with safe_open(
+                        shard_path,
+                        framework="pt",
+                        device="cpu",
+                    ) as f:
+
+                        for key in f.keys():
+                            total_checkpoint_tensors += 1
+
+                            if not key.startswith("language_model."):
+                                continue
+
+                            # Strip outer multimodal-model prefix.
+                            llm_key = key[len("language_model."):]
+
+                            hf_llm_state[llm_key] = f.get_tensor(key)
+
+                            language_model_tensors += 1
+
+                logging.info(
+                    "Extracted %d language-model tensors "
+                    "from %d total checkpoint tensors",
+                    language_model_tensors,
+                    total_checkpoint_tensors,
+                )
+
+                # ------------------------------------------------------------
+                # HF -> native AutoModel conversion.
+                #
+                # NeMo handles:
+                #
+                # backbone.* -> model.*
+                #
+                # embeddings -> embed_tokens
+                #
+                # norm_f -> norm
+                #
+                # experts.0.up_proj.weight
+                # experts.1.up_proj.weight
+                # ...
+                #
+                #       ->
+                #
+                # experts.gate_and_up_projs
+                #
+                # and similarly for down_projs.
+                # ------------------------------------------------------------
+                logging.info(
+                    "Converting HF Nemotron-H state dict "
+                    "to native NeMo AutoModel format..."
+                )
+
+                native_state = (
+                    automodel_model.state_dict_adapter.from_hf(
+                        hf_llm_state
+                    )
+                )
+
+                # HF tensors are no longer needed.
+                del hf_llm_state
+                gc.collect()
+
+                logging.info(
+                    "Converted HF state dict: %d source tensors -> "
+                    "%d native AutoModel tensors",
+                    language_model_tensors,
+                    len(native_state),
+                )
+
+                # ------------------------------------------------------------
+                # Validate BEFORE copying.
+                # ------------------------------------------------------------
+                model_state = automodel_model.state_dict()
+
+                missing_keys = sorted(
+                    set(model_state.keys())
+                    - set(native_state.keys())
+                )
+
+                unexpected_keys = sorted(
+                    set(native_state.keys())
+                    - set(model_state.keys())
+                )
+
+                shape_mismatches = []
+
+                for key in (
+                    set(model_state.keys())
+                    & set(native_state.keys())
+                ):
+                    if (
+                        model_state[key].shape
+                        != native_state[key].shape
+                    ):
+                        shape_mismatches.append(
+                            (
+                                key,
+                                tuple(native_state[key].shape),
+                                tuple(model_state[key].shape),
+                            )
+                        )
+
+                logging.info("=" * 80)
+                logging.info(
+                    "HF -> NEMO AUTOMODEL CONVERSION SUMMARY"
+                )
+                logging.info(
+                    "HF LLM tensors:              %d",
+                    language_model_tensors,
+                )
+                logging.info(
+                    "Native AutoModel tensors:    %d",
+                    len(native_state),
+                )
+                logging.info(
+                    "Missing native keys:         %d",
+                    len(missing_keys),
+                )
+                logging.info(
+                    "Unexpected converted keys:   %d",
+                    len(unexpected_keys),
+                )
+                logging.info(
+                    "Shape mismatches:            %d",
+                    len(shape_mismatches),
+                )
+                logging.info("=" * 80)
+
+                if missing_keys:
+                    logging.warning(
+                        "First missing native keys:\n%s",
+                        "\n".join(
+                            f"  {key}"
+                            for key in missing_keys[:20]
+                        ),
+                    )
+
+                if unexpected_keys:
+                    logging.warning(
+                        "First unexpected converted keys:\n%s",
+                        "\n".join(
+                            f"  {key}"
+                            for key in unexpected_keys[:20]
+                        ),
+                    )
+
+                if shape_mismatches:
+                    logging.warning(
+                        "First shape mismatches:\n%s",
+                        "\n".join(
+                            f"  {key}: checkpoint={src}, model={dst}"
+                            for key, src, dst
+                            in shape_mismatches[:20]
+                        ),
+                    )
+
+                if shape_mismatches:
+                    raise RuntimeError(
+                        "HF -> AutoModel conversion produced "
+                        f"{len(shape_mismatches)} shape mismatches."
+                    )
+
+                # ------------------------------------------------------------
+                # Load converted native tensors.
+                # ------------------------------------------------------------
+                load_result = automodel_model.load_state_dict(
+                    native_state,
+                    strict=False,
+                )
+
+                logging.info(
+                    "Native AutoModel load result: "
+                    "missing=%d unexpected=%d",
+                    len(load_result.missing_keys),
+                    len(load_result.unexpected_keys),
+                )
+
+                del native_state
+                gc.collect()
+
+                automodel_source = (
+                    automodel_pretrained_checkpoint
+                )
+
+
+            # ------------------------------------------------------------
+            # Scratch/config-only path.
+            # ------------------------------------------------------------
+            else:
+                automodel_config_source = cfg.get(
+                    'automodel_config_source',
+                    'nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16',
+                )
+
+                self.transformer_backend_config = AutoConfig.from_pretrained(
+                    automodel_config_source,
+                    trust_remote_code=True,
+                )
+
+                self.transformer_backend_config = _replace_config_values(
+                    self.transformer_backend_config,
+                    _get_nemotron_h_config_dict(cfg),
+                )
+
+                logging.info(
+                    "Creating NeMo AutoModel from config: %s",
+                    automodel_config_source,
+                )
+
+                # Some AutoModel NemotronV3 builds leave mixer tensors from
+                # scratch init uninitialized after from_config(); reset those
+                # tensors before running AutoModel's regular init/rescaling path.
+                with torch.device('cpu'):
+                    automodel_model = (
+                        NeMoAutoModelForCausalLM.from_config(
+                            self.transformer_backend_config,
+                            **automodel_kwargs,
+                        )
+                    )
+
+                _initialize_automodel_scratch_parameters(
+                    automodel_model
+                )
+
+                buffer_device = (
+                    torch.device(
+                        f'cuda:{torch.cuda.current_device()}'
+                    )
+                    if torch.cuda.is_available()
+                    else torch.device('cpu')
+                )
+
+                automodel_dtype = next(
+                    (
+                        param.dtype
+                        for param in automodel_model.parameters()
+                        if (
+                            param.is_floating_point()
+                            and not param.is_meta
+                        )
+                    ),
+                    torch.bfloat16,
+                )
+
+                if hasattr(
+                    automodel_model,
+                    'initialize_weights',
+                ):
+                    automodel_model.initialize_weights(
+                        buffer_device=buffer_device,
+                        dtype=automodel_dtype,
+                    )
+
+                elif hasattr(
+                    getattr(automodel_model, 'model', None),
+                    'initialize_weights',
+                ):
+                    automodel_model.model.initialize_weights(
+                        buffer_device=buffer_device,
+                    )
+
+                automodel_source = automodel_config_source
+
+            # ------------------------------------------------------------
+            # Common setup for pretrained and scratch.
+            # ------------------------------------------------------------
+            if self.disable_lm_text_head:
+                # Keep the CausalLM wrapper contract while avoiding use of
+                # the vocabulary projection during forward.
+                automodel_model.lm_head = nn.Identity()
+
+            self.decoder = automodel_model
+
+            if self.decoder is None:
+                raise AttributeError(
+                    "NeMo AutoModel causal LM did not expose a decoder."
+                )
+
+            self.lm_text_head = (
+                None
+                if self.disable_lm_text_head
+                else getattr(automodel_model, 'lm_head', None)
+            )
+
+            logging.info(
+                f"NeMo AutoModel config: "
+                f"source={automodel_source}, "
+                f"hidden_size="
+                f"{getattr(self.transformer_backend_config, 'hidden_size', 'N/A')}, "
+                f"num_hidden_layers="
+                f"{getattr(self.transformer_backend_config, 'num_hidden_layers', 'N/A')}"
+            )
         else:
             raise ValueError(
                 f"Unknown decoder_type: {self.decoder_type}. "
@@ -738,6 +1143,7 @@ class EasyMagpieTTSInferenceModel(ModelPT):
             state.past_key_values = None
             state.cache_seq_len = 0
 
+
     def restore_from_pretrained_checkpoint(self, checkpoint_path):
         """
         Loads model weights a pretrained checkpoint file, supporting partial loading from safetensor and PyTorch formats.
@@ -748,6 +1154,7 @@ class EasyMagpieTTSInferenceModel(ModelPT):
         Returns:
             None. The model is updated in-place.
         """
+
         if checkpoint_path is not None:
             if '.nemo' in checkpoint_path:
                 with tempfile.TemporaryDirectory() as tmpdir:
