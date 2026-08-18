@@ -947,16 +947,15 @@ class EasyMagpieTTSInferenceModel(ModelPT):
             # Common setup for pretrained and scratch.
             # ------------------------------------------------------------
             if self.disable_lm_text_head:
-                # Keep the CausalLM wrapper contract while avoiding use of
-                # the vocabulary projection during forward.
+                # The custom AutoModel CausalLM wrapper always calls lm_head, even
+                # when only hidden states are requested. Keep that wrapper contract
+                # without allocating or evaluating the vocabulary projection.
                 automodel_model.lm_head = nn.Identity()
 
             self.decoder = automodel_model
 
             if self.decoder is None:
-                raise AttributeError(
-                    "NeMo AutoModel causal LM did not expose a decoder."
-                )
+                raise AttributeError("NeMo AutoModel causal LM did not expose a `model` decoder.")
 
             self.lm_text_head = (
                 None
