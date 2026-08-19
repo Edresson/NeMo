@@ -12,7 +12,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import os
+
 import lightning.pytorch as pl
+import torch
 import torch.multiprocessing as mp
 from omegaconf import OmegaConf, open_dict
 
@@ -37,6 +40,25 @@ def main(cfg):
     # to fix this is to use "spawn" to create a completely new and clean python process for
     # each worker, avoding the problematic CUDA state inheritance.
     mp.set_start_method("spawn", force=True)
+
+    if torch.cuda.is_available():
+        local_rank = int(os.environ.get("LOCAL_RANK", 0))
+        global_rank = int(os.environ.get("RANK", 0))
+        node_rank = int(os.environ.get("NODE_RANK", 0))
+
+        torch.cuda.set_device(local_rank)
+
+        logging.info(
+            "CUDA process binding before model construction: "
+            "pid=%d, NODE_RANK=%d, RANK=%d, LOCAL_RANK=%d, "
+            "current_device=%d, device_name=%s",
+            os.getpid(),
+            node_rank,
+            global_rank,
+            local_rank,
+            torch.cuda.current_device(),
+            torch.cuda.get_device_name(torch.cuda.current_device()),
+        )
 
     trainer = pl.Trainer(**cfg.trainer)
     trainer.callbacks.append(pl.callbacks.LearningRateMonitor(logging_interval='step', log_weight_decay=True))
